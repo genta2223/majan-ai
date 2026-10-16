@@ -17,6 +17,7 @@ from tools.paifu_to_mjai import (
     extract_paifu_uuids,
     extract_player_names_from_record,
     create_mock_authentic_game_record,
+    is_cpu_player_name,
     PaifuDownloader,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "extract_paifu_uuids",
     "extract_player_names_from_record",
     "create_mock_authentic_game_record",
+    "is_cpu_player_name",
     "PaifuDownloader",
 ]

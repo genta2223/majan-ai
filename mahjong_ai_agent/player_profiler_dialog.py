@@ -236,6 +236,19 @@ class PlayerProfilerDialog(tk.Toplevel):
             child.destroy()
 
         # Render Badges
+        is_cpu = "CPU" in prof.name or "cpu" in prof.name.lower()
+        if is_cpu:
+            cpu_lbl = tk.Label(
+                self.badge_frame,
+                text=" 🤖 CPU対局枠 ",
+                font=("Meiryo", 8, "bold"),
+                fg="#ffffff",
+                bg="#64748b",
+                padx=4,
+                pady=1,
+            )
+            cpu_lbl.pack(side=tk.LEFT, padx=(0, 6))
+
         for badge_text in prof.badges:
             badge_color = "#3b82f6"
             if "鳴き" in badge_text or "喰いタン" in badge_text or "役牌" in badge_text:

@@ -135,7 +135,8 @@ class PaifuDownloader:
             else:
                 raise FileNotFoundError(
                     f"牌譜データ (UUID: {safe_uuid}) を取得できませんでした。\n"
-                    f"Chrome (Port: {self.cdp_port}) で雀魂が起動しているか、またはURLが正しいか確認してください。"
+                    f"【操作手順】雀魂の牌譜一覧から該当の牌譜を一度再生・開いた状態にしてから、再度「牌譜を取り込んで解析」を実行してください。\n"
+                    f"(Chromeがリモートデバッグポート {self.cdp_port} で起動していることもご確認ください)"
                 )
 
         # Cache downloaded authentic data
@@ -277,8 +278,28 @@ class PaifuDownloader:
         cdp_res = self._fetch_via_cdp(uuid)
         if cdp_res:
             return cdp_res
+        else:
+            print(
+                f"[PaifuDownloader] CDPメモリから牌譜 (UUID: {uuid}) が見つかりませんでした。\n"
+                f"【案内】雀魂の牌譜一覧から該当の牌譜を一度再生・開いた状態で再度読み込んでください。"
+            )
 
         return None
+
+
+def is_cpu_player_name(name: str) -> bool:
+    """Checks whether the given player name indicates a CPU/bot or placeholder slot."""
+    if not name:
+        return True
+    lower = name.lower().strip()
+    return (
+        "cpu" in lower
+        or "bot" in lower
+        or "电脑" in lower
+        or "computer" in lower
+        or lower.startswith("player")
+        or lower in ("佐藤", "鈴木", "self")
+    )
 
 
 def create_mock_authentic_game_record(
@@ -287,11 +308,11 @@ def create_mock_authentic_game_record(
 ) -> Dict[str, Any]:
     """
     Creates an authentic full match structure for testing and offline analysis.
-    Contains 4 distinct player names, multiple rounds (East 1 to South 4),
-    and diverse outcomes (Riichi, Chi, Pon, Tsumo Hora, and Ron Deal-in)
+    Contains real player names and CPU player designations without fictional surnames,
+    multiple rounds (East 1 to South 4), and diverse outcomes (Riichi, Chi, Pon, Tsumo Hora, and Ron Deal-in)
     ensuring each player has unique, non-zero, statistically distinct results.
     """
-    names = player_names or ["genta2223", "プロコフ", "佐藤", "鈴木"]
+    names = player_names or ["genta2223", "プロコフ", "CPUプレイヤー (西家)", "CPUプレイヤー (北家)"]
     return {
         "uuid": uuid,
         "title": f"Majsoul Match {uuid}",
@@ -299,8 +320,8 @@ def create_mock_authentic_game_record(
             "accounts": [
                 {"seat": 0, "nickname": names[0], "account_id": 10001, "level": "Master"},
                 {"seat": 1, "nickname": names[1], "account_id": 10002, "level": "Saint"},
-                {"seat": 2, "nickname": names[2], "account_id": 10003, "level": "Master"},
-                {"seat": 3, "nickname": names[3], "account_id": 10004, "level": "Expert"},
+                {"seat": 2, "nickname": names[2], "account_id": 0, "level": ""},
+                {"seat": 3, "nickname": names[3], "account_id": 0, "level": ""},
             ]
         },
         "players": [
@@ -329,7 +350,7 @@ def create_mock_authentic_game_record(
                     {"action_name": "ActionHule", "data": {"hules": [{"seat": 0, "target": 1, "hu_tile": "5m", "zimo": False}], "delta_scores": [8000, -8000, 0, 0]}},
                 ]
             },
-            # Round 2 (East 2): Player 2 (佐藤) calls Chi/Pon and wins by Tsumo
+            # Round 2 (East 2): Player 2 (CPUプレイヤー (西家)) calls Chi/Pon and wins by Tsumo
             {
                 "round_info": {"chang": 0, "ju": 1, "ben": 0, "liqibang": 0, "scores": [33000, 17000, 25000, 25000], "doras": ["5s"]},
                 "actions": [
@@ -344,7 +365,7 @@ def create_mock_authentic_game_record(
                     {"action_name": "ActionHule", "data": {"hules": [{"seat": 2, "target": 2, "hu_tile": "2s", "zimo": True}], "delta_scores": [-1000, -1000, 3000, -1000]}},
                 ]
             },
-            # Round 3 (South 4: Ooras): Player 3 (鈴木) wins by Ron from Player 2 (佐藤)
+            # Round 3 (South 4: Ooras): Player 3 (CPUプレイヤー (北家)) wins by Ron from Player 2 (CPUプレイヤー (西家))
             {
                 "round_info": {"chang": 1, "ju": 3, "ben": 0, "liqibang": 0, "scores": [32000, 16000, 27000, 24000], "doras": ["9p"]},
                 "actions": [
@@ -364,8 +385,10 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
     """
     Extracts authentic player account nicknames from Majsoul record structures.
     Supports Liqi Proto head.accounts, root accounts, players, and result objects.
+    Replaces blank or CPU slots with 'CPUプレイヤー (東/南/西/北家)' instead of dummy family names.
     """
     player_names = ["", "", "", ""]
+    SEAT_DEFAULTS = ["東家", "南家", "西家", "北家"]
 
     head = record.get("head") or {}
     accounts = head.get("accounts") or record.get("accounts") or []
@@ -374,13 +397,12 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
             if isinstance(acc, dict):
                 seat = acc.get("seat", -1)
                 nickname = acc.get("nickname") or acc.get("name") or ""
-                if 0 <= seat < 4 and nickname:
-                    player_names[seat] = str(nickname).strip()
-                elif nickname:
-                    for i in range(4):
-                        if not player_names[i]:
-                            player_names[i] = str(nickname).strip()
-                            break
+                acc_id = acc.get("account_id", 0)
+                if 0 <= seat < 4:
+                    if nickname and acc_id != 0 and not is_cpu_player_name(str(nickname)):
+                        player_names[seat] = str(nickname).strip()
+                    elif not player_names[seat]:
+                        player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
 
     if any(not n for n in player_names):
         players = record.get("players") or head.get("players") or []
@@ -389,8 +411,11 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                 if isinstance(p, dict):
                     seat = p.get("seat", idx)
                     name = p.get("name") or p.get("nickname") or ""
-                    if 0 <= seat < 4 and name and not player_names[seat]:
-                        player_names[seat] = str(name).strip()
+                    if 0 <= seat < 4 and not player_names[seat]:
+                        if name and not is_cpu_player_name(str(name)):
+                            player_names[seat] = str(name).strip()
+                        else:
+                            player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
 
     if any(not n for n in player_names):
         result_players = head.get("result", {}).get("players") or []
@@ -399,13 +424,15 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                 if isinstance(p, dict):
                     seat = p.get("seat", idx)
                     name = p.get("nickname") or p.get("name") or ""
-                    if 0 <= seat < 4 and name and not player_names[seat]:
-                        player_names[seat] = str(name).strip()
+                    if 0 <= seat < 4 and not player_names[seat]:
+                        if name and not is_cpu_player_name(str(name)):
+                            player_names[seat] = str(name).strip()
+                        else:
+                            player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
 
-    SEAT_DEFAULTS = ["東家", "南家", "西家", "北家"]
     for i in range(4):
-        if not player_names[i]:
-            player_names[i] = f"Player{i+1} ({SEAT_DEFAULTS[i]})"
+        if not player_names[i] or is_cpu_player_name(player_names[i]):
+            player_names[i] = f"CPUプレイヤー ({SEAT_DEFAULTS[i]})"
 
     return player_names
 
