@@ -3029,12 +3029,129 @@ def test_paifu_downloader_subthread_asyncio_loop():
     assert not thread_exceptions, f"Subthread raised unexpected exception: {thread_exceptions}"
 
 
+def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatch, capsys):
+    """
+    Test CDP target selection and structured {success, error, payload} evaluation:
+    1. Target selection priority:
+       - Prefers type == 'page' and URL/Title matching 'mahjongsoul' / '雀魂' over generic pages.
+    2. Structured error handling:
+       - Catches {success: false, error: ...} and prints descriptive error details without crashing.
+    3. Structured success handling:
+       - Extracts payload when {success: true, payload: ...} is returned.
+    4. Runtime exceptionDetails extraction:
+       - Formats exception details properly instead of printing empty string.
+    """
+    import io
+    import json
+    import urllib.request
+    from tools.paifu_to_mjai import PaifuDownloader
 
+    mock_targets = [
+        {"type": "background_page", "title": "Extension", "url": "chrome-extension://abc", "webSocketDebuggerUrl": "ws://dummy/ext"},
+        {"type": "page", "title": "Google", "url": "https://www.google.com/", "webSocketDebuggerUrl": "ws://dummy/google"},
+        {"type": "page", "title": "雀魂 -じゃんたま-", "url": "https://game.mahjongsoul.com/", "webSocketDebuggerUrl": "ws://dummy/majsoul"},
+    ]
 
+    class MockHTTPResponse:
+        def __init__(self, data):
+            self._data = data
+        def read(self):
+            return self._data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
 
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockHTTPResponse(json.dumps(mock_targets).encode("utf-8")))
 
+    connected_urls = []
 
+    class MockWebSocket:
+        def __init__(self, url, response_json):
+            self.url = url
+            self.response_json = response_json
+            connected_urls.append(url)
 
+        async def __aenter__(self):
+            return self
 
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
 
+        async def send(self, msg):
+            pass
+
+        async def recv(self):
+            return json.dumps(self.response_json)
+
+    downloader = PaifuDownloader(cdp_port=9222)
+
+    import websockets
+    # Test 1: Structured failure response (e.g. window.app.NetAgent is undefined)
+    fail_ws_resp = {
+        "id": 201,
+        "result": {
+            "result": {
+                "type": "string",
+                "value": json.dumps({
+                    "success": False,
+                    "error": "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません。"
+                })
+            }
+        }
+    }
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, fail_ws_resp))
+
+    res_fail = downloader._fetch_via_rpc("261017-error-test-uuid")
+    assert res_fail is None
+    assert connected_urls[-1] == "ws://dummy/majsoul"
+
+    captured = capsys.readouterr().out
+    assert "Selected Majsoul page target" in captured
+    assert "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません" in captured
+    assert "Majsoul RPC Error for 261017-error-test-uuid" in captured
+
+    # Test 2: Structured success response
+    success_ws_resp = {
+        "id": 201,
+        "result": {
+            "result": {
+                "type": "string",
+                "value": json.dumps({
+                    "success": True,
+                    "payload": {
+                        "uuid": "261017-success-test-uuid",
+                        "head": {"accounts": [{"nickname": "genta2223"}]},
+                        "rounds": []
+                    }
+                })
+            }
+        }
+    }
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, success_ws_resp))
+
+    res_success = downloader._fetch_via_rpc("261017-success-test-uuid")
+    assert res_success is not None
+    assert res_success.get("uuid") == "261017-success-test-uuid"
+    assert res_success.get("head", {}).get("accounts", [])[0].get("nickname") == "genta2223"
+
+    # Test 3: CDP exceptionDetails returned (must print exception details, not empty)
+    exc_ws_resp = {
+        "id": 201,
+        "result": {
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
+                    "type": "object",
+                    "value": "ReferenceError: NetAgent is not defined"
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, exc_ws_resp))
+
+    res_exc = downloader._fetch_via_rpc("261017-exc-test-uuid")
+    assert res_exc is None
+    captured_exc = capsys.readouterr().out
+    assert "CDP Runtime evaluation exception: ReferenceError: NetAgent is not defined" in captured_exc
 

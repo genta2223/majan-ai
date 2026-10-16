@@ -182,16 +182,39 @@ class PaifuDownloader:
             return None
 
         target_ws_url = None
+        # 1. First priority: type == 'page' and ('mahjongsoul' or 'maj-soul' or '雀魂')
         for t in targets:
+            t_type = t.get("type", "")
             url = t.get("url", "").lower()
             title = t.get("title", "").lower()
-            if "mahjongsoul" in url or "maj-soul" in url or "雀魂" in title:
+            if t_type == "page" and ("mahjongsoul" in url or "maj-soul" in url or "雀魂" in title):
                 target_ws_url = t.get("webSocketDebuggerUrl")
+                print(f"[PaifuDownloader] Selected Majsoul page target: Title='{t.get('title')}', URL='{t.get('url')}'")
                 break
+
+        # 2. Second priority: any type with matching URL/title
+        if not target_ws_url:
+            for t in targets:
+                url = t.get("url", "").lower()
+                title = t.get("title", "").lower()
+                if "mahjongsoul" in url or "maj-soul" in url or "雀魂" in title:
+                    target_ws_url = t.get("webSocketDebuggerUrl")
+                    print(f"[PaifuDownloader] Selected fallback matching target: Title='{t.get('title')}', URL='{t.get('url')}'")
+                    break
+
+        # 3. Third priority: first type == 'page'
+        if not target_ws_url:
+            for t in targets:
+                if t.get("type") == "page":
+                    target_ws_url = t.get("webSocketDebuggerUrl")
+                    print(f"[PaifuDownloader] Selected first active page target: Title='{t.get('title')}', URL='{t.get('url')}'")
+                    break
+
         if not target_ws_url and targets:
             target_ws_url = targets[0].get("webSocketDebuggerUrl")
 
         if not target_ws_url:
+            print(f"[PaifuDownloader] No usable CDP WebSocket targets found on port {self.cdp_port}")
             return None
 
         try:
@@ -201,103 +224,141 @@ class PaifuDownloader:
             async def _query():
                 async with websockets.connect(target_ws_url, open_timeout=2.5) as ws:
                     js_code = f"""
-                    (function(targetUuid) {{
-                        return new Promise(function(resolve, reject) {{
-                            let timer = setTimeout(function() {{
-                                reject("RPC request timed out after 8000ms");
-                            }}, 8000);
+                    (async function() {{
+                        try {{
+                            let targetUuid = "{uuid}";
 
-                            function handleSuccess(res) {{
-                                clearTimeout(timer);
-                                try {{
-                                    if (!res) {{
-                                        reject("Empty record response received");
-                                        return;
-                                    }}
-                                    let payload = {{
-                                        uuid: targetUuid,
-                                        head: res.head || {{}},
-                                        rounds: []
-                                    }};
+                            // Diagnostics: Check presence of core objects
+                            let hasApp = Boolean(window.app);
+                            let hasNetAgent = Boolean(window.app && window.app.NetAgent);
+                            let hasLobby = Boolean(hasNetAgent && typeof window.app.NetAgent.sendReq2Lobby === "function");
+                            let hasUI = Boolean(window.uiscript && window.uiscript.UI_GameRecord);
 
-                                    if (res.head && res.head.accounts) {{
-                                        payload.accounts = res.head.accounts;
-                                    }}
+                            if (!hasApp && !hasUI) {{
+                                return JSON.stringify({{
+                                    success: false,
+                                    error: "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません。現在のタブが雀魂のゲーム画面であることを確認してください (現在URL: " + location.href + ")"
+                                }});
+                            }}
 
-                                    if (res.data) {{
-                                        let u8 = null;
-                                        if (res.data instanceof Uint8Array) {{
-                                            u8 = res.data;
-                                        }} else if (res.data.buffer && res.data.byteLength) {{
-                                            u8 = new Uint8Array(res.data.buffer, res.data.byteOffset || 0, res.data.byteLength);
-                                        }} else if (Array.isArray(res.data)) {{
-                                            u8 = new Uint8Array(res.data);
+                            return await new Promise(function(resolve) {{
+                                let timer = setTimeout(function() {{
+                                    resolve(JSON.stringify({{
+                                        success: false,
+                                        error: "雀魂サーバーからのRPC応答がタイムアウトしました (8000ms)"
+                                    }}));
+                                }}, 8000);
+
+                                function handleSuccess(res) {{
+                                    clearTimeout(timer);
+                                    try {{
+                                        if (!res) {{
+                                            resolve(JSON.stringify({{
+                                                success: false,
+                                                error: "サーバーから空の牌譜レコードが返却されました"
+                                            }}));
+                                            return;
                                         }}
-                                        if (u8) {{
-                                            let binary = '';
-                                            let len = u8.byteLength;
-                                            for (let i = 0; i < len; i++) {{
-                                                binary += String.fromCharCode(u8[i]);
+                                        let payload = {{
+                                            uuid: targetUuid,
+                                            head: res.head || {{}},
+                                            rounds: []
+                                        }};
+
+                                        if (res.head && res.head.accounts) {{
+                                            payload.accounts = res.head.accounts;
+                                        }}
+
+                                        if (res.data) {{
+                                            let u8 = null;
+                                            if (res.data instanceof Uint8Array) {{
+                                                u8 = res.data;
+                                            }} else if (res.data.buffer && res.data.byteLength) {{
+                                                u8 = new Uint8Array(res.data.buffer, res.data.byteOffset || 0, res.data.byteLength);
+                                            }} else if (Array.isArray(res.data)) {{
+                                                u8 = new Uint8Array(res.data);
                                             }}
-                                            payload.data_base64 = btoa(binary);
-                                        }} else if (typeof res.data === "object") {{
-                                            payload.data = res.data;
+                                            if (u8) {{
+                                                let binary = '';
+                                                let len = u8.byteLength;
+                                                for (let i = 0; i < len; i++) {{
+                                                    binary += String.fromCharCode(u8[i]);
+                                                }}
+                                                payload.data_base64 = btoa(binary);
+                                            }} else if (typeof res.data === "object") {{
+                                                payload.data = res.data;
+                                            }}
                                         }}
+
+                                        if (res.records) payload.records = res.records;
+                                        if (res.actions) payload.actions = res.actions;
+                                        if (res.rounds) payload.rounds = res.rounds;
+
+                                        resolve(JSON.stringify({{
+                                            success: true,
+                                            payload: payload
+                                        }}));
+                                    }} catch (err) {{
+                                        resolve(JSON.stringify({{
+                                            success: false,
+                                            error: "ペイロードシリアライズ例外: " + err.toString()
+                                        }}));
                                     }}
-
-                                    if (res.records) payload.records = res.records;
-                                    if (res.actions) payload.actions = res.actions;
-                                    if (res.rounds) payload.rounds = res.rounds;
-
-                                    resolve(JSON.stringify(payload));
-                                }} catch (err) {{
-                                    reject("Payload formatting error: " + err.toString());
                                 }}
-                            }}
 
-                            function handleFailure(err) {{
-                                clearTimeout(timer);
-                                reject("Majsoul RPC error: " + JSON.stringify(err));
-                            }}
+                                function handleFailure(msg) {{
+                                    clearTimeout(timer);
+                                    resolve(JSON.stringify({{
+                                        success: false,
+                                        error: String(msg)
+                                    }}));
+                                }}
 
-                            // 1. Primary RPC: app.NetAgent.sendReq2Lobby
-                            if (window.app && window.app.NetAgent && typeof window.app.NetAgent.sendReq2Lobby === "function") {{
-                                let clientVer = (window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "";
-                                window.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
-                                    if (!err && res) {{
-                                        handleSuccess(res);
-                                    }} else {{
-                                        // Fallback to contest game record
-                                        window.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
-                                            if (!err2 && res2) {{
-                                                handleSuccess(res2);
-                                            }} else {{
-                                                handleFailure(err || err2);
-                                            }}
-                                        }});
-                                    }}
-                                }});
-                                return;
-                            }}
+                                // 1. Primary RPC: app.NetAgent.sendReq2Lobby
+                                if (hasLobby) {{
+                                    let clientVer = (window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "";
+                                    window.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
+                                        if (!err && res) {{
+                                            handleSuccess(res);
+                                        }} else {{
+                                            // Fallback: fetchCustomizedContestGameRecord
+                                            window.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
+                                                if (!err2 && res2) {{
+                                                    handleSuccess(res2);
+                                                }} else {{
+                                                    let errDetail = JSON.stringify(err || err2);
+                                                    handleFailure("雀魂Lobby RPCエラー (fetchGameRecord失敗): " + errDetail);
+                                                }}
+                                            }});
+                                        }}
+                                    }});
+                                    return;
+                                }}
 
-                            // 2. Secondary RPC: uiscript.UI_GameRecord.getRecord
-                            if (window.uiscript && window.uiscript.UI_GameRecord && typeof window.uiscript.UI_GameRecord.getRecord === "function") {{
-                                window.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
-                                    if (res) handleSuccess(res);
-                                    else handleFailure("uiscript.UI_GameRecord.getRecord returned empty");
-                                }});
-                                return;
-                            }}
+                                // 2. Secondary RPC: uiscript.UI_GameRecord.getRecord
+                                if (hasUI && typeof window.uiscript.UI_GameRecord.getRecord === "function") {{
+                                    window.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
+                                        if (res) handleSuccess(res);
+                                        else handleFailure("uiscript.UI_GameRecord.getRecord が空を返しました");
+                                    }});
+                                    return;
+                                }}
 
-                            // 3. Fallback: app.NetAgent.cached_records
-                            if (window.app && window.app.NetAgent && window.app.NetAgent.cached_records && window.app.NetAgent.cached_records[targetUuid]) {{
-                                handleSuccess(window.app.NetAgent.cached_records[targetUuid]);
-                                return;
-                            }}
+                                // 3. Fallback: app.NetAgent.cached_records
+                                if (window.app && window.app.NetAgent && window.app.NetAgent.cached_records && window.app.NetAgent.cached_records[targetUuid]) {{
+                                    handleSuccess(window.app.NetAgent.cached_records[targetUuid]);
+                                    return;
+                                }}
 
-                            handleFailure("雀魂の通信マネージャー (app.NetAgent) が検出されませんでした。");
-                        }});
-                    }})("{uuid}")
+                                handleFailure("雀魂RPC呼び出しメソッド (sendReq2Lobby) が初期化されていません。ログイン状態をご確認ください。");
+                            }});
+                        }} catch (e) {{
+                            return JSON.stringify({{
+                                success: false,
+                                error: "ブラウザ内スクリプト例外: " + e.toString() + "\\n" + (e.stack || "")
+                            }});
+                        }}
+                    }})()
                     """
                     cmd = {
                         "id": 201,
@@ -314,21 +375,29 @@ class PaifuDownloader:
 
                     result_data = resp_obj.get("result", {})
                     if "exceptionDetails" in result_data:
-                        desc = result_data["exceptionDetails"].get("exception", {}).get("description", "")
-                        print(f"[PaifuDownloader] RPC evaluation exception: {desc}")
-                        return None
+                        exc = result_data["exceptionDetails"]
+                        exc_desc = exc.get("exception", {}).get("value") or exc.get("exception", {}).get("description") or exc.get("text", "")
+                        print(f"[PaifuDownloader] CDP Runtime evaluation exception: {exc_desc}")
 
                     val = result_data.get("result", {}).get("value")
                     if val and isinstance(val, str):
                         try:
-                            record = json.loads(val)
-                            # If binary payload was returned in data_base64, decode actions
-                            if "data_base64" in record and not record.get("rounds"):
-                                raw_bytes = base64.b64decode(record["data_base64"])
-                                actions = decode_game_detail_records(raw_bytes)
-                                if actions:
-                                    record["rounds"] = [{"actions": actions}]
-                            return record
+                            resp_json = json.loads(val)
+                            if isinstance(resp_json, dict) and "success" in resp_json:
+                                if not resp_json.get("success"):
+                                    err_msg = resp_json.get("error", "Unknown RPC failure")
+                                    print(f"[PaifuDownloader] Majsoul RPC Error for {uuid}:\n  --> {err_msg}")
+                                    return None
+                                payload = resp_json.get("payload") or resp_json.get("data")
+                                if isinstance(payload, dict):
+                                    if "data_base64" in payload and not payload.get("rounds"):
+                                        raw_bytes = base64.b64decode(payload["data_base64"])
+                                        actions = decode_game_detail_records(raw_bytes)
+                                        if actions:
+                                            payload["rounds"] = [{"actions": actions}]
+                                    return payload
+                            elif isinstance(resp_json, dict):
+                                return resp_json
                         except Exception as e:
                             print(f"[PaifuDownloader] JSON parse error on RPC response: {e}")
                     elif isinstance(val, dict):
