@@ -1,0 +1,99 @@
+engine:
+  model_path: models/mortal_model.pt
+  device: cpu
+  max_inference_time_ms: 200
+  use_mock_fallback: true
+timing:
+  mean_latency_sec: 1.8
+  std_dev_sec: 0.4
+  min_latency_sec: 1.0
+  max_latency_sec: 3.0
+  fast_tsumogiri_sec: 0.8
+  riichi_auto_discard_sec: 0.4
+  urgent_cut_sec: 0.6
+strategy:
+  attack_bias: 1.0
+  defense_bias: 1.0
+  rank_multipliers:
+    1:
+      defense_scale: 1.6
+      attack_scale: 0.7
+    2:
+      defense_scale: 1.1
+      attack_scale: 0.95
+    3:
+      defense_scale: 0.9
+      attack_scale: 1.2
+    4:
+      defense_scale: 0.6
+      attack_scale: 1.7
+  ooras:
+    top_heavy_defense: 2.2
+    last_push_aggression: 2.5
+    oya_renchan_bias: 1.3
+  riichi_response:
+    danger_penalty_weight: 1.5
+    push_shanten_threshold: 1
+screen_mapping:
+  client_viewport:
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+    scale_x: 1.0
+    scale_y: 1.0
+  resolution:
+  - 1920
+  - 1080
+  hand_area:
+    start_x: 430
+    end_x: 1490
+    y: 980
+    slot_width: 75
+  tsumo_slot:
+    x: 1530
+    y: 980
+  button_positions:
+    riichi:
+    - 1100
+    - 850
+    chi:
+    - 1200
+    - 850
+    pon:
+    - 1300
+    - 850
+    kan:
+    - 1400
+    - 850
+    ron:
+    - 1500
+    - 850
+    tsumo:
+    - 1500
+    - 850
+    pass:
+    - 1600
+    - 850
+output_mode: dashboard
+opponent_profiles_path: config/opponent_profiles.json
+semi_auto:
+  hover_timeout_sec: 15.0
+  auto_click_on_timeout: false
+  wait_key: space
+  interactive_wait: true
+mouse_control:
+  enable_pyautogui: false
+  jitter_px: 6
+  hover_delay_min: 0.08
+  hover_delay_max: 0.18
+  click_hold_min: 0.04
+  click_hold_max: 0.09
+  riichi_step_wait: 0.35
+  rest_area:
+    x_min: 1400
+    x_max: 1750
+    y_min: 650
+    y_max: 800
+  rest_escape_min_sec: 0.2
+  rest_escape_max_sec: 0.5

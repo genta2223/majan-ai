@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Mahjong AI Agent local runtime and output
+mahjong_ai_agent/build/
+mahjong_ai_agent/dist/
+mahjong_ai_agent/output/
+mahjong_ai_agent/scratch/
+mahjong_ai_agent/runtime/
+mahjong_ai_agent/app/
+mahjong_ai_agent/_update_temp.zip
+mahjong_ai_agent/version.txt
+output/
+runtime/
+app/
+_update_temp.zip
+version.txt
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
