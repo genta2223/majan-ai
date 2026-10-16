@@ -2997,6 +2997,39 @@ def test_authentic_paifu_player_names_and_independent_stats():
     assert p1.deal_in_count != p3.deal_in_count
 
 
+def test_paifu_downloader_subthread_asyncio_loop():
+    """
+    Test verifying asyncio event loop safety in background worker threads:
+    Calls _fetch_via_rpc and fetch_paifu from within a fresh threading.Thread (simulating GUI worker).
+    Asserts that NO 'RuntimeError: There is no current event loop in thread' is raised.
+    """
+    import threading
+    from tools.paifu_to_mjai import PaifuDownloader
+
+    downloader = PaifuDownloader(cdp_port=9222)
+    thread_exceptions = []
+
+    def _worker():
+        try:
+            # 1. Test _fetch_via_rpc in subthread without active loop (offline port -> gracefully returns None)
+            res = downloader._fetch_via_rpc("261016-subthread-test-uuid")
+            assert res is None or isinstance(res, dict)
+
+            # 2. Test fetch_paifu in subthread with mock/test UUID
+            rec = downloader.fetch_paifu("261016-mock-subthread-worker")
+            assert rec is not None
+            assert rec.get("uuid") == "261016-mock-subthread-worker"
+        except Exception as e:
+            thread_exceptions.append(e)
+
+    t = threading.Thread(target=_worker, name="TestWorkerThread")
+    t.start()
+    t.join(timeout=5.0)
+
+    assert not thread_exceptions, f"Subthread raised unexpected exception: {thread_exceptions}"
+
+
+
 
 
 

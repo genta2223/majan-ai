@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -335,14 +336,18 @@ class PaifuDownloader:
                     return None
 
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+
+                if running_loop and running_loop.is_running():
                     import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(lambda: asyncio.run(_query()))
-                        return future.result(timeout=11.0)
+                        return future.result(timeout=12.0)
                 else:
-                    return loop.run_until_complete(_query())
+                    return asyncio.run(_query())
             except Exception as e:
                 print(f"[PaifuDownloader] On-demand RPC fetch failed: {e}")
                 return None
