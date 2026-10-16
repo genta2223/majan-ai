@@ -546,8 +546,8 @@ class MahjongHUDApp:
             lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
             extracted = [(parse_paifu_url(l)[0], 0) for l in lines]
 
-        self.btn_analyze_paifu.config(state=tk.DISABLED, text="⏳ 解析中...")
-        self.lbl_exploit_summary.config(text="牌譜をダウンロード・解析しています...", fg=self.c_yellow)
+        self.btn_analyze_paifu.config(state=tk.DISABLED, text="⏳ サーバーから取得中...")
+        self.lbl_exploit_summary.config(text="雀魂内部RPC経由でサーバーから牌譜データを取得中...", fg=self.c_yellow)
 
         def _worker():
             from tools.paifu_to_mjai import download_and_convert_paifu
@@ -557,12 +557,15 @@ class MahjongHUDApp:
                 if not u:
                     continue
                 try:
-                    self._log(f"[Paifu] 牌譜ダウンロード・変換開始: {u}")
+                    self.root.after(0, lambda uuid_text=u: self.lbl_exploit_summary.config(
+                        text=f"雀魂サーバーから牌譜を取得中: {uuid_text[:20]}...", fg=self.c_yellow
+                    ))
+                    self._log(f"[Paifu] 雀魂RPC牌譜取得リクエスト開始: {u}")
                     _, events = download_and_convert_paifu(u)
                     self.active_profiler.analyze_game_events(events)
                     parsed_count += 1
                 except Exception as e:
-                    self._log_err(f"[Paifu Error] {u} の解析失敗: {e}")
+                    self._log_err(f"[Paifu Error] {u} の取得・解析失敗: {e}")
 
             def _update_ui():
                 self.btn_analyze_paifu.config(state=tk.NORMAL, text="📊 牌譜を取り込んで解析")

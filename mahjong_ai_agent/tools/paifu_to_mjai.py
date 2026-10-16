@@ -134,9 +134,9 @@ class PaifuDownloader:
                 record_data = create_mock_authentic_game_record(safe_uuid)
             else:
                 raise FileNotFoundError(
-                    f"牌譜データ (UUID: {safe_uuid}) を取得できませんでした。\n"
-                    f"【操作手順】雀魂の牌譜一覧から該当の牌譜を一度再生・開いた状態にしてから、再度「牌譜を取り込んで解析」を実行してください。\n"
-                    f"(Chromeがリモートデバッグポート {self.cdp_port} で起動していることもご確認ください)"
+                    f"牌譜データ (UUID: {safe_uuid}) を雀魂サーバーから取得できませんでした。\n"
+                    f"・Chrome (デバッグポート: {self.cdp_port}) で雀魂が起動し、ログインしているかご確認ください。\n"
+                    f"・指定された牌譜UUID ({safe_uuid}) が正しいかご確認ください。"
                 )
 
         # Cache downloaded authentic data
@@ -167,10 +167,11 @@ class PaifuDownloader:
                 return True
         return False
 
-    def _fetch_via_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
+    def _fetch_via_rpc(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
-        Extracts authentic paifu record directly from the active Chrome instance (CDP port 9222).
-        Attempts to read from window.uiscript, app.NetAgent, or localStorage cache.
+        Actively invokes Majsoul internal RPC (app.NetAgent.sendReq2Lobby 'fetchGameRecord')
+        via Chrome DevTools Protocol (CDP port 9222) Runtime.evaluate with awaitPromise: True.
+        Directly fetches authentic game record data on demand without requiring manual replay playback.
         """
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
@@ -181,8 +182,9 @@ class PaifuDownloader:
 
         target_ws_url = None
         for t in targets:
-            url = t.get("url", "")
-            if "mahjongsoul" in url or "game.maj-soul" in url:
+            url = t.get("url", "").lower()
+            title = t.get("title", "").lower()
+            if "mahjongsoul" in url or "maj-soul" in url or "雀魂" in title:
                 target_ws_url = t.get("webSocketDebuggerUrl")
                 break
         if not target_ws_url and targets:
@@ -196,39 +198,140 @@ class PaifuDownloader:
             import asyncio
 
             async def _query():
-                async with websockets.connect(target_ws_url, open_timeout=2.0) as ws:
+                async with websockets.connect(target_ws_url, open_timeout=2.5) as ws:
                     js_code = f"""
-                    (function() {{
-                        try {{
-                            if (window.uiscript && window.uiscript.UI_GameRecord && window.uiscript.UI_GameRecord.record) {{
-                                return JSON.stringify(window.uiscript.UI_GameRecord.record);
-                            }}
-                            for (let i = 0; i < localStorage.length; i++) {{
-                                let k = localStorage.key(i);
-                                if (k && k.includes("{uuid}")) {{
-                                    return localStorage.getItem(k);
+                    (function(targetUuid) {{
+                        return new Promise(function(resolve, reject) {{
+                            let timer = setTimeout(function() {{
+                                reject("RPC request timed out after 8000ms");
+                            }}, 8000);
+
+                            function handleSuccess(res) {{
+                                clearTimeout(timer);
+                                try {{
+                                    if (!res) {{
+                                        reject("Empty record response received");
+                                        return;
+                                    }}
+                                    let payload = {{
+                                        uuid: targetUuid,
+                                        head: res.head || {{}},
+                                        rounds: []
+                                    }};
+
+                                    if (res.head && res.head.accounts) {{
+                                        payload.accounts = res.head.accounts;
+                                    }}
+
+                                    if (res.data) {{
+                                        let u8 = null;
+                                        if (res.data instanceof Uint8Array) {{
+                                            u8 = res.data;
+                                        }} else if (res.data.buffer && res.data.byteLength) {{
+                                            u8 = new Uint8Array(res.data.buffer, res.data.byteOffset || 0, res.data.byteLength);
+                                        }} else if (Array.isArray(res.data)) {{
+                                            u8 = new Uint8Array(res.data);
+                                        }}
+                                        if (u8) {{
+                                            let binary = '';
+                                            let len = u8.byteLength;
+                                            for (let i = 0; i < len; i++) {{
+                                                binary += String.fromCharCode(u8[i]);
+                                            }}
+                                            payload.data_base64 = btoa(binary);
+                                        }} else if (typeof res.data === "object") {{
+                                            payload.data = res.data;
+                                        }}
+                                    }}
+
+                                    if (res.records) payload.records = res.records;
+                                    if (res.actions) payload.actions = res.actions;
+                                    if (res.rounds) payload.rounds = res.rounds;
+
+                                    resolve(JSON.stringify(payload));
+                                }} catch (err) {{
+                                    reject("Payload formatting error: " + err.toString());
                                 }}
                             }}
-                            return null;
-                        }} catch (e) {{
-                            return null;
-                        }}
-                    }})()
+
+                            function handleFailure(err) {{
+                                clearTimeout(timer);
+                                reject("Majsoul RPC error: " + JSON.stringify(err));
+                            }}
+
+                            // 1. Primary RPC: app.NetAgent.sendReq2Lobby
+                            if (window.app && window.app.NetAgent && typeof window.app.NetAgent.sendReq2Lobby === "function") {{
+                                let clientVer = (window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "";
+                                window.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
+                                    if (!err && res) {{
+                                        handleSuccess(res);
+                                    }} else {{
+                                        // Fallback to contest game record
+                                        window.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
+                                            if (!err2 && res2) {{
+                                                handleSuccess(res2);
+                                            }} else {{
+                                                handleFailure(err || err2);
+                                            }}
+                                        }});
+                                    }}
+                                }});
+                                return;
+                            }}
+
+                            // 2. Secondary RPC: uiscript.UI_GameRecord.getRecord
+                            if (window.uiscript && window.uiscript.UI_GameRecord && typeof window.uiscript.UI_GameRecord.getRecord === "function") {{
+                                window.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
+                                    if (res) handleSuccess(res);
+                                    else handleFailure("uiscript.UI_GameRecord.getRecord returned empty");
+                                }});
+                                return;
+                            }}
+
+                            // 3. Fallback: app.NetAgent.cached_records
+                            if (window.app && window.app.NetAgent && window.app.NetAgent.cached_records && window.app.NetAgent.cached_records[targetUuid]) {{
+                                handleSuccess(window.app.NetAgent.cached_records[targetUuid]);
+                                return;
+                            }}
+
+                            handleFailure("雀魂の通信マネージャー (app.NetAgent) が検出されませんでした。");
+                        }});
+                    }})("{uuid}")
                     """
                     cmd = {
-                        "id": 101,
+                        "id": 201,
                         "method": "Runtime.evaluate",
-                        "params": {"expression": js_code, "returnByValue": True}
+                        "params": {
+                            "expression": js_code,
+                            "awaitPromise": True,
+                            "returnByValue": True,
+                        }
                     }
                     await ws.send(json.dumps(cmd))
-                    resp_str = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                    resp_str = await asyncio.wait_for(ws.recv(), timeout=10.0)
                     resp_obj = json.loads(resp_str)
-                    val = resp_obj.get("result", {}).get("result", {}).get("value")
+
+                    result_data = resp_obj.get("result", {})
+                    if "exceptionDetails" in result_data:
+                        desc = result_data["exceptionDetails"].get("exception", {}).get("description", "")
+                        print(f"[PaifuDownloader] RPC evaluation exception: {desc}")
+                        return None
+
+                    val = result_data.get("result", {}).get("value")
                     if val and isinstance(val, str):
                         try:
-                            return json.loads(val)
-                        except Exception:
-                            pass
+                            record = json.loads(val)
+                            # If binary payload was returned in data_base64, decode actions
+                            if "data_base64" in record and not record.get("rounds"):
+                                raw_bytes = base64.b64decode(record["data_base64"])
+                                actions = decode_game_detail_records(raw_bytes)
+                                if actions:
+                                    record["rounds"] = [{"actions": actions}]
+                            return record
+                        except Exception as e:
+                            print(f"[PaifuDownloader] JSON parse error on RPC response: {e}")
+                    elif isinstance(val, dict):
+                        return val
                     return None
 
             try:
@@ -237,20 +340,29 @@ class PaifuDownloader:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor() as executor:
                         future = executor.submit(lambda: asyncio.run(_query()))
-                        return future.result(timeout=4.0)
+                        return future.result(timeout=11.0)
                 else:
                     return loop.run_until_complete(_query())
-            except Exception:
-                return asyncio.run(_query())
+            except Exception as e:
+                print(f"[PaifuDownloader] On-demand RPC fetch failed: {e}")
+                return None
         except Exception as e:
-            print(f"[PaifuDownloader] CDP extraction error: {e}")
+            print(f"[PaifuDownloader] CDP connection error: {e}")
             return None
 
     def _fetch_from_remote(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
-        Attempts to fetch public record from API gateways or mirrors.
-        Returns None if record cannot be fetched from remote.
+        Attempts to fetch record:
+        1. On-demand active RPC directly through the running Majsoul browser session.
+        2. Public web APIs / gateways as fallback.
         """
+        # 1. Primary: Active RPC call via CDP directly to Majsoul server
+        rpc_record = self._fetch_via_rpc(uuid)
+        if rpc_record:
+            print(f"[PaifuDownloader] Successfully fetched authentic game record via active Majsoul RPC for: {uuid}")
+            return rpc_record
+
+        # 2. Secondary: Public API endpoints
         api_endpoints = [
             f"https://api.mahjongsoul.com/record?uuid={uuid}",
             f"https://game.mahjongsoul.com/api/record/{uuid}",
@@ -274,17 +386,38 @@ class PaifuDownloader:
             except Exception:
                 continue
 
-        # Try CDP fetch
-        cdp_res = self._fetch_via_cdp(uuid)
-        if cdp_res:
-            return cdp_res
-        else:
-            print(
-                f"[PaifuDownloader] CDPメモリから牌譜 (UUID: {uuid}) が見つかりませんでした。\n"
-                f"【案内】雀魂の牌譜一覧から該当の牌譜を一度再生・開いた状態で再度読み込んでください。"
-            )
-
         return None
+
+
+def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
+    """
+    Decodes GameDetailRecords protobuf payload (often gzip-compressed) from Majsoul RPC.
+    Extracts repeated Wrapper messages containing action_name and decoded payload data.
+    """
+    if not raw_bytes:
+        return []
+    import gzip
+    try:
+        data = gzip.decompress(raw_bytes)
+    except Exception:
+        data = raw_bytes
+
+    actions: List[Dict[str, Any]] = []
+    fields = decode_raw_protobuf(data)
+    record_blobs = fields.get(1, [])
+    for blob in record_blobs:
+        if isinstance(blob, (bytes, bytearray)):
+            w_fields = decode_raw_protobuf(bytes(blob))
+            raw_name = w_fields.get(1, [b""])[0]
+            name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, (bytes, bytearray)) else str(raw_name)
+            payload = w_fields.get(2, [b""])[0]
+            if isinstance(payload, (bytes, bytearray)):
+                parsed_data = LiqiProtoDecoder.parse_action_payload(name, bytes(payload))
+                if parsed_data:
+                    actions.append({"action_name": name, "data": parsed_data})
+                else:
+                    actions.append({"action_name": name, "data": {}})
+    return actions
 
 
 def is_cpu_player_name(name: str) -> bool:
