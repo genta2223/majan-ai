@@ -263,7 +263,18 @@ class MahjongStateManager:
         new_p.is_dealer = (new_actor == self.round_state.oya)
         self.verify_hand_consistency(context="migrate_seat")
 
-    def reset_round(self, bakaze: str, kyoku: int, honba: int, kyotaku: int, oya: int, scores: List[int], tehais: List[List[str]], dora_marker: Any):
+    def reset_round(
+        self,
+        bakaze: str,
+        kyoku: int,
+        honba: int,
+        kyotaku: int,
+        oya: int,
+        scores: List[int],
+        tehais: List[List[str]],
+        dora_marker: Any,
+        is_rescue: bool = False
+    ):
         """Initialize state for a new round."""
         if isinstance(dora_marker, (list, tuple)):
             dora_indicators = [m for m in dora_marker if m and is_valid_mahjong_tile(m)]
@@ -287,12 +298,28 @@ class MahjongStateManager:
                 pass
             return default
 
+        # Identify genuine starting hand tiles (>= 13 valid non-'?' tiles)
+        genuine_hand = []
+        for h in tehais:
+            v_h = [t for t in h if t and t != "?" and is_valid_mahjong_tile(t)]
+            if len(v_h) >= 13:
+                genuine_hand = list(v_h)
+                self._initial_round_hand = list(v_h)
+                break
+        if not genuine_hand and self._initial_round_hand:
+            genuine_hand = list(self._initial_round_hand)
+
         players = []
         for i in range(4):
             raw_player_tehai = tehais[i] if i < len(tehais) and tehais[i] else []
             # Filter strictly valid mahjong tiles for self hand
             if i == self.my_actor_id:
                 clean_tehai = [t for t in raw_player_tehai if t and t not in ("?", "None") and is_valid_mahjong_tile(t)]
+                # Regular round start route: If self hand is empty or masked in tehais,
+                # but genuine 13-tile hand exists in payload, UNCONDITIONALLY bind it to self!
+                if not is_rescue and len(clean_tehai) < 13 and genuine_hand:
+                    clean_tehai = list(genuine_hand[:13])
+                    print(f"[StateManager] Regular start route: Unconditionally bound {len(clean_tehai)} authentic hand tiles to self (Player {i}).")
             else:
                 clean_tehai = list(raw_player_tehai)
 
@@ -316,12 +343,6 @@ class MahjongStateManager:
             players=players,
             active_actor=oya
         )
-        # Record initial round hand (the hand with >= 13 valid tiles across all seats)
-        for h in tehais:
-            v_h = [t for t in h if t and t != "?" and is_valid_mahjong_tile(t)]
-            if len(v_h) >= 13:
-                self._initial_round_hand = list(v_h)
-                break
 
         self._update_ranks()
         self.verify_hand_consistency(context="reset_round")
@@ -463,6 +484,7 @@ class MahjongStateManager:
             else:
                 dora_marker = str(raw_dora) if raw_dora else ""
 
+            is_rescue = bool(event.get("is_rescue", False))
             self.reset_round(
                 bakaze=event.get("bakaze", "E"),
                 kyoku=event.get("kyoku", 1),
@@ -471,7 +493,8 @@ class MahjongStateManager:
                 oya=event.get("oya", 0),
                 scores=event.get("scores", self.initial_scores),
                 tehais=event.get("tehais", [[], [], [], []]),
-                dora_marker=dora_marker
+                dora_marker=dora_marker,
+                is_rescue=is_rescue
             )
             mark_trace_event("START_KYOKU", self.dump_state())
             trace_log("ROUND_STATE_INITIALIZED", self.dump_state())

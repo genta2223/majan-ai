@@ -5543,6 +5543,122 @@ def test_binary_comprehension_benchmark_100_percent():
     assert report["overall_comprehension"] == 100.0
 
 
+@pytest.mark.asyncio
+async def test_regular_round_start_dealer_unconditional_hand_and_immediate_decision(test_config):
+    """
+    Verify that in regular round start route (ActionNewRound, not rescue):
+    1. Dealer hand is unconditionally bound to 13 tiles without being blocked by safety guards.
+    2. Dealer's 1st turn decision is directly kicked immediately on start_kyoku (no freezing/waiting).
+    """
+    from main import MahjongAIAgent
+
+    agent = MahjongAIAgent(
+        config=test_config,
+        my_actor_id=0,
+        apply_sleep=False
+    )
+    agent.vision_fallback_enabled = False
+
+    initial_13_tiles = ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4s"]
+
+    start_event = {
+        "type": "start_kyoku",
+        "action_name": "ActionNewRound",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [list(initial_13_tiles), ["?"], ["?"], ["?"]],
+        "dora_marker": "1z",
+        "is_rescue": False
+    }
+
+    # Handle start_kyoku: dealer should immediately compute 1st turn action
+    action = await agent.handle_event(start_event)
+
+    # 1. State must have full hand tiles (14 after dealer tsumo)
+    assert agent.state_mgr.round_state is not None
+    assert agent.state_mgr.my_player is not None
+    assert len(agent.state_mgr.my_player.tehai) == 14
+    # 2. Decision must be returned immediately without silence/freeze
+    assert action is not None
+    assert action.tile in initial_13_tiles or action.tile == agent.state_mgr.my_player.tsumo_tile
+
+
+@pytest.mark.asyncio
+async def test_regular_round_start_non_dealer_unconditional_hand_and_first_tsumo(test_config):
+    """
+    Verify that for child player (seat=3, North):
+    1. Regular round start unconditionally binds authentic 13 tiles to self hand.
+    2. When child's 1st turn draw arrives, decision is directly computed.
+    """
+    from main import MahjongAIAgent
+
+    # Agent initialized as child (seat 3)
+    agent = MahjongAIAgent(
+        config=test_config,
+        my_actor_id=3,
+        apply_sleep=False
+    )
+    agent.vision_fallback_enabled = False
+
+    initial_13_tiles = ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s", "1m", "2m", "3m", "4m"]
+
+    # Even if start_kyoku carries hand in seat 0 or payload, regular route binds it to self
+    start_event = {
+        "type": "start_kyoku",
+        "action_name": "ActionNewRound",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [["?"], ["?"], ["?"], list(initial_13_tiles)],
+        "dora_marker": "1z",
+        "is_rescue": False
+    }
+
+    action_start = await agent.handle_event(start_event)
+    # Child does not discard on start_kyoku (waiting for dealer's turn)
+    assert action_start is None
+    assert len(agent.state_mgr.my_player.tehai) == 13
+
+    # Child's 1st draw arrives
+    tsumo_event = {
+        "type": "tsumo",
+        "actor": 3,
+        "pai": "5m"
+    }
+    action_draw = await agent.handle_event(tsumo_event)
+    assert action_draw is not None
+    assert len(agent.state_mgr.my_player.tehai) == 14
+    assert action_draw.tile in agent.state_mgr.my_player.tehai
+
+
+def test_rescue_route_does_not_unconditionally_bind_when_empty():
+    """Verify that rescue route (mid-game sync with empty hand) preserves recovery safeguards."""
+    sm = MahjongStateManager(my_actor_id=0)
+    rescue_event = {
+        "type": "start_kyoku",
+        "action_name": "RescueNewRound",
+        "bakaze": "E",
+        "kyoku": 2,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 1,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [["?"] * 13, ["?"] * 13, ["?"] * 13, ["?"] * 13],
+        "dora_marker": "1z",
+        "is_rescue": True
+    }
+    sm.update_event(rescue_event)
+    # Rescue route with no visible tiles must have empty clean hand awaiting sync, not fake tiles
+    assert len(sm.my_player.tehai) == 0
+
+
 
 
 

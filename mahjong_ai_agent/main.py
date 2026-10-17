@@ -228,10 +228,14 @@ class MahjongAIAgent:
             except Exception:
                 pass
 
-        # Schedule autonomous 1st turn watchdog safety net on round start
+        # Direct 1st turn trigger for dealer on regular round start
         if event_type == "start_kyoku":
-            if (self.state_mgr.round_state and self.state_mgr.round_state.oya == self.my_actor_id) or self.state_mgr.is_my_turn:
+            is_dealer_self = (self.state_mgr.round_state and self.state_mgr.round_state.oya == self.my_actor_id)
+            if is_dealer_self or self.state_mgr.is_my_turn:
+                self.state_mgr.ensure_dealer_first_tsumo()
                 asyncio.create_task(self._schedule_first_turn_watchdog(delay_sec=0.2))
+                print(f"[Main FirstTurn] Dealer initial turn detected on start_kyoku. Triggering decide_and_act() immediately.")
+                return await self.decide_and_act()
 
         # Strict guard condition checking if self decision is genuinely required
         from io_adapter.stream_client import is_my_decision_required

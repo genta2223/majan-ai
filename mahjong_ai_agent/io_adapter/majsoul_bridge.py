@@ -428,6 +428,7 @@ class MajsoulBridge:
                 "scores": scores,
                 "tehais": tehais,
                 "dora_marker": dora_marker,
+                "is_rescue": False,
             }
             if any(self.player_nicknames):
                 start_event["names"] = list(self.player_nicknames)
