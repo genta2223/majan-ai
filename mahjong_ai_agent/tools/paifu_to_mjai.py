@@ -980,7 +980,7 @@ class PaifuDownloader:
                                         and "-" not in text
                                         and not text.startswith("Record")
                                         and not text.startswith("Action")
-                                        and not is_tile
+                                        and not is_tile and not text.isdigit() and any(c.isalpha() for c in text) and not text.startswith(".lq.")
                                         and not is_cpu
                                     ):
                                         nick = text
@@ -1011,7 +1011,7 @@ class PaifuDownloader:
                                                         and "-" not in text
                                                         and not text.startswith("Record")
                                                         and not text.startswith("Action")
-                                                        and not is_tile
+                                                        and not is_tile and not text.isdigit() and any(c.isalpha() for c in text) and not text.startswith(".lq.")
                                                         and not is_cpu
                                                     ):
                                                         nick = text
@@ -1070,7 +1070,7 @@ class PaifuDownloader:
                     }
                     break
 
-        accounts = [seat_to_account[s] for s in sorted(seat_to_account.keys())]
+        accounts = [seat_to_account[s] for s in sorted(seat_to_account.keys()) if 0 <= s <= 3][:4]
         return extracted_uuid, accounts
 
     def _try_decode_records(
@@ -1857,60 +1857,101 @@ def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
             data = raw_bytes
 
     actions: List[Dict[str, Any]] = []
-    fields = decode_raw_protobuf(data)
 
-    # 1. Search for repeated records in all tags of fields (prioritize tag 1)
+    def _clean_name(s: str) -> str:
+        s = s.strip()
+        if s.startswith(".lq."):
+            s = s[4:]
+        elif s.startswith("lq."):
+            s = s[3:]
+        return s
+
+    def _parse(name: str, payload: bytes) -> Dict[str, Any]:
+        if not payload:
+            return {}
+        try:
+            return LiqiProtoDecoder.parse_action_payload(name, payload) or {}
+        except Exception:
+            return {}
+
+    # Primary: scan the decompressed bytes for every Wrapper {1: ".lq.RecordXxx", 2: bytes data}.
+    # Works regardless of nesting (v1 `records` tag 1 or v2 `actions` tag 3 -> GameAction.result).
+    import re
+    wrapper_re = re.compile(rb'\x0a([\x05-\x7f])((?:\.lq\.)?(?:Record|Action)[A-Za-z0-9_]+)')
+    pos = 0
+    while data:
+        m = wrapper_re.search(data, pos)
+        if not m:
+            break
+        name_len = m.group(1)[0]
+        raw_name = m.group(2)
+        if len(raw_name) != name_len:
+            pos = m.start() + 1
+            continue
+        name = _clean_name(raw_name.decode("utf-8", errors="ignore"))
+        end = m.end()
+        payload = b""
+        if end < len(data) and data[end] == 0x12:
+            # read varint length
+            ln, shift, i = 0, 0, end + 1
+            while i < len(data):
+                b = data[i]
+                ln |= (b & 0x7F) << shift
+                i += 1
+                if not (b & 0x80):
+                    break
+                shift += 7
+            if i + ln <= len(data):
+                payload = bytes(data[i:i + ln])
+                end = i + ln
+        if name not in ("RecordGame", "RecordAccount", "RecordGameLive"):
+            actions.append({"action_name": name, "data": _parse(name, payload)})
+        pos = end if end > m.start() else m.start() + 1
+
+    primary_actions = actions
+    actions = []
+
+    # Structural protobuf walk (legacy layouts with arbitrary tags)
+    fields = decode_raw_protobuf(data)
     tags_to_check = [1] + [t for t in sorted(fields.keys()) if t != 1]
     for tag in tags_to_check:
-        record_blobs = fields.get(tag, [])
-        for blob in record_blobs:
-            if isinstance(blob, (bytes, bytearray)):
-                w_fields = decode_raw_protobuf(bytes(blob))
-                name = ""
-                payload = b""
-                # Find action name (starts with Record or Action)
-                for w_tag, w_vals in w_fields.items():
-                    for wv in w_vals:
-                        if isinstance(wv, (bytes, bytearray)):
-                            try:
-                                s = wv.decode("utf-8", errors="ignore").strip()
-                                if s.startswith("Record") or s.startswith("Action"):
-                                    name = s
-                                    break
-                            except Exception:
-                                pass
-                    if name:
-                        break
-
-                if name:
-                    # Pick payload from remaining fields
-                    for w_tag, w_vals in w_fields.items():
-                        for wv in w_vals:
-                            if isinstance(wv, (bytes, bytearray)) and bytes(wv) != name.encode("utf-8"):
-                                payload = bytes(wv)
-                                break
-                        if payload:
+        for blob in fields.get(tag, []):
+            if not isinstance(blob, (bytes, bytearray)):
+                continue
+            w_fields = decode_raw_protobuf(bytes(blob))
+            name = ""
+            name_raw = b""
+            for w_vals in w_fields.values():
+                for wv in w_vals:
+                    if isinstance(wv, (bytes, bytearray)):
+                        s = _clean_name(bytes(wv).decode("utf-8", errors="ignore"))
+                        if s.startswith("Record") or s.startswith("Action"):
+                            name, name_raw = s, bytes(wv)
                             break
+                if name:
+                    break
+            if not name:
+                continue
+            payload = b""
+            for w_vals in w_fields.values():
+                for wv in w_vals:
+                    if isinstance(wv, (bytes, bytearray)) and bytes(wv) != name_raw:
+                        payload = bytes(wv)
+                        break
+                if payload:
+                    break
+            actions.append({"action_name": name, "data": _parse(name, payload)})
 
-                    parsed_data = {}
-                    if payload:
-                        try:
-                            parsed_data = LiqiProtoDecoder.parse_action_payload(name, payload) or {}
-                        except Exception:
-                            parsed_data = {}
-                    actions.append({"action_name": name, "data": parsed_data})
+    if len(primary_actions) >= len(actions):
+        actions = primary_actions
 
-    # 2. If no actions from protobuf wire, scan raw decompressed bytes for action names
+    # Last resort: names only (payload unknown)
     if not actions and data:
-        import re
         action_re = re.compile(rb'(Record[A-Za-z0-9_]+|Action[A-Za-z0-9_]+)')
         for m in action_re.finditer(data):
-            try:
-                act_name = m.group(1).decode("utf-8", errors="ignore")
-                if act_name not in ("RecordGame", "RecordAccount", "RecordGameLive"):
-                    actions.append({"action_name": act_name, "data": {}})
-            except Exception:
-                pass
+            act_name = m.group(1).decode("utf-8", errors="ignore")
+            if act_name not in ("RecordGame", "RecordAccount", "RecordGameLive"):
+                actions.append({"action_name": act_name, "data": {}})
 
     return actions
 
@@ -1920,6 +1961,8 @@ def is_cpu_player_name(name: str) -> bool:
     if not name:
         return True
     lower = name.lower().strip()
+    if lower.isdigit() or not any(c.isalpha() for c in lower):
+        return True
     return (
         "cpu" in lower
         or "bot" in lower

@@ -4336,4 +4336,90 @@ def test_paifu_stats_profiler_hora_houju_riichi_and_calls():
     assert p3.open_rate == 0.5
 
 
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def _pb_len(tag: int, payload: bytes) -> bytes:
+    return _pb_varint((tag << 3) | 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_int(tag: int, v: int) -> bytes:
+    return _pb_varint(tag << 3) + _pb_varint(v)
+
+
+def test_paifu_binary_v2_records_numeric_names_and_seat_stats():
+    """
+    Real-format replay: GameDetailRecords.actions (tag 3) -> GameAction.result (tag 3)
+    -> Wrapper{name='.lq.RecordXxx', data}. Numeric strings (200, 3980, 3740) must never
+    become nicknames, and hora/houju/reach/naki must land on the correct seats.
+    """
+    import gzip
+    from tools.paifu_to_mjai import PaifuDownloader, extract_player_names_from_record, convert_record_to_mjai
+    from core.opponent_profiler import OpponentProfiler
+
+    names = ["genta2223", "ブロコフ", "龍斗たっちゃん", "横丁の隠居"]
+
+    def wrap(name: str, data: bytes) -> bytes:
+        wrapper = _pb_len(1, (".lq." + name).encode()) + _pb_len(2, data)
+        game_action = _pb_int(1, 1) + _pb_int(2, 1) + _pb_len(3, wrapper)
+        return _pb_len(3, game_action)
+
+    def tiles(tag, ts):
+        return b"".join(_pb_len(tag, t.encode()) for t in ts)
+
+    recs = b"".join([
+        wrap("RecordNewRound", _pb_int(1, 0) + _pb_int(2, 0) + _pb_len(6, b"".join(_pb_varint(25000) for _ in range(4)))),
+        wrap("RecordDiscardTile", _pb_int(1, 0) + tiles(2, ["5z"])),
+        # Seat 2 (龍斗たっちゃん) pons 5z from seat 0
+        wrap("RecordChiPengGang", _pb_int(1, 2) + _pb_int(2, 1) + tiles(3, ["5z", "5z", "5z"]) + _pb_len(4, bytes([2, 2, 0]))),
+        wrap("RecordDiscardTile", _pb_int(1, 2) + tiles(2, ["9p"])),
+        # Seat 3 riichi
+        wrap("RecordDiscardTile", _pb_int(1, 3) + tiles(2, ["1m"]) + _pb_int(3, 1)),
+        # Seat 1 discards, seat 3 rons
+        wrap("RecordDiscardTile", _pb_int(1, 1) + tiles(2, ["4s"])),
+        wrap("RecordHule", _pb_len(1, _pb_int(4, 3) + _pb_int(9, 1) + tiles(3, ["4s"]))),
+    ])
+    gz = gzip.compress(recs)
+
+    # head: 4 real accounts + noise sub-messages containing numeric strings
+    accs = b"".join(
+        _pb_len(11, _pb_int(1, 50000 + i) + (_pb_int(2, i) if i else b"") + _pb_len(3, n.encode()))
+        for i, n in enumerate(names)
+    )
+    noise = b"".join(_pb_len(12, _pb_int(2, 1) + _pb_len(3, v)) for v in (b"200", b"3980", b"3740"))
+    head = _pb_len(1, b"261017-v2-binary-uuid") + accs + noise
+    frame = b"\x03\x05\x00" + _pb_len(2, gz) + _pb_len(3, head) + b"\x00" * 2000
+
+    rec = PaifuDownloader()._try_decode_records(frame, "261017-v2-binary-uuid")
+    assert rec is not None
+    nicks = [a["nickname"] for a in rec["accounts"]]
+    assert not any(n.isdigit() for n in nicks)
+    assert extract_player_names_from_record(rec) == names
+
+    acts = rec["rounds"][0]["actions"]
+    assert acts[0]["action_name"] == "RecordNewRound"
+    assert all(a["data"] for a in acts), "action payloads must be decoded, not empty"
+
+    events = convert_record_to_mjai(rec, my_seat=0)
+    profiler = OpponentProfiler()
+    profiler.analyze_game_events(events)
+
+    assert set(profiler.profiles) == set(names)
+    assert profiler.stats[2]["naki"] == 1 and profiler.stats[2]["yakuhai"] == 1
+    assert profiler.stats[0]["naki"] == 0
+    assert profiler.stats[3]["reach"] == 1 and profiler.stats[3]["agari"] == 1
+    assert profiler.stats[1]["houju"] == 1
+    assert profiler.get_profile("龍斗たっちゃん").open_rate == 1.0
+    assert profiler.get_profile("genta2223").open_rate == 0.0
+    assert profiler.get_profile("横丁の隠居").hora_rate == 1.0
+    assert profiler.get_profile("横丁の隠居").riichi_rate == 1.0
+    assert profiler.get_profile("ブロコフ").deal_in_rate == 1.0
+
+
 

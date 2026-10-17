@@ -169,6 +169,7 @@ class OpponentProfiler:
                 "houju": 0,
                 "reach": 0,
                 "call": 0,
+                "naki": 0,
                 "rounds": 0,
                 "tanyao": 0,
                 "yakuhai": 0,
@@ -245,6 +246,7 @@ class OpponentProfiler:
                 actor = ev.get("actor", 0)
                 if 0 <= actor < 4 and actor in self.stats:
                     self.stats[actor]["call"] += 1
+                    self.stats[actor]["naki"] += 1
 
                 if 0 <= actor < len(player_names):
                     name = player_names[actor]
