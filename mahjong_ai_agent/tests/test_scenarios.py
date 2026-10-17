@@ -2612,7 +2612,8 @@ def test_action_packet_hand_state_synchronization():
     for ev in events:
         state_mgr.update_event(ev)
 
-    assert len(state_mgr.my_player.tehai) == 13
+    # Dealer is brought into 14-tile state immediately (13-tile hand + initial draw) so initial discard is triggered
+    assert len(state_mgr.my_player.tehai) == 14
     assert state_mgr.my_player.has_tile("1m")
     assert not state_mgr.my_player.has_tile("9s")
 
@@ -4611,6 +4612,109 @@ def test_notify_room_game_start_does_not_trigger_vision_fallback(monkeypatch):
     assert len(events) == 1
     assert events[0]["type"] == "start_kyoku"
     assert events[0]["tehais"][0] == ["?"] * 13
+
+
+def test_oya_initial_tsumo_emission_brings_hand_to_14_tiles():
+    """
+    Verify that when self is oya (dealer), ActionNewRound with 13 dealt tiles
+    immediately emits an initial tsumo event bringing hand to 14 tiles for initial discard.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from core.state_manager import MahjongStateManager
+    from core.engine import DecisionEngine
+
+    bridge = MajsoulBridge(my_seat=0)
+    state_mgr = MahjongStateManager(my_actor_id=0)
+    engine = DecisionEngine(use_fallback=True)
+
+    nr_payload = {
+        "chang": 0,
+        "ju": 0, # oya = 0 == my_seat
+        "ben": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "doras": ["1p"],
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4p"]
+    }
+    events = bridge.translate_action("ActionNewRound", nr_payload)
+    
+    # Must contain both start_kyoku and initial tsumo
+    assert len(events) == 2
+    assert events[0]["type"] == "start_kyoku"
+    assert events[1]["type"] == "tsumo"
+    assert events[1]["actor"] == 0
+    assert events[1]["pai"] == "4p"
+
+    # Update state manager: hand should become 14 tiles
+    for ev in events:
+        state_mgr.update_event(ev)
+
+    assert len(state_mgr.my_player.tehai) == 14
+    # Decision engine must be able to evaluate and offer discards on first turn
+    candidates = engine.evaluate(state_mgr)
+    discard_candidates = [c for c in candidates if c.action_type in ("dahai", "reach", "none")]
+    assert len(discard_candidates) > 0, "Decision engine must trigger on first turn for dealer"
+
+
+def test_action_deal_tile_self_draw_preserved_and_opponent_hidden():
+    """
+    Verify that ActionDealTile extracts actual tile when seat == my_seat,
+    and obscures tile as '?' when seat != my_seat.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+
+    bridge = MajsoulBridge(my_seat=0)
+    
+    # Self draw on seat 0: tile must be preserved
+    self_events = bridge.translate_action("ActionDealTile", {"seat": 0, "tile": "7s"})
+    assert len(self_events) == 1
+    assert self_events[0]["type"] == "tsumo"
+    assert self_events[0]["actor"] == 0
+    assert self_events[0]["pai"] == "7s"
+
+    # Opponent draw on seat 1: tile must be obscured
+    opp_events = bridge.translate_action("ActionDealTile", {"seat": 1, "tile": "7s"})
+    assert len(opp_events) == 1
+    assert opp_events[0]["type"] == "tsumo"
+    assert opp_events[0]["actor"] == 1
+    assert opp_events[0]["pai"] == "?"
+
+
+def test_state_manager_hand_size_safety_guard_prevents_shrinking_below_13():
+    """
+    Verify that state_manager strictly forbids reducing self hand below 13 tiles
+    even when unmatched dahai events or missed draw tiles occur for 4 consecutive turns.
+    """
+    from core.state_manager import MahjongStateManager
+
+    state_mgr = MahjongStateManager(my_actor_id=0)
+    init_event = {
+        "type": "start_kyoku",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 1,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [
+            ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4p"],
+            ["?"] * 13, ["?"] * 13, ["?"] * 13
+        ],
+        "dora_marker": "1p"
+    }
+    state_mgr.update_event(init_event)
+    assert len(state_mgr.my_player.tehai) == 13
+
+    # Simulate 4 consecutive turns where tsumo was missed (tile '?') and dahai occurs
+    discards = ["1m", "2m", "3m", "4m"]
+    for d in discards:
+        # Missed draw
+        state_mgr.update_event({"type": "tsumo", "actor": 0, "pai": "?"})
+        assert len(state_mgr.my_player.tehai) == 13, "Missed draw should not add tile"
+        # Discard occurs
+        state_mgr.update_event({"type": "dahai", "actor": 0, "pai": d, "tsumogiri": False})
+        # Hand must NEVER shrink below 13!
+        assert len(state_mgr.my_player.tehai) == 13, f"Hand collapsed to {len(state_mgr.my_player.tehai)} tiles after discarding {d}!"
+
 
 
 

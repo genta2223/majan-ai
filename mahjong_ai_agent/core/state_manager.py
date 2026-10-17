@@ -320,11 +320,22 @@ class MahjongStateManager:
             print(msg)
             trace_log("HAND_SIZE_ANOMALY", msg, {"tehai": list(my_p.tehai), "melds": meld_count, "context": context})
 
-            # Safe self-healing: if hand size has overflowed beyond draw_size, trim excess
+            # Safe self-healing:
+            # 1. If hand size has overflowed beyond draw_size, trim excess
             if current_len > draw_size:
                 trim_count = current_len - draw_size
                 print(f"[StateManager RECOVERY] Hand size {current_len} > {draw_size}. Trimming {trim_count} overflow tile(s) from hand end: {my_p.tehai[-trim_count:]}")
                 my_p.tehai = my_p.tehai[:draw_size]
+            # 2. If hand size has collapsed below base_size, resurrect missing tiles from discards to prevent crash
+            elif current_len < base_size:
+                needed = base_size - current_len
+                print(f"[StateManager RECOVERY] Hand size {current_len} < {base_size} in {context}. Reconstructing {needed} missing tile(s) to protect 13-tile integrity...")
+                for d in reversed(my_p.discards):
+                    if len(my_p.tehai) >= base_size:
+                        break
+                    if is_valid_mahjong_tile(d) and my_p.tehai.count(d) < 4:
+                        my_p.tehai.append(d)
+                        print(f"[StateManager RECOVERY] Restored '{d}' from discards into hand: {my_p.tehai}")
             return False
 
         return True
@@ -397,8 +408,11 @@ class MahjongStateManager:
                 if pai and pai not in ("?", "None") and is_valid_mahjong_tile(pai):
                     expected_draw_len = 14 - (3 * len(p.melds))
                     if len(p.tehai) >= expected_draw_len:
-                        print(f"[StateManager WARNING] Tsumo tile '{pai}' received but hand is already full ({len(p.tehai)} >= {expected_draw_len}). Updated tsumo_tile only.")
-                        trace_log("TSUMO_DUPLICATE_GUARD", f"Hand already at {len(p.tehai)} tiles, tile '{pai}' not appended.")
+                        # Replace provisional draw tile (e.g. from dealer ActionNewRound) with verified DealTile draw
+                        old_tile = p.tehai[-1]
+                        p.tehai[-1] = pai
+                        print(f"[StateManager UPDATE] Replaced provisional draw tile '{old_tile}' with verified draw tile '{pai}'.")
+                        trace_log("TSUMO_REPLACE_PROVISIONAL", f"Replaced '{old_tile}' with '{pai}' in hand {p.tehai}")
                     else:
                         p.tehai.append(pai)
                 self.verify_hand_consistency(context="tsumo")
@@ -440,33 +454,38 @@ class MahjongStateManager:
                             found_idx = idx
                             break
 
-                if found_idx != -1:
-                    p.tehai.pop(found_idx)
+                # Strict hand size guard:
+                # Discarding must NEVER reduce concealed hand below expected_base_len (13 tiles without melds).
+                if len(p.tehai) > expected_base_len:
+                    if found_idx != -1:
+                        p.tehai.pop(found_idx)
+                    else:
+                        # Tedashi not found in hand or draw tile was missed: pop last tile to restore valid 13-tile base
+                        popped_tile = p.tehai.pop()
+                        print(f"[StateManager RECOVERY] Hand was {len(p.tehai)+1} > {expected_base_len}. Popped '{popped_tile}' to restore base hand size.")
                 else:
-                    # Unmatched discard handling:
-                    # If this was tsumogiri (moqie: True), the discarded tile was the freshly drawn tile
-                    # (which may have been missed in ActionDealTile). Therefore, the 13 concealed hand
-                    # tiles must NOT be touched!
+                    # Hand is ALREADY <= expected_base_len! A pop would illegally reduce hand to 12 (or fewer) tiles.
+                    # This happens when the draw tile was missed in packet (e.g. ActionDealTile '?').
                     if tsumogiri:
-                        msg = f"[StateManager Tsumogiri Missed Draw] Discard '{pai}' was tsumogiri (moqie) but missing from hand. Preserved hand tiles: {p.tehai}"
+                        msg = f"[StateManager Tsumogiri Draw Missed] Discard '{pai}' was tsumogiri (moqie) but missing from hand. Preserved {len(p.tehai)} hand tiles."
                         print(msg)
                         trace_log("TSUMOGIRI_MISSED_DRAW_PRESERVED", msg)
-                        # If hand has overflowed, trim excess to expected_base_len
-                        if len(p.tehai) > expected_base_len:
-                            p.tehai = p.tehai[:expected_base_len]
                     else:
-                        msg = f"[StateManager CRITICAL DESYNC] Discard '{pai}' (norm: '{norm_discard}') was NOT found in self hand {p.tehai}!"
+                        # Tedashi: tile was discarded from hand, but draw tile was missing from packet.
+                        # Preserve hand size: if tile was found in hand, swap with the discard or preserve size
+                        msg = f"[StateManager CRITICAL GUARD] Hand already at {len(p.tehai)} <= {expected_base_len}. Discard '{pai}' prohibited from reducing hand size."
                         print(msg)
-                        trace_log("DAHAI_UNMATCHED_TILE", msg)
-                        # Hand was tedashi (from hand) but tile wasn't present.
-                        # Safe resynchronization:
-                        # 1. If hand has drawn-size (> expected_base_len), pop the last/drawn tile to restore base size.
-                        # 2. If hand is already at expected_base_len, check if a recent tsumo tile existed that can be substituted or maintain 13 tiles without shrinking.
-                        if len(p.tehai) > expected_base_len:
-                            popped_tile = p.tehai.pop()
-                            print(f"[StateManager RECOVERY] Hand size was {len(p.tehai)+1} > {expected_base_len}. Popped '{popped_tile}' to restore valid hand size.")
-                        elif len(p.tehai) < expected_base_len:
-                            print(f"[StateManager RECOVERY] Hand size was {len(p.tehai)} < {expected_base_len}. Preserved hand without pop.")
+                        trace_log("DAHAI_HAND_GUARD", msg)
+
+                # Final fallback safety net: if hand ever drops below expected_base_len, reconstruct by resurrecting discards
+                while len(p.tehai) < expected_base_len and p.discards:
+                    for d_tile in reversed(p.discards):
+                        if is_valid_mahjong_tile(d_tile) and p.tehai.count(d_tile) < 4:
+                            p.tehai.append(d_tile)
+                            print(f"[StateManager RECOVERY] Restored '{d_tile}' from discards into hand to maintain {len(p.tehai)} tiles.")
+                            break
+                    if len(p.tehai) < expected_base_len:
+                        break
 
                 self.verify_hand_consistency(context="dahai")
 

@@ -208,12 +208,23 @@ class MajsoulBridge:
                 if not tehais[i]:
                     tehais[i] = ["?"] * 13
 
-            # Dealer initial 14-tile handling:
-            # If dealer starts with 14 tiles, MJAI standard splits into 13-tile hand + 14th tile tsumo
+            # Dealer initial draw handling:
+            # MJAI standard: start_kyoku has 13-tile hands for all players.
+            # If dealer starts with >= 14 tiles, MJAI standard splits into 13-tile hand + 14th tile tsumo.
+            # If dealer is self (oya == self.my_seat) and hand has 13 tiles, emit initial tsumo immediately
+            # so the AI engine is brought into 14-tile state and triggered for initial discard.
             dealer_tsumo_tile = None
             if len(tehais[oya]) >= 14:
                 dealer_tsumo_tile = tehais[oya][-1]
-                tehais[oya] = tehais[oya][:-1]
+                tehais[oya] = list(tehais[oya][:13])
+            elif clean_name in ("ActionNewRound", "RecordNewRound") and oya == self.my_seat and len(tehais[oya]) >= 13 and any(t != "?" for t in tehais[oya]):
+                cand_tile = data.get("tile") or data.get("first_tile") or data.get("tsumo")
+                if cand_tile and is_valid_tile_code(cand_tile):
+                    dealer_tsumo_tile = liqi_tile_to_mjai(cand_tile)
+                else:
+                    dealer_tsumo_tile = tehais[oya][-1]
+                # Keep tehais[oya] at 13 tiles; the following tsumo event will transition hand to 14 tiles
+                tehais[oya] = list(tehais[oya][:13])
 
             events.append({
                 "type": "start_kyoku",
@@ -228,7 +239,7 @@ class MajsoulBridge:
                 "dora_marker": dora_marker,
             })
 
-            # If dealer has 14th tile, immediately trigger initial draw event
+            # If dealer has initial draw tile, immediately trigger initial draw event
             if dealer_tsumo_tile:
                 events.append({
                     "type": "tsumo",
@@ -238,10 +249,20 @@ class MajsoulBridge:
 
         elif clean_name in ("ActionDealTile", "RecordDealTile", "NotifyDealTile"):
             seat = data.get("seat", 0)
-            tile = liqi_tile_to_mjai(data.get("tile", ""))
-            # In live play, non-self draws are always hidden ('?') to prevent accidental seat switching or phantom tile leaks
+            raw_tile = data.get("tile", "")
+            
+            # Opponent draw isolation:
+            # If seat != self.my_seat and not a replay Record, non-self draws are always hidden ('?')
+            # to strictly prevent accidental seat switching or phantom tile leaks.
             if seat != self.my_seat and not clean_name.startswith("Record"):
                 tile = "?"
+            elif raw_tile and is_valid_tile_code(raw_tile):
+                tile = liqi_tile_to_mjai(raw_tile)
+            elif clean_name.startswith("Record") and raw_tile:
+                tile = liqi_tile_to_mjai(raw_tile)
+            else:
+                tile = "?"
+
             # Check if new dora indicator was revealed
             raw_doras = data.get("doras") or data.get("dora") or data.get("dora_marker") or []
             if isinstance(raw_doras, str):
