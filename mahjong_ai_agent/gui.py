@@ -767,8 +767,10 @@ class MahjongHUDApp:
 
                 # Auto-sync resolved seat to agent, state manager, and UI log
                 def _on_seat_change(new_seat: int):
+                    old_seat = agent.my_actor_id
                     agent.my_actor_id = new_seat
-                    agent.state_mgr.my_actor_id = new_seat
+                    init_h = getattr(sniffer.bridge, "_initial_round_hand", [])
+                    agent.state_mgr.migrate_seat(old_seat, new_seat, initial_hand=init_h)
                     seat_names = ["東家", "南家", "西家", "北家"]
                     s_name = seat_names[new_seat] if 0 <= new_seat <= 3 else f"P{new_seat}"
                     self.root.after(0, lambda: self._log(f"[AutoSeat] 自席を自動検出・同期しました: {s_name} (席インデックス: {new_seat})"))

@@ -213,6 +213,55 @@ class MahjongStateManager:
         self.game_active: bool = False
         self.round_state: Optional[KyokuState] = None
         self.initial_scores: List[int] = [25000, 25000, 25000, 25000]
+        self._initial_round_hand: List[str] = []
+
+    def migrate_seat(self, old_actor: int, new_actor: int, initial_hand: Optional[List[str]] = None) -> None:
+        """
+        Migrates hand tiles and state when self seat is delayed-detected (e.g. Switched self seat 0 -> 3).
+        Transfers the 13-tile starting hand from old_actor to new_actor,
+        and masks old_actor's hand back to ['?'] * 13 to eliminate DESYNC.
+        """
+        if old_actor == new_actor:
+            return
+
+        print(f"[StateManager] Migrating self seat: P{old_actor} -> P{new_actor}...")
+        self.my_actor_id = new_actor
+
+        if not self.round_state:
+            return
+
+        old_p = self.round_state.players[old_actor] if 0 <= old_actor < len(self.round_state.players) else None
+        new_p = self.round_state.players[new_actor] if 0 <= new_actor < len(self.round_state.players) else None
+
+        if not old_p or not new_p:
+            return
+
+        valid_old_tiles = [t for t in old_p.tehai if t and t != "?" and is_valid_mahjong_tile(t)]
+        valid_new_tiles = [t for t in new_p.tehai if t and t != "?" and is_valid_mahjong_tile(t)]
+
+        # If new_p hand is incomplete (< 13 tiles), migrate tiles from old_p or initial_hand
+        if len(valid_new_tiles) < 13:
+            hand_source = valid_old_tiles
+            if len(hand_source) < 13 and (initial_hand or self._initial_round_hand):
+                cand = initial_hand or self._initial_round_hand
+                valid_cand = [t for t in cand if t and t != "?" and is_valid_mahjong_tile(t)]
+                if len(valid_cand) >= 13:
+                    hand_source = valid_cand
+
+            if len(hand_source) >= 13:
+                # Retain verified tsumo_tile on new_p if present, do not treat provisional/dummy metadata as a draw
+                drawn_tile = new_p.tsumo_tile
+                new_p.tehai = list(hand_source[:13])
+                if drawn_tile and drawn_tile != "?" and is_valid_mahjong_tile(drawn_tile):
+                    new_p.tsumo_tile = drawn_tile
+                    new_p.tehai.append(drawn_tile)
+                old_p.tehai = ["?"] * 13
+                old_p.tsumo_tile = None
+                print(f"[StateManager] Successfully migrated {len(new_p.tehai)} tiles from P{old_actor} to P{new_actor}: {new_p.tehai}")
+
+        old_p.is_dealer = (old_actor == self.round_state.oya)
+        new_p.is_dealer = (new_actor == self.round_state.oya)
+        self.verify_hand_consistency(context="migrate_seat")
 
     def reset_round(self, bakaze: str, kyoku: int, honba: int, kyotaku: int, oya: int, scores: List[int], tehais: List[List[str]], dora_marker: Any):
         """Initialize state for a new round."""
@@ -267,6 +316,13 @@ class MahjongStateManager:
             players=players,
             active_actor=oya
         )
+        # Record initial round hand (the hand with >= 13 valid tiles across all seats)
+        for h in tehais:
+            v_h = [t for t in h if t and t != "?" and is_valid_mahjong_tile(t)]
+            if len(v_h) >= 13:
+                self._initial_round_hand = list(v_h)
+                break
+
         self._update_ranks()
         self.verify_hand_consistency(context="reset_round")
 
@@ -451,6 +507,12 @@ class MahjongStateManager:
                     else:
                         p.tehai.append(pai)
                 self.verify_hand_consistency(context="tsumo")
+            else:
+                # 4-Seat hand tracking for other players (paifu decode / live spectator)
+                expected_draw_len = 14 - (3 * len(p.melds))
+                if len(p.tehai) < expected_draw_len:
+                    tile_to_add = pai if (pai and pai not in ("?", "None") and is_valid_mahjong_tile(pai)) else "?"
+                    p.tehai.append(tile_to_add)
 
         elif event_type == "dahai":
             if not self.round_state:
@@ -512,6 +574,19 @@ class MahjongStateManager:
                         trace_log("DAHAI_HAND_GUARD", msg)
 
                 self.verify_hand_consistency(context="dahai")
+            else:
+                # 4-Seat hand tracking for other players
+                if len(p.tehai) > expected_base_len:
+                    norm_discard = normalize_tile(pai)
+                    found_idx = -1
+                    for idx, t in enumerate(p.tehai):
+                        if t == pai or normalize_tile(t) == norm_discard:
+                            found_idx = idx
+                            break
+                    if found_idx != -1:
+                        p.tehai.pop(found_idx)
+                    else:
+                        p.tehai.pop()
 
         elif event_type == "reach":
             if not self.round_state:
@@ -542,23 +617,26 @@ class MahjongStateManager:
 
             p = self.round_state.players[actor]
             p.melds.append(Meld(type=event_type, tiles=meld_tiles, target=target, opened=True))
-            if actor == self.my_actor_id:
-                for c in consumed:
-                    norm_c = normalize_tile(c)
-                    found_idx = -1
+            # Hand consumption for any actor (self or other players in paifu/replay)
+            for c in consumed:
+                norm_c = normalize_tile(c)
+                found_idx = -1
+                for idx, t in enumerate(p.tehai):
+                    if t == c:
+                        found_idx = idx
+                        break
+                if found_idx == -1:
                     for idx, t in enumerate(p.tehai):
-                        if t == c:
+                        if normalize_tile(t) == norm_c:
                             found_idx = idx
                             break
-                    if found_idx == -1:
-                        for idx, t in enumerate(p.tehai):
-                            if normalize_tile(t) == norm_c:
-                                found_idx = idx
-                                break
-                    if found_idx != -1:
-                        p.tehai.pop(found_idx)
-                    else:
-                        print(f"[StateManager WARNING] Meld consumed tile '{c}' not found in self hand {p.tehai}!")
+                if found_idx != -1:
+                    p.tehai.pop(found_idx)
+                elif p.tehai:
+                    p.tehai.pop()
+                elif actor == self.my_actor_id:
+                    print(f"[StateManager WARNING] Meld consumed tile '{c}' not found in self hand {p.tehai}!")
+            if actor == self.my_actor_id:
                 self.verify_hand_consistency(context=f"meld_{event_type}")
 
         elif event_type in ("kankan", "ankan"):
@@ -568,23 +646,25 @@ class MahjongStateManager:
             consumed = event.get("consumed", [])
             p = self.round_state.players[actor]
             p.melds.append(Meld(type=event_type, tiles=consumed, opened=(event_type == "kankan")))
-            if actor == self.my_actor_id:
-                for c in consumed:
-                    norm_c = normalize_tile(c)
-                    found_idx = -1
+            for c in consumed:
+                norm_c = normalize_tile(c)
+                found_idx = -1
+                for idx, t in enumerate(p.tehai):
+                    if t == c:
+                        found_idx = idx
+                        break
+                if found_idx == -1:
                     for idx, t in enumerate(p.tehai):
-                        if t == c:
+                        if normalize_tile(t) == norm_c:
                             found_idx = idx
                             break
-                    if found_idx == -1:
-                        for idx, t in enumerate(p.tehai):
-                            if normalize_tile(t) == norm_c:
-                                found_idx = idx
-                                break
-                    if found_idx != -1:
-                        p.tehai.pop(found_idx)
-                    else:
-                        print(f"[StateManager WARNING] Kan consumed tile '{c}' not found in self hand {p.tehai}!")
+                if found_idx != -1:
+                    p.tehai.pop(found_idx)
+                elif p.tehai:
+                    p.tehai.pop()
+                elif actor == self.my_actor_id:
+                    print(f"[StateManager WARNING] Kan consumed tile '{c}' not found in self hand {p.tehai}!")
+            if actor == self.my_actor_id:
                 self.verify_hand_consistency(context=f"kan_{event_type}")
 
         elif event_type == "dora":
@@ -608,6 +688,23 @@ class MahjongStateManager:
                 if m and is_valid_mahjong_tile(m):
                     self.round_state.dora_indicators.append(m)
                     self.round_state.dora_tiles.append(get_dora_next(m))
+
+        elif event_type == "nuki":
+            if not self.round_state:
+                return
+            actor = event.get("actor", 0)
+            pai = event.get("pai", "4z")
+            p = self.round_state.players[actor]
+            found = False
+            for idx, t in enumerate(p.tehai):
+                if normalize_tile(t) in ("4z", "N"):
+                    p.tehai.pop(idx)
+                    found = True
+                    break
+            if not found and p.tehai:
+                p.tehai.pop()
+            if actor == self.my_actor_id:
+                self.verify_hand_consistency(context="nuki")
 
         elif event_type in ("hora", "ryukyoku"):
             if not self.round_state:

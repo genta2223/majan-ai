@@ -109,8 +109,9 @@ class MahjongAIAgent:
                     has_visible = True
                     if self.my_actor_id != s_idx:
                         print(f"\n[Main AutoSeat] Auto-detected self seat: Player {s_idx} ({len(visible_tiles)} tiles). Switched actor ID {self.my_actor_id} -> {s_idx}")
+                        old_seat = self.my_actor_id
                         self.my_actor_id = s_idx
-                        self.state_mgr.my_actor_id = s_idx
+                        self.state_mgr.migrate_seat(old_seat, s_idx)
                     break
             self.packet_hand_trusted = has_visible
             if has_visible:
@@ -140,8 +141,9 @@ class MahjongAIAgent:
             pai = event.get("pai", "")
             if pai and pai != "?" and self.my_actor_id != actor:
                 print(f"\n[Main AutoSeat] Auto-detected self drawn tile ({pai}) on Player {actor}. Switched actor ID {self.my_actor_id} -> {actor}")
+                old_seat = self.my_actor_id
                 self.my_actor_id = actor
-                self.state_mgr.my_actor_id = actor
+                self.state_mgr.migrate_seat(old_seat, actor)
 
             # Live Vision Resynchronization on self turn
             if actor == self.my_actor_id:

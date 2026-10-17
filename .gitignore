@@ -48,3 +48,7 @@ version.txt
 Thumbs.db
 .vscode/
 .idea/
+
+# Local data cache
+mahjong_ai_agent/data/
+data/

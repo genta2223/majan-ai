@@ -123,6 +123,7 @@ class MajsoulBridge:
         self._last_discard_seat: Optional[int] = None
         self._in_round: bool = False
         self._last_round_params: Dict[str, Any] = {}
+        self._initial_round_hand: List[str] = []
         # Vision is a last-resort fallback only. It must never override packet-decoded tiles.
         self.vision_fallback_enabled = vision_fallback_enabled
 
@@ -147,16 +148,39 @@ class MajsoulBridge:
     def resolve_seat_from_player_list(self, players_or_seats: Any) -> Optional[int]:
         """
         Matches my_account_id against player list to dynamically resolve self seat (0..3).
-        Supports list of dicts, int account_ids, or submessages.
+        Supports list of dicts, int account_ids, raw_fields, or protobuf submessages.
         """
         if not self.my_account_id or not players_or_seats:
             return None
+
+        # If passed a dict containing raw_fields or nested player containers
+        if isinstance(players_or_seats, dict):
+            # Check known sub-keys
+            for sub_key in ("players", "player_list", "seat_list", "seats", "game_details"):
+                if sub_key in players_or_seats and players_or_seats[sub_key]:
+                    res = self.resolve_seat_from_player_list(players_or_seats[sub_key])
+                    if res is not None:
+                        return res
+            # Check raw_fields
+            if "raw_fields" in players_or_seats:
+                rf = players_or_seats["raw_fields"]
+                for f_num, f_vals in rf.items():
+                    if isinstance(f_vals, (list, tuple)):
+                        res = self.resolve_seat_from_player_list(f_vals)
+                        if res is not None:
+                            return res
+
         if isinstance(players_or_seats, (list, tuple)):
             for idx, item in enumerate(players_or_seats):
                 acc_id = None
                 seat_val = idx
                 if isinstance(item, dict):
                     acc_id = item.get("account_id") or item.get("accountId") or item.get("id")
+                    if not acc_id and "raw_fields" in item:
+                        # Scan raw_fields of the player message for account_id
+                        p_rf = item["raw_fields"]
+                        if 1 in p_rf and p_rf[1] and isinstance(p_rf[1][0], int):
+                            acc_id = p_rf[1][0]
                     if "seat" in item and 0 <= safe_coerce_int(item["seat"], -1) <= 3:
                         seat_val = safe_coerce_int(item["seat"], idx)
                     nick = item.get("nickname") or item.get("name")
@@ -165,6 +189,12 @@ class MajsoulBridge:
                 elif isinstance(item, int):
                     acc_id = item
                     seat_val = idx
+                elif isinstance(item, (bytes, bytearray)):
+                    from io_adapter.liqi_proto_decoder import decode_raw_protobuf
+                    p_rf = decode_raw_protobuf(item)
+                    if 1 in p_rf and p_rf[1] and isinstance(p_rf[1][0], int):
+                        acc_id = p_rf[1][0]
+
                 if acc_id == self.my_account_id:
                     print(f"[MajsoulBridge AutoSeat] Dynamically resolved my_seat={seat_val} for account_id={self.my_account_id}")
                     self.set_my_seat(seat_val)
@@ -330,7 +360,8 @@ class MajsoulBridge:
             raw_my_tiles = data.get("tiles") or []
             my_tiles = [t for t in raw_my_tiles if is_valid_tile_code(t)] if isinstance(raw_my_tiles, (list, tuple)) else []
             if my_tiles:
-                tehais[self.my_seat] = [liqi_tile_to_mjai(t) for t in my_tiles]
+                self._initial_round_hand = [liqi_tile_to_mjai(t) for t in my_tiles]
+                tehais[self.my_seat] = list(self._initial_round_hand)
 
             # 2. Replay/spectator logs passing tiles0..tiles3
             for i in range(4):
@@ -606,6 +637,14 @@ class MajsoulBridge:
                     "actor": seat,
                     "consumed": mjai_tiles,
                 })
+
+        elif clean_name in ("ActionBaBei", "RecordBaBei"):
+            seat = safe_coerce_int(data.get("seat", 0), 0)
+            events.append({
+                "type": "nuki",
+                "actor": seat,
+                "pai": "4z",
+            })
 
         elif clean_name in ("ActionHule", "RecordHule"):
             hules = data.get("hules", [])

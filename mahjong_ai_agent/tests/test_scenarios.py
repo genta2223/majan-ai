@@ -5483,6 +5483,67 @@ def test_no_phantom_discard_resurrection_and_packet_hard_sync():
     assert "2z" not in p.tehai
 
 
+def test_delayed_seat_switch_initial_hand_migration():
+    """
+    Verify that when self seat is initially assumed as 0 (East) at ActionNewRound,
+    and delayed seat switch resolves to 3 (North) upon ActionDealTile seat=3,
+    the initial 13-tile hand in P0 is safely migrated to P3, and P0 is masked to '?'.
+    """
+    initial_13_tiles = ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4s"]
+    
+    # 1. Initialize StateManager with my_actor_id=0 (provisional East seat)
+    sm = MahjongStateManager(my_actor_id=0)
+    
+    # ActionNewRound assigns 13 tiles to P0 because my_seat was 0, while P3 has only dora indicator ['S']
+    sm.update_event({
+        "type": "start_kyoku",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [list(initial_13_tiles), ["?"], ["?"], ["S"]],
+        "dora_marker": "S"
+    })
+    
+    # Before migration: P0 has 13 real tiles, P3 has ['S']
+    assert sm.round_state.players[0].tehai == initial_13_tiles
+    assert sm.round_state.players[3].tehai == ["S"]
+    assert sm.my_actor_id == 0
+
+    # 2. Delayed seat switch occurs: ActionDealTile arrives with seat=3, triggering switch 0 -> 3
+    old_seat = 0
+    new_seat = 3
+    sm.my_actor_id = new_seat
+    sm.migrate_seat(old_actor=old_seat, new_actor=new_seat)
+
+    # After migration:
+    # P3 MUST have the full 13 real tiles
+    assert len(sm.round_state.players[3].tehai) == 13
+    assert sm.round_state.players[3].tehai == initial_13_tiles
+    # P0 MUST be masked to concealed tiles
+    assert len(sm.round_state.players[0].tehai) == 13
+    assert sm.round_state.players[0].tehai == ["?"] * 13
+
+    # 3. P3 draws 14th tile '9s'
+    sm.update_event({"type": "tsumo", "actor": 3, "pai": "9s"})
+    assert len(sm.round_state.players[3].tehai) == 14
+    assert sm.round_state.players[3].tehai[-1] == "9s"
+    assert sm.my_player.tehai == initial_13_tiles + ["9s"]
+
+
+def test_binary_comprehension_benchmark_100_percent():
+    """Verify that the quantitative binary protocol benchmark achieves 100% comprehension."""
+    from tools.measure_binary_comprehension import run_quantitative_comprehension_benchmark
+    report = run_quantitative_comprehension_benchmark()
+    assert report["action_field_rate"] == 100.0
+    assert report["trace_rate"] == 100.0
+    assert report["profiler_rate"] == 100.0
+    assert report["overall_comprehension"] == 100.0
+
+
+
 
 
 

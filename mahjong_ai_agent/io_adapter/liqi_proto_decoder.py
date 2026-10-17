@@ -639,6 +639,17 @@ class LiqiProtoDecoder:
                 m["delta_scores"] = del_sc
             return m
 
+        if name in ("ActionBaBei", "RecordBaBei"):
+            m["seat"] = first_int(1)
+            m["moqie"] = bool(first_int(2, 0))
+            d = tiles_of(3)
+            if d:
+                m["doras"] = d
+            ops = ops_of(4) or ops_of(5)
+            if ops:
+                m["operation_list"] = ops
+            return m
+
         if name in ("ActionNewRound", "RecordNewRound"):
             # chang=1, ju=2, ben=3, tiles=4, dora=5, scores=6, operation=7, liqibang=8, doras=10, tiles0..3=11..14
             m["chang"] = first_int(1)
