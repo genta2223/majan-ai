@@ -182,16 +182,24 @@ class MajsoulBridge:
                 tehais[self.my_seat] = list(tehais[0])
 
             # 4. Vision Fallback: If packet has 0 hand tiles for self, capture screen
+            # ONLY allow vision fallback for genuine round start (ActionNewRound / RecordNewRound),
+            # NEVER for ActionMJStart (which arrives during table start animation and reads all tiles as blank/P).
             my_hand = tehais[self.my_seat]
             is_empty_hand = (not my_hand) or (all(t == "?" for t in my_hand))
-            if is_empty_hand and self.vision_fallback_enabled:
+            is_genuine_round = clean_name in ("ActionNewRound", "RecordNewRound")
+            if is_empty_hand and is_genuine_round and self.vision_fallback_enabled:
                 try:
                     from io_adapter.vision_hand_reader import VisionHandReader
                     reader = VisionHandReader()
                     vision_tiles = reader.read_hand()
                     if vision_tiles and len(vision_tiles) >= 13:
-                        tehais[self.my_seat] = [liqi_tile_to_mjai(t) for t in vision_tiles]
-                        print(f"[Vision Fallback] Overrode self hand with {len(tehais[self.my_seat])} vision tiles: {tehais[self.my_seat]}")
+                        # Sanity check: must not be 13+ identical tiles (e.g. all 'P' from blank animation)
+                        norm_vision = [liqi_tile_to_mjai(t) for t in vision_tiles]
+                        if len(set(norm_vision)) >= 3:
+                            tehais[self.my_seat] = norm_vision
+                            print(f"[Vision Fallback] Overrode self hand with {len(tehais[self.my_seat])} vision tiles: {tehais[self.my_seat]}")
+                        else:
+                            print(f"[Vision Fallback] Rejected vision tiles due to low diversity (likely animation blank screen): {norm_vision}")
                 except Exception as ve:
                     print(f"[Vision Fallback] Warning: Hand capture fallback failed: {ve}")
 

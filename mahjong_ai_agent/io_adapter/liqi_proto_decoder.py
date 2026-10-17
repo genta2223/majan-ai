@@ -473,6 +473,13 @@ class LiqiProtoDecoder:
             t = tiles_of(2)
             if t:
                 m["tile"] = t[0]
+            else:
+                # Fallback: scan any tag that has a valid 2-char tile code
+                for tag in (2, 3, 4, 5, 6, 7):
+                    cand_t = tiles_of(tag)
+                    if cand_t:
+                        m["tile"] = cand_t[0]
+                        break
             if 3 in f:
                 m["left_tile_count"] = first_int(3)
             d = tiles_of(6)
@@ -825,8 +832,8 @@ class LiqiProtoDecoder:
                                 common_mapped["doras"] = [salvaged[len(hand_tiles)]]
                             print(f"[LiqiDecoder Salvage Full] Salvaged {len(hand_tiles)} hand tiles from resolved bytes: {hand_tiles}")
 
-                    # Salvage for ActionDealTile (only when wire format is corrupt)
-                    if schema_mapped is None and "DealTile" in act_name and "tile" not in common_mapped:
+                    # Salvage for ActionDealTile: if tile was not extracted by schema mapping, scan raw/sub bytes
+                    if "DealTile" in act_name and "tile" not in common_mapped:
                         salvaged_deal = LiqiProtoDecoder.scan_tiles_from_bytes(resolved_bytes or sub_bytes or payload_bytes)
                         if salvaged_deal:
                             common_mapped["tile"] = salvaged_deal[0]

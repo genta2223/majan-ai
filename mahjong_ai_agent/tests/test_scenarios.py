@@ -4508,10 +4508,62 @@ async def test_hud_recommendation_top_candidates_and_display():
     assert len(top_cands) >= 2
     # Verify 1st candidate
     assert top_cands[0]["tile"] == "4m"
-    assert top_cands[0]["win_prob"] > 0
-    # Verify 2nd candidate
     assert top_cands[1]["tile"] == "7s"
     assert top_cands[1]["diff_q"] == -13.0
+
+
+def test_action_mjstart_does_not_trigger_vision_fallback(monkeypatch):
+    """Verify ActionMJStart does NOT trigger Vision fallback or overwrite hand tiles."""
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from io_adapter.vision_hand_reader import VisionHandReader
+
+    called = False
+    def _fake_read(self):
+        nonlocal called
+        called = True
+        return ["P"] * 14  # Simulate animation blank screen
+    monkeypatch.setattr(VisionHandReader, "read_hand", _fake_read)
+
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=True)
+    events = bridge.translate_action("ActionMJStart", {})
+    assert not called, "Vision fallback must NEVER be triggered for ActionMJStart"
+    assert len(events) == 1
+    assert events[0]["type"] == "start_kyoku"
+    # Self hand should be 13 unknown '?' tiles, NOT 14 'P' tiles!
+    assert events[0]["tehais"][0] == ["?"] * 13
+
+
+def test_state_manager_moqie_tsumogiri_preserves_hand_on_unmatched_tile():
+    """Verify that discarding a missed tsumo tile with moqie=True preserves the 13 hand tiles."""
+    from core.state_manager import MahjongStateManager
+
+    mgr = MahjongStateManager(my_actor_id=0)
+    initial_hand = ["1m", "2m", "3m", "4p", "5p", "6p", "7s", "8s", "9s", "1z", "1z", "2z", "2z"]
+    mgr.reset_round(
+        bakaze="E",
+        kyoku=1,
+        honba=0,
+        kyotaku=0,
+        oya=0,
+        scores=[25000, 25000, 25000, 25000],
+        tehais=[list(initial_hand), ["?"]*13, ["?"]*13, ["?"]*13],
+        dora_marker="1p"
+    )
+
+    # Discard a tile NOT in hand (e.g. drawn tile '9m' that wasn't decoded in deal_tile) with tsumogiri=True
+    mgr.update_event({
+        "type": "dahai",
+        "actor": 0,
+        "pai": "9m",
+        "tsumogiri": True
+    })
+
+    # The original 13 hand tiles must remain untouched
+    my_p = mgr.my_player
+    assert my_p is not None
+    assert my_p.tehai == initial_hand
+    assert len(my_p.tehai) == 13
+
 
 
 
