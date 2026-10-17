@@ -114,10 +114,54 @@ class MajsoulBridge:
 
     def __init__(self, my_seat: int = 0, vision_fallback_enabled: bool = True):
         self.my_seat = my_seat
+        self.my_account_id: Optional[int] = None
+        self.on_seat_changed: Optional[Callable[[int], None]] = None
         self._current_doras: List[str] = []
         self._last_discard_seat: Optional[int] = None
         # Vision is a last-resort fallback only. It must never override packet-decoded tiles.
         self.vision_fallback_enabled = vision_fallback_enabled
+
+    def set_my_account_id(self, account_id: int) -> None:
+        """Dynamically bind self account_id (e.g. from FastTest.authGame request packet)."""
+        if account_id and isinstance(account_id, int) and account_id > 0:
+            self.my_account_id = account_id
+            print(f"[MajsoulBridge AutoSeat] Successfully bound login account_id: {self.my_account_id}")
+
+    def set_my_seat(self, seat: int) -> None:
+        """Update my_seat and notify listeners if changed."""
+        if 0 <= seat <= 3 and self.my_seat != seat:
+            old = self.my_seat
+            self.my_seat = seat
+            print(f"[MajsoulBridge AutoSeat] Switched self seat: {old} -> {seat}")
+            if self.on_seat_changed:
+                try:
+                    self.on_seat_changed(seat)
+                except Exception as e:
+                    print(f"[MajsoulBridge] on_seat_changed callback error: {e}")
+
+    def resolve_seat_from_player_list(self, players_or_seats: Any) -> Optional[int]:
+        """
+        Matches my_account_id against player list to dynamically resolve self seat (0..3).
+        Supports list of dicts, int account_ids, or submessages.
+        """
+        if not self.my_account_id or not players_or_seats:
+            return None
+        if isinstance(players_or_seats, (list, tuple)):
+            for idx, item in enumerate(players_or_seats):
+                acc_id = None
+                seat_val = idx
+                if isinstance(item, dict):
+                    acc_id = item.get("account_id") or item.get("accountId") or item.get("id")
+                    if "seat" in item and 0 <= safe_coerce_int(item["seat"], -1) <= 3:
+                        seat_val = safe_coerce_int(item["seat"], idx)
+                elif isinstance(item, int):
+                    acc_id = item
+                    seat_val = idx
+                if acc_id == self.my_account_id:
+                    print(f"[MajsoulBridge AutoSeat] Dynamically resolved my_seat={seat_val} for account_id={self.my_account_id}")
+                    self.set_my_seat(seat_val)
+                    return seat_val
+        return None
 
     def translate_action(self, action_name: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -126,9 +170,30 @@ class MajsoulBridge:
         events: List[Dict[str, Any]] = []
         clean_name = action_name.split(".")[-1]
 
+        # 1. Login / Game Auth Request (.lq.FastTest.authGame)
+        if clean_name in ("authGame", "ReqAuthGame"):
+            acc_id = safe_coerce_int(data.get("account_id", 0), 0)
+            if acc_id > 0:
+                self.set_my_account_id(acc_id)
+            return []
+
+        # 2. Player info updates or Auth responses
+        if clean_name in ("ResAuthGame", "NotifyRoomPlayerUpdate", "NotifyPlayerLoadGameReady"):
+            plist = data.get("players") or data.get("player_list") or data.get("seat_list") or []
+            if plist:
+                self.resolve_seat_from_player_list(plist)
+            return []
+
         if clean_name in ("ActionNewRound", "RecordNewRound", "ActionMJStart", "NotifyRoomGameStart"):
             # New Round (start_kyoku)
             self._last_discard_seat = None
+
+            # Dynamic Seat Fallback: Check if explicit seat tag is in NewRound data
+            if "seat" in data and isinstance(data["seat"], int) and 0 <= data["seat"] <= 3 and data.get("tiles"):
+                if self.my_seat != data["seat"]:
+                    print(f"[MajsoulBridge AutoSeat] Dynamic fallback: Aligned my_seat {self.my_seat} -> {data['seat']} from ActionNewRound seat tag.")
+                    self.set_my_seat(data["seat"])
+
             raw_chang = safe_coerce_int(data.get("chang", 0), 0)
             chang_idx = raw_chang if 0 <= raw_chang < len(WIND_CHARS) else 0
             bakaze = WIND_CHARS[chang_idx]

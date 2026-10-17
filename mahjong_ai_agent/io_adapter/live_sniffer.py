@@ -254,6 +254,22 @@ class LiveSniffer:
             if "action_name" in action_data and action_data["action_name"]:
                 action_name = action_data["action_name"]
 
+            # Capture login account_id from authGame request
+            if "authGame" in action_name:
+                acc_id = action_data.get("account_id")
+                if not acc_id and "raw_fields" in action_data and 1 in action_data["raw_fields"]:
+                    v = action_data["raw_fields"][1]
+                    if v and isinstance(v[0], int):
+                        acc_id = v[0]
+                if acc_id:
+                    self.bridge.set_my_account_id(acc_id)
+
+            # Resolve seat from room/game player updates
+            if any(k in action_name for k in ("ResAuthGame", "NotifyRoomPlayerUpdate", "ActionMJStart")):
+                plist = action_data.get("players") or action_data.get("player_list") or action_data.get("seat_list")
+                if plist:
+                    self.bridge.resolve_seat_from_player_list(plist)
+
             trace_log("LIQI_ACTION_DECODED", f"Action: {action_name}", action_data)
 
             # Translate into mjai events via bridge

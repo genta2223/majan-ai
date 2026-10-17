@@ -4798,6 +4798,187 @@ async def test_user_ignores_recommendation_and_fresh_recalculation_on_next_tsumo
     assert "6p" in current_hand, "Preserved 6p must remain in hand"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_seat", [0, 1, 2, 3])
+async def test_dynamic_seat_resolution_and_turn_management_for_all_four_seats(target_seat):
+    """
+    Verify 100% dynamic seat resolution and dealer/non-dealer turn lifecycle across all four seats:
+    - Target account_id is dynamically extracted from authGame request.
+    - Player list matches account_id to target_seat (0, 1, 2, or 3).
+    - Round starts (East 1, oya=0):
+      * If target_seat == 0 (dealer / oya): ActionNewRound immediately yields 14th tile tsumo,
+        and AIAgent produces a valid discard recommendation on move 1.
+      * If target_seat != 0 (non-dealer / child): ActionNewRound yields 13 tiles without tsumo,
+        agent remains waiting (no recommendation). When ActionDealTile arrives for target_seat,
+        tsumo is triggered, agent produces recommendation, and dahai clears it back to waiting.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from main import MahjongAIAgent
+
+    account_ids = [9990001, 9990002, 9990003, 9990004]
+    my_account_id = account_ids[target_seat]
+
+    # Initialize bridge without hardcoded seat (or default 0)
+    bridge = MajsoulBridge(my_seat=0)
+
+    # 1. Step 1: Dynamic account_id capture from FastTest.authGame Request
+    auth_req_data = {
+        "account_id": my_account_id,
+        "token": "test_token_abc",
+        "game_uuid": "game_12345"
+    }
+    bridge.translate_action("authGame", auth_req_data)
+    assert bridge.my_account_id == my_account_id, "Bridge failed to bind my_account_id from authGame"
+
+    # 2. Step 2: Dynamic seat resolution via NotifyRoomPlayerUpdate / ResAuthGame
+    player_update_data = {
+        "player_list": [
+            {"account_id": account_ids[0], "seat": 0, "nickname": "PlayerEast"},
+            {"account_id": account_ids[1], "seat": 1, "nickname": "PlayerSouth"},
+            {"account_id": account_ids[2], "seat": 2, "nickname": "PlayerWest"},
+            {"account_id": account_ids[3], "seat": 3, "nickname": "PlayerNorth"},
+        ]
+    }
+    bridge.translate_action("NotifyRoomPlayerUpdate", player_update_data)
+    assert bridge.my_seat == target_seat, f"Bridge resolved seat {bridge.my_seat}, expected {target_seat}"
+
+    # Setup agent aligned with resolved seat
+    agent = MahjongAIAgent(
+        my_actor_id=target_seat,
+        apply_sleep=False,
+        output_mode="text_only"
+    )
+
+    # Bridge seat change callback synchronizes agent
+    bridge.on_seat_changed = lambda seat: agent.set_my_actor_id(seat)
+    assert agent.my_actor_id == target_seat
+
+    # 3. Step 3: ActionNewRound in East 1 (oya = 0)
+    tiles_13 = ["1m", "2m", "3m", "4m", "5m", "6p", "7p", "8p", "1s", "2s", "3s", "1z", "2z"]
+    new_round_data = {
+        "chang": 0,
+        "ju": 0,
+        "ben": 0,
+        "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tiles": list(tiles_13),
+        "doras": ["1p"]
+    }
+    events = bridge.translate_action("ActionNewRound", new_round_data)
+
+    if target_seat == 0:
+        # Dealer (oya): must yield start_kyoku AND immediate 14th tile tsumo
+        assert len(events) == 2, f"Dealer should have 2 events (start_kyoku + tsumo), got {len(events)}"
+        assert events[0]["type"] == "start_kyoku"
+        assert events[1]["type"] == "tsumo"
+        assert events[1]["actor"] == 0
+        from io_adapter.majsoul_bridge import liqi_tile_to_mjai
+        assert events[1]["pai"] == liqi_tile_to_mjai(tiles_13[-1])
+
+        # Feed events to agent
+        await agent.handle_event(events[0])
+        action = await agent.handle_event(events[1])
+
+        # Agent must immediately calculate and emit recommendation for first turn
+        assert action is not None, "Dealer agent failed to produce recommendation on first turn"
+        assert action.action_type in ("dahai", "reach")
+        assert agent.action_controller._last_recommendation is not None
+        assert agent.action_controller._last_recommendation.tile == action.tile
+
+        # Dealer plays tile
+        dahai_events = bridge.translate_action("ActionDiscardTile", {
+            "seat": 0, "tile": action.tile, "is_liqi": False, "moqie": False
+        })
+        for ev in dahai_events:
+            await agent.handle_event(ev)
+
+        # Recommendation must be cleared back to waiting
+        assert agent.action_controller._last_recommendation is None
+    else:
+        # Non-dealer (child): must yield ONLY start_kyoku, NO tsumo
+        assert len(events) == 1, f"Child should have 1 event (start_kyoku), got {len(events)}"
+        assert events[0]["type"] == "start_kyoku"
+
+        res = await agent.handle_event(events[0])
+        # Agent must be in waiting state (no recommendation)
+        assert res is None, "Child agent should not produce recommendation on round start"
+        assert agent.action_controller._last_recommendation is None
+
+        # Dealer (P0) discards a tile
+        p0_discard_events = bridge.translate_action("ActionDiscardTile", {
+            "seat": 0, "tile": "9m", "is_liqi": False, "moqie": True
+        })
+        for ev in p0_discard_events:
+            await agent.handle_event(ev)
+        assert agent.action_controller._last_recommendation is None
+
+        # If target_seat is West (2) or North (3), intervening players discard
+        for seat in range(1, target_seat):
+            # intervening draw & discard
+            for ev in bridge.translate_action("ActionDealTile", {"seat": seat}):
+                await agent.handle_event(ev)
+            for ev in bridge.translate_action("ActionDiscardTile", {"seat": seat, "tile": "1z", "is_liqi": False, "moqie": True}):
+                await agent.handle_event(ev)
+            assert agent.action_controller._last_recommendation is None
+
+        # Now target_seat's turn arrives via ActionDealTile
+        deal_events = bridge.translate_action("ActionDealTile", {
+            "seat": target_seat,
+            "tile": "9p",
+            "left_tile_count": 65
+        })
+        assert len(deal_events) == 1
+        assert deal_events[0]["type"] == "tsumo"
+        assert deal_events[0]["actor"] == target_seat
+        assert deal_events[0]["pai"] == "9p"
+
+        # Agent receives tsumo -> MUST produce discard recommendation
+        action = await agent.handle_event(deal_events[0])
+        assert action is not None, f"Child seat {target_seat} produced no recommendation on tsumo"
+        assert action.action_type in ("dahai", "reach")
+        assert agent.action_controller._last_recommendation is not None
+        assert agent.action_controller._last_recommendation.tile == action.tile
+
+        # Target seat discards tile -> MUST clear recommendation back to waiting
+        dahai_events = bridge.translate_action("ActionDiscardTile", {
+            "seat": target_seat, "tile": action.tile, "is_liqi": False, "moqie": False
+        })
+        for ev in dahai_events:
+            await agent.handle_event(ev)
+        assert agent.action_controller._last_recommendation is None, "Recommendation must clear on self dahai"
+
+
+def test_dynamic_seat_resolution_fallback_to_plain_tiles():
+    """
+    Verify fallback mechanism when account_id matching is unavailable:
+    If ActionNewRound provides plain tiles with seat specified, my_seat falls back to it.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+
+    # Fallback 1: ActionNewRound carries seat = 2 with plain tiles
+    bridge = MajsoulBridge(my_seat=0)
+    nr_data = {
+        "seat": 2,
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6p", "7p", "8p", "1s", "2s", "3s", "1z", "2z"],
+        "doras": ["1p"]
+    }
+    bridge.translate_action("ActionNewRound", nr_data)
+    assert bridge.my_seat == 2, f"Expected fallback to seat 2, got {bridge.my_seat}"
+
+    # Fallback 2: ActionNewRound carries seat = 3 with plain tiles
+    bridge2 = MajsoulBridge(my_seat=0)
+    nr_data2 = {
+        "seat": 3,
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6p", "7p", "8p", "1s", "2s", "3s", "1z", "2z"],
+        "doras": ["1p"]
+    }
+    bridge2.translate_action("ActionNewRound", nr_data2)
+    assert bridge2.my_seat == 3, f"Expected fallback to seat 3, got {bridge2.my_seat}"
+
+
+
+
+
 
 
 

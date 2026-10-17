@@ -467,6 +467,42 @@ class LiqiProtoDecoder:
         name = action_name.split(".")[-1]
         m: Dict[str, Any] = {}
 
+        if name in ("authGame", "ReqAuthGame"):
+            # account_id=1, token=2, game_uuid=3
+            m["account_id"] = first_int(1)
+            if 2 in f and f[2]:
+                m["token"] = s(f[2][0])
+            if 3 in f and f[3]:
+                m["game_uuid"] = s(f[3][0])
+            return m
+
+        if name in ("ResAuthGame", "NotifyRoomPlayerUpdate", "NotifyPlayerLoadGameReady"):
+            # Extract player list or seat list
+            players: List[Dict[str, Any]] = []
+            for tag in (1, 2, 3):
+                for item in f.get(tag) or []:
+                    if isinstance(item, (bytes, bytearray)):
+                        pf = decode_raw_protobuf(bytes(item))
+                        p_dict: Dict[str, Any] = {}
+                        if 1 in pf and pf[1]:
+                            p_dict["account_id"] = coerce_int(pf[1][0], 0)
+                        if 2 in pf and pf[2] and 0 <= coerce_int(pf[2][0], -1) <= 3:
+                            p_dict["seat"] = coerce_int(pf[2][0], 0)
+                        if 4 in pf and pf[4]:
+                            p_dict["nickname"] = s(pf[4][0])
+                        elif 3 in pf and pf[3] and isinstance(pf[3][0], (str, bytes)):
+                            p_dict["nickname"] = s(pf[3][0])
+                        if p_dict.get("account_id"):
+                            players.append(p_dict)
+                    elif isinstance(item, int) and item > 1000:
+                        players.append({"account_id": item})
+            if players:
+                for idx, p in enumerate(players):
+                    p.setdefault("seat", idx)
+                m["players"] = players
+                m["player_list"] = players
+            return m
+
         if name in ("ActionDealTile", "RecordDealTile"):
             # seat=1, tile=2, left_tile_count=3, operation=4, liqi=5, doras=6, zhenting=7
             m["seat"] = first_int(1)
