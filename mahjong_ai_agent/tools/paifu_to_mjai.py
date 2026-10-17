@@ -8,9 +8,11 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.parse
 import urllib.request
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Tuple, Union, Callable, Set
 
 # Ensure mahjong_ai_agent root is in sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -923,6 +925,7 @@ class PaifuDownloader:
                 if fields and (2 in fields or 4 in fields or 1 in fields):
                     head_data: Dict[str, Any] = {}
                     accounts: List[Dict[str, Any]] = []
+                    extracted_uuid = ""
 
                     # Field 4 / Field 1: head (RecordGame)
                     h_blobs = fields.get(4, []) or (fields.get(1, []) if 2 in fields else [])
@@ -930,6 +933,13 @@ class PaifuDownloader:
                         if isinstance(h_blob, (bytes, bytearray)):
                             try:
                                 h_fields = decode_raw_protobuf(bytes(h_blob))
+                                # Field 1 in RecordGame: uuid
+                                if 1 in h_fields:
+                                    u_raw = h_fields[1][0]
+                                    if isinstance(u_raw, (bytes, bytearray)):
+                                        extracted_uuid = u_raw.decode("utf-8", errors="replace").strip()
+                                    elif isinstance(u_raw, str):
+                                        extracted_uuid = u_raw.strip()
                                 # Field 3 in RecordGame: repeated accounts
                                 if 3 in h_fields:
                                     for acc_blob in h_fields[3]:
@@ -938,7 +948,11 @@ class PaifuDownloader:
                                             seat = acc_fields.get(1, [0])[0]
                                             nick_raw = acc_fields.get(2, [b""])[0]
                                             nick = nick_raw.decode("utf-8", errors="replace") if isinstance(nick_raw, (bytes, bytearray)) else str(nick_raw)
-                                            accounts.append({"seat": int(seat) if isinstance(seat, int) else 0, "nickname": nick})
+                                            accounts.append({
+                                                "seat": int(seat) if isinstance(seat, int) else 0,
+                                                "nickname": nick,
+                                                "account_id": 10001 + (int(seat) if isinstance(seat, int) else 0)
+                                            })
                             except Exception:
                                 pass
 
@@ -950,10 +964,14 @@ class PaifuDownloader:
                             decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
                             inner_actions = decode_game_detail_records(decomp)
                             if inner_actions and len(inner_actions) > 0:
-                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord.data at offset {off}!")
+                                final_uuid = uuid or extracted_uuid
+                                if not final_uuid:
+                                    import hashlib
+                                    final_uuid = f"paifu_{hashlib.md5(d_bytes[:512]).hexdigest()[:12]}"
+                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord.data at offset {off} (UUID: {final_uuid})!")
                                 payload = {
-                                    "uuid": uuid,
-                                    "head": {"accounts": accounts} if accounts else head_data,
+                                    "uuid": final_uuid,
+                                    "head": {"accounts": accounts, "uuid": final_uuid} if accounts else {"uuid": final_uuid},
                                     "rounds": [{"actions": inner_actions}]
                                 }
                                 if accounts:
@@ -966,9 +984,10 @@ class PaifuDownloader:
                         if gzip_decomp:
                             actions = decode_game_detail_records(gzip_decomp)
                             if actions and len(actions) > 0:
+                                final_uuid = uuid or extracted_uuid or f"paifu_{int(time.time())}"
                                 return {
-                                    "uuid": uuid,
-                                    "head": {"accounts": accounts},
+                                    "uuid": final_uuid,
+                                    "head": {"accounts": accounts, "uuid": final_uuid},
                                     "accounts": accounts,
                                     "rounds": [{"actions": actions}]
                                 }
@@ -980,20 +999,23 @@ class PaifuDownloader:
             if gzip_decomp:
                 actions = decode_game_detail_records(gzip_decomp)
                 if actions and len(actions) > 0:
+                    import hashlib
+                    final_uuid = uuid or f"paifu_{hashlib.md5(chunk[:512]).hexdigest()[:12]}"
                     print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from gzip stream at offset {off}!")
                     return {
-                        "uuid": uuid,
-                        "head": {},
+                        "uuid": final_uuid,
+                        "head": {"uuid": final_uuid},
                         "rounds": [{"actions": actions}]
                     }
 
             # 3. Third priority: Direct GameDetailRecords decode on uncompressed chunk
             actions = decode_game_detail_records(chunk)
             if actions and len(actions) > 0:
+                final_uuid = uuid or f"paifu_{int(time.time())}"
                 print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions directly at offset {off}!")
                 return {
-                    "uuid": uuid,
-                    "head": {},
+                    "uuid": final_uuid,
+                    "head": {"uuid": final_uuid},
                     "rounds": [{"actions": actions}]
                 }
 
@@ -1330,6 +1352,207 @@ class PaifuDownloader:
         return None
 
 
+class PaifuSniffer:
+    """
+    Passive WebSocket packet sniffer attached to the active MahjongSoul tab.
+    Monitors Network.webSocketFrameReceived on the existing session (port 9222)
+    WITHOUT reloading, navigating, or creating tabs.
+    Captures ResGameRecord packets when the user clicks '詳細' (Details) in the replay list.
+    Accumulates up to max_games (default 3) distinct matches.
+    """
+
+    def __init__(self, cdp_port: int = 9222, max_games: int = 3, cache_dir: Optional[str] = None):
+        self.cdp_port = cdp_port
+        self.max_games = max_games
+        self.cache_dir = cache_dir or os.path.join(PROJECT_ROOT, "data", "paifu_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.is_running = False
+        self.captured_records: List[Dict[str, Any]] = []
+        self.captured_uuids: Set[str] = set()
+        self._ws = None
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.downloader = PaifuDownloader(cache_dir=self.cache_dir, cdp_port=self.cdp_port)
+
+    def process_frame(self, raw_bytes: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Processes a single WebSocket binary frame.
+        Decodes ResGameRecord, saves to cache, and records unique UUID.
+        Returns the decoded record if newly captured, or None if skipped/invalid/duplicate.
+        """
+        rec = self.downloader._try_decode_records(raw_bytes, "")
+        if not rec or (not rec.get("rounds") and not rec.get("actions")):
+            return None
+
+        uuid = rec.get("uuid") or f"sniffed_{int(time.time())}_{len(self.captured_records)+1}"
+        rec["uuid"] = uuid
+
+        if uuid in self.captured_uuids:
+            return None
+
+        self.captured_uuids.add(uuid)
+        self.captured_records.append(rec)
+
+        # Cache JSON
+        cache_file = os.path.join(self.cache_dir, f"{sanitize_filename(uuid)}.json")
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        return rec
+
+    def start(
+        self,
+        on_captured: Optional[Callable[[Dict[str, Any], int, int, List[Dict[str, Any]]], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+        on_finished: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> bool:
+        if self.is_running:
+            return True
+
+        self.is_running = True
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            args=(on_captured, on_status, on_finished, on_error),
+            daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self.is_running = False
+        if self._ws and self._loop:
+            try:
+                import websockets
+                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+            except Exception:
+                pass
+
+    def _find_majsoul_target(self) -> Optional[str]:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                targets = json.loads(resp.read().decode("utf-8"))
+
+            def _score(t: dict) -> int:
+                score = 0
+                url = t.get("url", "").lower()
+                title = t.get("title", "").lower()
+                t_type = t.get("type", "").lower()
+                if any(k in url for k in ("mahjongsoul", "maj-soul", "yo-star", "yostar")):
+                    score += 50
+                if any(k in title for k in ("雀魂", "じゃんたま", "majsoul")):
+                    score += 50
+                if t_type == "page":
+                    score += 20
+                elif t_type == "iframe":
+                    score += 15
+                return score
+
+            valid = [t for t in targets if t.get("webSocketDebuggerUrl") and _score(t) > 0]
+            if not valid:
+                return None
+            valid.sort(key=_score, reverse=True)
+            return valid[0]["webSocketDebuggerUrl"]
+        except Exception:
+            return None
+
+    def _run_loop(self, on_captured, on_status, on_finished, on_error):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(
+                self._listen_async(on_captured, on_status, on_finished, on_error)
+            )
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+            self._loop = None
+
+    async def _listen_async(self, on_captured, on_status, on_finished, on_error):
+        target_ws_url = self._find_majsoul_target()
+        if not target_ws_url:
+            self.is_running = False
+            msg = f"雀魂のタブが見つかりません (Port: {self.cdp_port})。Chromeで雀魂が開かれているか確認してください。"
+            if on_error:
+                on_error(msg)
+            return
+
+        if on_status:
+            on_status(f"牌譜画面の『詳細』をクリックしてください（取得中: {len(self.captured_records)}/{self.max_games}件）")
+
+        try:
+            import websockets
+            async with websockets.connect(target_ws_url, open_timeout=4.0, max_size=None, ping_interval=None) as ws:
+                self._ws = ws
+                await ws.send(json.dumps({"id": 1, "method": "Network.enable", "params": {}}))
+                print(f"[PaifuSniffer] Attached to main tab WebSocket. Network.enable activated.")
+
+                while self.is_running and len(self.captured_records) < self.max_games:
+                    try:
+                        msg_str = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        msg = json.loads(msg_str)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception:
+                        break
+
+                    method = msg.get("method", "")
+                    if method == "Network.webSocketFrameReceived":
+                        params = msg.get("params", {})
+                        payload_data = params.get("response", {}).get("payloadData", "")
+                        if not payload_data:
+                            continue
+
+                        if isinstance(payload_data, (bytes, bytearray)):
+                            raw_bytes = bytes(payload_data)
+                        else:
+                            try:
+                                raw_bytes = base64.b64decode(payload_data)
+                            except Exception:
+                                raw_bytes = payload_data.encode("latin1", errors="ignore")
+
+                        frame_len = len(raw_bytes)
+                        # High-priority detection: large payload (>10KB) or gzip magic
+                        if frame_len > 10000 or b"\x1f\x8b" in raw_bytes:
+                            rec = self.process_frame(raw_bytes)
+                            if rec:
+                                count = len(self.captured_records)
+                                uuid = rec.get("uuid", "unknown")
+                                print(f"[PaifuSniffer] Successfully captured paifu #{count}: {uuid}")
+
+                                # Convert to MJAI events
+                                try:
+                                    events = convert_record_to_mjai(rec, my_seat=0)
+                                except Exception as ce:
+                                    print(f"[PaifuSniffer] MJAI conversion error: {ce}")
+                                    events = []
+
+                                if on_captured:
+                                    on_captured(rec, count, self.max_games, events)
+
+                                if on_status:
+                                    on_status(f"牌譜画面の『詳細』をクリックしてください（取得中: {count}/{self.max_games}件）")
+
+                                if count >= self.max_games:
+                                    print(f"[PaifuSniffer] Reached target {self.max_games} games. Stopping.")
+                                    break
+        except Exception as e:
+            print(f"[PaifuSniffer] Listener error: {e}")
+            if on_error:
+                on_error(f"スニッファー通信エラー: {e}")
+        finally:
+            self.is_running = False
+            self._ws = None
+            if on_finished:
+                on_finished(self.captured_records)
+
+
 def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
     """
     Decodes GameDetailRecords protobuf payload (often gzip-compressed) from Majsoul RPC or WebSocket frames.
@@ -1488,7 +1711,7 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                 nickname = acc.get("nickname") or acc.get("name") or ""
                 acc_id = acc.get("account_id", 0)
                 if 0 <= seat < 4:
-                    if nickname and acc_id != 0 and not is_cpu_player_name(str(nickname)):
+                    if nickname and not is_cpu_player_name(str(nickname)):
                         player_names[seat] = str(nickname).strip()
                     elif not player_names[seat]:
                         player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"

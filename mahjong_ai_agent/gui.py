@@ -106,9 +106,10 @@ class MahjongHUDApp:
         self.sniffer_instance: Optional[LiveSniffer] = None
         self.agent_loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # Opponent profiler state
+        # Opponent profiler & paifu sniffer state
         self.active_profiler = OpponentProfiler()
         self.active_custom_exploit: Optional[Dict[str, Any]] = None
+        self.paifu_sniffer: Optional[Any] = None
 
         self._init_styles()
         self._build_ui()
@@ -335,10 +336,10 @@ class MahjongHUDApp:
         )
         self.lbl_rec_detail.pack(fill=tk.X, pady=(2, 0))
 
-        # Paifu & Exploit Adaptation Section
+        # Paifu Packet Sniffer & Exploit Adaptation Section
         exploit_frame = tk.LabelFrame(
             self.root,
-            text=" 📊 牌譜解析 & 相手癖エクスプロイト ",
+            text=" 📊 牌譜パケットスニッファー & 相手癖分析 ",
             font=("Meiryo", 9, "bold"),
             fg=self.c_purple,
             bg=self.c_card,
@@ -347,34 +348,25 @@ class MahjongHUDApp:
         )
         exploit_frame.pack(fill=tk.X, padx=12, pady=4)
 
-        paifu_lbl = tk.Label(
+        self.lbl_sniffer_guide = tk.Label(
             exploit_frame,
-            text="過去牌譜URLまたはUUID (1〜3本, 改行区切り):",
+            text="雀魂の牌譜画面で「詳細」をクリックするとパケットを直接キャプチャします（最大3件）。",
             font=("Meiryo", 8),
             fg=self.c_text_dim,
             bg=self.c_card,
             anchor=tk.W,
+            wraplength=410,
+            justify=tk.LEFT,
         )
-        paifu_lbl.pack(fill=tk.X)
-
-        self.txt_paifu_urls = tk.Text(
-            exploit_frame,
-            font=("Consolas", 8),
-            bg=self.c_bg,
-            fg=self.c_text,
-            insertbackground=self.c_text,
-            height=2,
-            relief=tk.FLAT,
-        )
-        self.txt_paifu_urls.pack(fill=tk.X, pady=2)
+        self.lbl_sniffer_guide.pack(fill=tk.X)
 
         exp_btn_row = tk.Frame(exploit_frame, bg=self.c_card)
-        exp_btn_row.pack(fill=tk.X, pady=2)
+        exp_btn_row.pack(fill=tk.X, pady=(4, 2))
 
-        self.btn_analyze_paifu = tk.Button(
+        self.btn_sniffer = tk.Button(
             exp_btn_row,
-            text="📊 牌譜を取り込んで解析",
-            command=self._analyze_paifu_async,
+            text="📡 牌譜取り込み準備（スニッファー開始）",
+            command=self._toggle_sniffer,
             font=("Meiryo", 8, "bold"),
             bg="#7c3aed",
             fg="#ffffff",
@@ -385,12 +377,12 @@ class MahjongHUDApp:
             pady=3,
             cursor="hand2",
         )
-        self.btn_analyze_paifu.pack(side=tk.LEFT)
+        self.btn_sniffer.pack(side=tk.LEFT)
 
-        self.btn_open_profiler = tk.Button(
+        self.btn_finish_sniffer = tk.Button(
             exp_btn_row,
-            text="👥 対戦相手分析",
-            command=self._open_profiler_dialog,
+            text="👥 完了 / プロファイラー表示",
+            command=self._finish_and_show_profiler,
             font=("Meiryo", 8, "bold"),
             bg="#2563eb",
             fg="#ffffff",
@@ -401,11 +393,11 @@ class MahjongHUDApp:
             pady=3,
             cursor="hand2",
         )
-        self.btn_open_profiler.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_finish_sniffer.pack(side=tk.LEFT, padx=(6, 0))
 
         self.chk_exploit = tk.Checkbutton(
             exp_btn_row,
-            text="癖エクスプロイト (Exploit)",
+            text="癖エクスプロイト",
             variable=self.is_exploit_mode,
             font=("Meiryo", 8, "bold"),
             fg=self.c_purple,
@@ -418,7 +410,7 @@ class MahjongHUDApp:
 
         self.lbl_exploit_summary = tk.Label(
             exploit_frame,
-            text="解析未実行 (URLを入力して解析ボタンを押してください)",
+            text="待機中 (「牌譜取り込み準備」を押して監視を開始してください)",
             font=("Meiryo", 8),
             fg=self.c_text_dim,
             bg=self.c_card,
@@ -533,84 +525,119 @@ class MahjongHUDApp:
         except Exception as e:
             self._log_err(f"[Profiler Dialog Error] {e}")
 
-    def _analyze_paifu_async(self) -> None:
-        """Parse paifu URLs/UUIDs in background thread without freezing UI."""
-        raw_text = self.txt_paifu_urls.get("1.0", tk.END).strip()
-        if not raw_text:
-            messagebox.showinfo("牌譜解析", "牌譜URLまたはUUIDを入力してください。\n(日本語プレフィックス付きや複数行にも対応)")
+    def _toggle_sniffer(self) -> None:
+        """Starts or stops the passive WebSocket paifu sniffer on the active MahjongSoul tab."""
+        from tools.paifu_to_mjai import PaifuSniffer
+
+        if self.paifu_sniffer and self.paifu_sniffer.is_running:
+            self.paifu_sniffer.stop()
+            self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+            self.lbl_exploit_summary.config(text="スニッファーを停止しました。", fg=self.c_text_dim)
+            self._log("[Paifu Sniffer] スニッファーを手動停止しました。")
             return
 
-        extracted = extract_paifu_uuids(raw_text)
-        if not extracted:
-            # Fallback for plain lines
-            lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-            extracted = [(parse_paifu_url(l)[0], 0) for l in lines]
+        port = int(self.port_var.get().strip() or "9222")
+        self.paifu_sniffer = PaifuSniffer(cdp_port=port, max_games=3)
 
-        self.btn_analyze_paifu.config(state=tk.DISABLED, text="⏳ サーバーから取得中...")
-        self.lbl_exploit_summary.config(text="雀魂内部RPC経由でサーバーから牌譜データを取得中...", fg=self.c_yellow)
-
-        def _worker():
-            from tools.paifu_to_mjai import download_and_convert_paifu
-            parsed_count = 0
-            for item in extracted[:5]:
-                u = item[0] if isinstance(item, (list, tuple)) else str(item)
-                if not u:
-                    continue
-                try:
-                    self.root.after(0, lambda uuid_text=u: self.lbl_exploit_summary.config(
-                        text=f"雀魂サーバーから牌譜を取得中: {uuid_text[:20]}...", fg=self.c_yellow
-                    ))
-                    self._log(f"[Paifu] 雀魂RPC牌譜取得リクエスト開始: {u}")
-                    _, events = download_and_convert_paifu(u)
+        def _on_captured(rec, count, max_count, events):
+            def _ui_update():
+                uuid = rec.get("uuid", "unknown")
+                self._log(f"[Paifu Sniffer] 牌譜パケットキャプチャ成功 ({count}/{max_count}件): {uuid}")
+                if events:
                     self.active_profiler.analyze_game_events(events)
-                    parsed_count += 1
-                except Exception as e:
-                    self._log_err(f"[Paifu Error] {u} の取得・解析失敗: {e}")
+                    self._log(f"[Profiler] 対戦相手プロファイル更新完了 (解析イベント数: {len(events)})")
+                self.lbl_exploit_summary.config(
+                    text=f"1件取得完了: {uuid[:24]}...（取得中: {count}/{max_count}件）",
+                    fg=self.c_green
+                )
+                self._update_exploit_summary()
+            self.root.after(0, _ui_update)
 
-            def _update_ui():
-                self.btn_analyze_paifu.config(state=tk.NORMAL, text="📊 牌譜を取り込んで解析")
-                profiles = self.active_profiler.profiles
-                if not profiles:
+        def _on_status(status_msg):
+            def _ui_status():
+                self.lbl_exploit_summary.config(text=status_msg, fg=self.c_yellow)
+            self.root.after(0, _ui_status)
+
+        def _on_finished(records):
+            def _ui_finish():
+                self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+                count = len(records)
+                if count > 0:
                     self.lbl_exploit_summary.config(
-                        text="牌譜解析に失敗しました。URLを確認してください。", fg=self.c_red
+                        text=f"取得完了: {count}件の牌譜を取り込みました。プロファイラーを表示します。",
+                        fg=self.c_green
                     )
-                    return
-
-                # Summarize profiles
-                summary_lines = []
-                best_exploit = None
-                for name, p in profiles.items():
-                    if p.total_rounds >= 1:
-                        badges_str = " ".join([f"[{b}]" for b in p.badges])
-                        summary_lines.append(
-                            f"【{name}】{badges_str} | 和了:{p.hora_rate*100:.0f}% 放銃:{p.deal_in_rate*100:.0f}% 鳴き:{p.open_rate*100:.0f}%"
-                        )
-                        mod = self.active_profiler.get_exploit_modifiers(name)
-                        if "exploit_note" in mod and not best_exploit:
-                            best_exploit = mod
-
-                if best_exploit:
-                    self.active_custom_exploit = best_exploit
-                    summary_lines.append(f"★ 推奨エクスプロイト: {best_exploit['exploit_note']}")
-                    self.is_exploit_mode.set(True)
+                    self._log(f"[Paifu Sniffer] 合計 {count} 件の牌譜を取得完了。プロファイラーを開きます。")
+                    self._open_profiler_dialog()
                 else:
-                    self.active_custom_exploit = {
-                        "defense_scale_mult": 1.0,
-                        "danger_penalty_mult": 1.0,
-                        "attack_scale_mult": 1.0,
-                        "exploit_note": "バランス型対戦相手: 標準戦術を適用",
-                    }
+                    self.lbl_exploit_summary.config(
+                        text="スニッファー待機終了 (取得データなし)",
+                        fg=self.c_text_dim
+                    )
+            self.root.after(0, _ui_finish)
 
-                result_text = "\n".join(summary_lines)
-                self.lbl_exploit_summary.config(text=result_text, fg=self.c_green)
-                self._log(f"[Exploit] 牌譜解析完了 ({parsed_count}件):\n{result_text}")
+        def _on_error(err_msg):
+            def _ui_err():
+                self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+                self.lbl_exploit_summary.config(text=err_msg, fg=self.c_red)
+                self._log_err(f"[Paifu Sniffer Error] {err_msg}")
+            self.root.after(0, _ui_err)
 
-                # Automatically pop up the detailed Opponent Profiler dialog
-                self._open_profiler_dialog()
+        self.btn_sniffer.config(text="⏳ スニッファー監視中 (クリックで停止)", bg="#b91c1c")
+        self.lbl_exploit_summary.config(
+            text="牌譜画面の『詳細』をクリックしてください（取得中: 0/3件）",
+            fg=self.c_yellow
+        )
+        self._log(f"[Paifu Sniffer] 既存タブ監視開始 (Port: {port})。雀魂の牌譜一覧で「詳細」をクリックしてください。")
 
-            self.root.after(0, _update_ui)
+        self.paifu_sniffer.start(
+            on_captured=_on_captured,
+            on_status=_on_status,
+            on_finished=_on_finished,
+            on_error=_on_error
+        )
 
-        threading.Thread(target=_worker, daemon=True).start()
+    def _finish_and_show_profiler(self) -> None:
+        """Stops sniffer if running and opens the PlayerProfilerDialog."""
+        if self.paifu_sniffer and self.paifu_sniffer.is_running:
+            self.paifu_sniffer.stop()
+            self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+
+        self._update_exploit_summary()
+        self._open_profiler_dialog()
+
+    def _update_exploit_summary(self) -> None:
+        """Summarizes player profiles and enables exploit tactics if applicable."""
+        profiles = self.active_profiler.profiles
+        if not profiles:
+            return
+
+        summary_lines = []
+        best_exploit = None
+        for name, p in profiles.items():
+            if p.total_rounds >= 1:
+                badges_str = " ".join([f"[{b}]" for b in p.badges])
+                summary_lines.append(
+                    f"【{name}】{badges_str} | 和了:{p.hora_rate*100:.0f}% 放銃:{p.deal_in_rate*100:.0f}% 鳴き:{p.open_rate*100:.0f}%"
+                )
+                mod = self.active_profiler.get_exploit_modifiers(name)
+                if "exploit_note" in mod and not best_exploit:
+                    best_exploit = mod
+
+        if best_exploit:
+            self.active_custom_exploit = best_exploit
+            summary_lines.append(f"★ 推奨エクスプロイト: {best_exploit['exploit_note']}")
+            self.is_exploit_mode.set(True)
+        else:
+            self.active_custom_exploit = {
+                "defense_scale_mult": 1.0,
+                "danger_penalty_mult": 1.0,
+                "attack_scale_mult": 1.0,
+                "exploit_note": "バランス型対戦相手: 標準戦術を適用",
+            }
+
+        result_text = "\n".join(summary_lines)
+        self.lbl_exploit_summary.config(text=result_text, fg=self.c_green)
 
     def _toggle_assist(self) -> None:
         """Start or stop the Mahjong AI assist agent loop."""

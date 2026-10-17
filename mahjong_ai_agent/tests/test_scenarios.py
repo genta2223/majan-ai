@@ -3678,8 +3678,204 @@ def test_paifu_downloader_large_liqi_frame_res_game_record(tmp_path):
     assert len(result["accounts"]) == 2
     assert result["accounts"][0]["nickname"] == "genta2223"
     assert result["accounts"][1]["nickname"] == "プロコフ"
+def test_paifu_sniffer_process_frame_and_deduplication(tmp_path):
+    """
+    Verifies that PaifuSniffer.process_frame correctly decodes a large ResGameRecord packet,
+    caches it to disk, adds unique UUID to captured_records, and drops duplicate UUID frames.
+    """
+    from tools.paifu_to_mjai import PaifuSniffer
+    import gzip
+
+    sniffer = PaifuSniffer(cdp_port=9222, max_games=3, cache_dir=str(tmp_path))
+
+    def create_mock_frame(uuid_str: str, nick: str) -> bytes:
+        action_1 = b"\x0a\x0eRecordNewRound\x12\x02\x08\x00"
+        action_2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x01\x10\x12"
+        action_3 = b"\x0a\x0aRecordHule\x12\x06\x08\x00\x10\xc8\x01\x18\x01"
+        records_payload = (
+            b"\x0a" + bytes([len(action_1)]) + action_1 +
+            b"\x0a" + bytes([len(action_2)]) + action_2 +
+            b"\x0a" + bytes([len(action_3)]) + action_3
+        )
+        gzipped = gzip.compress(records_payload)
+
+        u_bytes = uuid_str.encode("utf-8")
+        uuid_field = b"\x0a" + bytes([len(u_bytes)]) + u_bytes
+        nick_bytes = nick.encode("utf-8")
+        acc_inner = b"\x08\x01\x12" + bytes([len(nick_bytes)]) + nick_bytes
+        acc_field = b"\x1a" + bytes([len(acc_inner)]) + acc_inner
+        head = uuid_field + acc_field
+
+        def encode_varint(n: int) -> bytes:
+            res = bytearray()
+            while n >= 0x80:
+                res.append((n & 0x7F) | 0x80)
+                n >>= 7
+            res.append(n)
+            return bytes(res)
+
+        res_game = (
+            b"\x12" + encode_varint(len(gzipped)) + gzipped +
+            b"\x22" + encode_varint(len(head)) + head
+        )
+        frame = b"\x03\x01\x00" + res_game
+        frame += b"\x00" * 12000
+        return frame
+
+    frame1 = create_mock_frame("261017-match-001", "プレイヤーA")
+    frame2 = create_mock_frame("261017-match-002", "プレイヤーB")
+
+    # 1. Process frame 1
+    rec1 = sniffer.process_frame(frame1)
+    assert rec1 is not None
+    assert rec1["uuid"] == "261017-match-001"
+    assert len(sniffer.captured_records) == 1
+    assert "261017-match-001" in sniffer.captured_uuids
+
+    # Verify cache file created
+    cache_file = os.path.join(str(tmp_path), "261017-match-001.json")
+    assert os.path.exists(cache_file)
+
+    # 2. Duplicate frame 1 should be ignored (None returned, count stays 1)
+    rec1_dup = sniffer.process_frame(frame1)
+    assert rec1_dup is None
+    assert len(sniffer.captured_records) == 1
+
+    # 3. Process frame 2 (unique match)
+    rec2 = sniffer.process_frame(frame2)
+    assert rec2 is not None
+    assert rec2["uuid"] == "261017-match-002"
+    assert len(sniffer.captured_records) == 2
 
 
+@pytest.mark.asyncio
+async def test_paifu_sniffer_sequential_capture_and_profiler_integration(tmp_path, monkeypatch):
+    """
+    Verifies that PaifuSniffer attaches to an existing Chrome WebSocket session,
+    sends Network.enable, captures up to 3 sequential paifu packets via Network.webSocketFrameReceived,
+    stops when reaching max_games=3, and feeds all game events into OpponentProfiler.
+    """
+    from tools.paifu_to_mjai import PaifuSniffer
+    from core.opponent_profiler import OpponentProfiler
+    import gzip
+    import base64
+    import json
+    import asyncio
 
+    sniffer = PaifuSniffer(cdp_port=9222, max_games=3, cache_dir=str(tmp_path))
 
+    def make_frame_base64(uuid_str: str, nick: str) -> str:
+        action_1 = b"\x0a\x0eRecordNewRound\x12\x02\x08\x00"
+        action_2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x01\x10\x12"
+        action_3 = b"\x0a\x0aRecordHule\x12\x06\x08\x00\x10\xc8\x01\x18\x01"
+        records_payload = (
+            b"\x0a" + bytes([len(action_1)]) + action_1 +
+            b"\x0a" + bytes([len(action_2)]) + action_2 +
+            b"\x0a" + bytes([len(action_3)]) + action_3
+        )
+        gzipped = gzip.compress(records_payload)
+        u_bytes = uuid_str.encode("utf-8")
+        uuid_field = b"\x0a" + bytes([len(u_bytes)]) + u_bytes
+        nick_bytes = nick.encode("utf-8")
+        acc_inner = b"\x08\x01\x12" + bytes([len(nick_bytes)]) + nick_bytes
+        acc_field = b"\x1a" + bytes([len(acc_inner)]) + acc_inner
+        head = uuid_field + acc_field
+
+        def encode_varint(n: int) -> bytes:
+            res = bytearray()
+            while n >= 0x80:
+                res.append((n & 0x7F) | 0x80)
+                n >>= 7
+            res.append(n)
+            return bytes(res)
+
+        res_game = (
+            b"\x12" + encode_varint(len(gzipped)) + gzipped +
+            b"\x22" + encode_varint(len(head)) + head
+        )
+        raw_b = b"\x03\x01\x00" + res_game + (b"\x00" * 12000)
+        return base64.b64encode(raw_b).decode("ascii")
+
+    frames_b64 = [
+        make_frame_base64(f"261017-stream-match-00{i}", f"Opponent_{i}")
+        for i in range(1, 4)
+    ]
+
+    sent_messages = []
+    class MockWS:
+        def __init__(self):
+            self.msg_idx = 0
+            self.closed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            self.closed = True
+
+        async def send(self, msg):
+            sent_messages.append(json.loads(msg))
+
+        async def recv(self):
+            if self.msg_idx < len(frames_b64):
+                payload = frames_b64[self.msg_idx]
+                self.msg_idx += 1
+                msg = {
+                    "method": "Network.webSocketFrameReceived",
+                    "params": {
+                        "response": {
+                            "payloadData": payload
+                        }
+                    }
+                }
+                return json.dumps(msg)
+            await asyncio.sleep(0.1)
+            raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(sniffer, "_find_majsoul_target", lambda: "ws://127.0.0.1:9222/devtools/page/TEST")
+
+    import websockets
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: MockWS())
+
+    captured_list = []
+    status_list = []
+    finished_list = []
+
+    profiler = OpponentProfiler()
+
+    def on_captured(rec, count, max_count, events):
+        captured_list.append((rec, count, max_count))
+        if events:
+            profiler.analyze_game_events(events)
+
+    def on_status(msg):
+        status_list.append(msg)
+
+    def on_finished(records):
+        finished_list.append(records)
+
+    sniffer.is_running = True
+    await sniffer._listen_async(
+        on_captured=on_captured,
+        on_status=on_status,
+        on_finished=on_finished,
+        on_error=None
+    )
+
+    # 1. Verify Network.enable was sent
+    assert any(m.get("method") == "Network.enable" for m in sent_messages)
+
+    # 2. Verify all 3 matches captured sequentially
+    assert len(captured_list) == 3
+    assert captured_list[0][1] == 1
+    assert captured_list[1][1] == 2
+    assert captured_list[2][1] == 3
+    assert len(sniffer.captured_records) == 3
+
+    # 3. Verify finished callback called with 3 records
+    assert len(finished_list) == 1
+    assert len(finished_list[0]) == 3
+
+    # 4. Verify profiler updated
+    assert len(profiler.profiles) > 0
 
