@@ -868,6 +868,84 @@ class PaifuDownloader:
             pass
         return True  # Modern MahjongSoul is Unity WebGL Build 4.0.12+
 
+    def _decompress_gzip_slice(self, raw_bytes: bytes) -> Optional[bytes]:
+        """Searches for gzip magic header 0x1f 0x8b and decompresses stream, handling trailing data."""
+        if not raw_bytes:
+            return None
+        import gzip
+        import zlib
+        idx = raw_bytes.find(b"\x1f\x8b")
+        if idx == -1:
+            return None
+        target_slice = raw_bytes[idx:]
+        try:
+            return gzip.decompress(target_slice)
+        except Exception:
+            pass
+        try:
+            # 16 + MAX_WBITS enables gzip decoding while ignoring extra trailing bytes
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            decompressed = d.decompress(target_slice)
+            if decompressed:
+                return decompressed
+        except Exception:
+            pass
+        return None
+
+    def _try_decode_records(self, raw_bytes: bytes, uuid: str) -> Optional[Dict[str, Any]]:
+        """Attempts to decode GameDetailRecords actions or ResGameRecord protobuf structure."""
+        if not raw_bytes:
+            return None
+        
+        # 1. Direct decode_game_detail_records
+        actions = decode_game_detail_records(raw_bytes)
+        if actions and len(actions) > 0:
+            return {
+                "uuid": uuid,
+                "head": {},
+                "rounds": [{"actions": actions}]
+            }
+
+        # 2. Check ResGameRecord protobuf fields (field 2 = data, field 4 = head)
+        head_data: Dict[str, Any] = {}
+        accounts: List[Dict[str, Any]] = []
+        try:
+            fields = decode_raw_protobuf(raw_bytes)
+            # Field 4: head (RecordGame)
+            if 4 in fields and fields[4]:
+                h_blob = fields[4][0]
+                if isinstance(h_blob, (bytes, bytearray)):
+                    h_fields = decode_raw_protobuf(bytes(h_blob))
+                    # Field 3 in RecordGame: repeated accounts
+                    if 3 in h_fields:
+                        for acc_blob in h_fields[3]:
+                            if isinstance(acc_blob, (bytes, bytearray)):
+                                acc_fields = decode_raw_protobuf(bytes(acc_blob))
+                                seat = acc_fields.get(1, [0])[0]
+                                nick_raw = acc_fields.get(2, [b""])[0]
+                                nick = nick_raw.decode("utf-8", errors="replace") if isinstance(nick_raw, (bytes, bytearray)) else str(nick_raw)
+                                accounts.append({"seat": int(seat) if isinstance(seat, int) else 0, "nickname": nick})
+            # Field 2: data (bytes)
+            if 2 in fields and fields[2]:
+                data_blob = fields[2][0]
+                if isinstance(data_blob, (bytes, bytearray)):
+                    d_bytes = bytes(data_blob)
+                    decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
+                    inner_actions = decode_game_detail_records(decomp)
+                    if inner_actions and len(inner_actions) > 0:
+                        payload = {
+                            "uuid": uuid,
+                            "head": {"accounts": accounts} if accounts else head_data,
+                            "rounds": [{"actions": inner_actions}]
+                        }
+                        if accounts:
+                            payload["accounts"] = accounts
+                        return payload
+        except Exception:
+            pass
+
+        return None
+
     def _fetch_via_unity_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Direct approach for Unity WebGL client:
@@ -979,19 +1057,29 @@ class PaifuDownloader:
                                 if payload_data:
                                     try:
                                         raw_bytes = base64.b64decode(payload_data)
-                                        # Fast check: gzip magic 0x1f 0x8b or decode directly
-                                        if b"\x1f\x8b" in raw_bytes or len(raw_bytes) > 64:
-                                            actions = decode_game_detail_records(raw_bytes)
-                                            if actions and len(actions) > 0:
-                                                print(f"[PaifuDownloader] Intercepted authentic paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
-                                                captured_record = {
-                                                    "uuid": uuid,
-                                                    "head": {},
-                                                    "rounds": [{"actions": actions}]
-                                                }
-                                                break
                                     except Exception:
-                                        pass
+                                        raw_bytes = payload_data.encode("latin1", errors="ignore")
+
+                                    gzip_idx = raw_bytes.find(b"\x1f\x8b")
+                                    has_gzip = (gzip_idx != -1)
+                                    print(f"[PaifuDownloader] WS Frame #{total_ws_frames}: len={len(raw_bytes)}, gzip={'YES (offset ' + str(gzip_idx) + ')' if has_gzip else 'no'}")
+
+                                    # A. If gzip magic present, attempt decompression and record decoding
+                                    if has_gzip:
+                                        decompressed = self._decompress_gzip_slice(raw_bytes)
+                                        if decompressed:
+                                            rec = self._try_decode_records(decompressed, uuid)
+                                            if rec and (rec.get("rounds") or rec.get("actions")):
+                                                print(f"[PaifuDownloader] Intercepted authentic paifu packet in gzip WS frame #{total_ws_frames}!")
+                                                captured_record = rec
+                                                break
+
+                                    # B. Attempt record decoding directly on raw_bytes
+                                    rec = self._try_decode_records(raw_bytes, uuid)
+                                    if rec and (rec.get("rounds") or rec.get("actions")):
+                                        print(f"[PaifuDownloader] Intercepted authentic paifu packet directly in WS frame #{total_ws_frames}!")
+                                        captured_record = rec
+                                        break
 
                             # Intercept HTTP response if fetched via HTTP
                             elif method == "Network.responseReceived":
@@ -1014,14 +1102,10 @@ class PaifuDownloader:
                                     if body_text:
                                         if is_b64:
                                             raw_b = base64.b64decode(body_text)
-                                            actions = decode_game_detail_records(raw_b)
-                                            if actions:
-                                                print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from HTTP response body!")
-                                                captured_record = {
-                                                    "uuid": uuid,
-                                                    "head": {},
-                                                    "rounds": [{"actions": actions}]
-                                                }
+                                            rec = self._try_decode_records(raw_b, uuid)
+                                            if rec:
+                                                print(f"[PaifuDownloader] Successfully extracted paifu from binary HTTP response body!")
+                                                captured_record = rec
                                                 break
                                         else:
                                             try:
@@ -1122,6 +1206,7 @@ def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
     if not raw_bytes:
         return []
     import gzip
+    import zlib
     data = None
     try:
         data = gzip.decompress(raw_bytes)
@@ -1129,10 +1214,15 @@ def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
         # Search for embedded gzip magic header 0x1f 0x8b if buried inside packet framing
         idx = raw_bytes.find(b"\x1f\x8b")
         if idx != -1:
+            target_slice = raw_bytes[idx:]
             try:
-                data = gzip.decompress(raw_bytes[idx:])
+                data = gzip.decompress(target_slice)
             except Exception:
-                pass
+                try:
+                    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    data = d.decompress(target_slice)
+                except Exception:
+                    pass
         if data is None:
             data = raw_bytes
 

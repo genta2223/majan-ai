@@ -3457,12 +3457,16 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
     downloader = PaifuDownloader(cache_dir=str(tmp_path))
     test_uuid = "261017-ws-frame-uuid"
 
-    # Construct mock protobuf payload wrapped in gzip
+    # Construct mock protobuf payload wrapped in gzip with prefix and trailing bytes (arbitrary offset)
     name_bytes = b"RecordNewRound"
     wrapper_bytes = b"\x0a" + bytes([len(name_bytes)]) + name_bytes + b"\x12\x02\x08\x00"
     payload = b"\x0a" + bytes([len(wrapper_bytes)]) + wrapper_bytes
     gzipped = gzip.compress(payload)
-    b64_payload = base64.b64encode(gzipped).decode("ascii")
+    # Add Liqi RPC header prefix (offset > 0) and trailing protobuf metadata bytes
+    prefix = b"\x02\x00\x05\x12\x34"
+    trailing = b"\x22\x06extra!"
+    framed_packet = prefix + gzipped + trailing
+    b64_payload = base64.b64encode(framed_packet).decode("ascii")
 
     targets_data = [
         {
@@ -3519,7 +3523,7 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
             method = msg.get("method")
             if method in ("Page.enable", "Network.enable", "Runtime.enable"):
                 await self._incoming.put(json.dumps({"id": cid, "result": {}}))
-                # Push binary WebSocket frame containing gzipped game detail records
+                # Push binary WebSocket frame containing gzipped game detail records at offset 5
                 await self._incoming.put(json.dumps({
                     "method": "Network.webSocketFrameReceived",
                     "params": {
@@ -3541,6 +3545,39 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
     assert res.get("uuid") == test_uuid
     assert len(res.get("rounds", [])) == 1
     assert res["rounds"][0]["actions"][0]["action_name"] == "RecordNewRound"
+
+
+def test_paifu_downloader_decompress_embedded_gzip_offset(tmp_path):
+    """
+    Direct unit test verifying _decompress_gzip_slice and _try_decode_records
+    correctly find and extract gzip stream buried at arbitrary offset with trailing data.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader
+    import gzip
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-embedded-gzip-test"
+
+    name_bytes = b"RecordNewRound"
+    wrapper_bytes = b"\x0a" + bytes([len(name_bytes)]) + name_bytes + b"\x12\x02\x08\x00"
+    payload = b"\x0a" + bytes([len(wrapper_bytes)]) + wrapper_bytes
+    gzipped = gzip.compress(payload)
+
+    # Buried at offset 12 with 8 bytes trailing metadata
+    garbage_prefix = b"LIQI_PACKET_"
+    garbage_suffix = b"_ENDDATA"
+    framed_data = garbage_prefix + gzipped + garbage_suffix
+
+    decompressed = downloader._decompress_gzip_slice(framed_data)
+    assert decompressed is not None
+    assert payload in decompressed
+
+    record = downloader._try_decode_records(decompressed, test_uuid)
+    assert record is not None
+    assert record["uuid"] == test_uuid
+    assert len(record["rounds"][0]["actions"]) == 1
+    assert record["rounds"][0]["actions"][0]["action_name"] == "RecordNewRound"
+
 
 
 def test_paifu_downloader_skips_legacy_rpc_on_unity(monkeypatch, tmp_path, capsys):
