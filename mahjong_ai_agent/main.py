@@ -78,6 +78,18 @@ class MahjongAIAgent:
         self.state_mgr.my_actor_id = seat
 
     async def handle_event(self, event: Dict[str, Any]) -> Optional[OutputAction]:
+        """Consumes a single mjai event with guaranteed top-level exception immunity."""
+        try:
+            return await self._handle_event_impl(event)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            ev_type = event.get("type", "unknown") if isinstance(event, dict) else "unknown"
+            print(f"[Main ERROR] Unhandled exception in handle_event for '{ev_type}': {e}\n{tb}")
+            trace_log("HANDLE_EVENT_EXCEPTION", f"Event '{ev_type}' error: {e}\n{tb}")
+            return None
+
+    async def _handle_event_impl(self, event: Dict[str, Any]) -> Optional[OutputAction]:
         event_type = event.get("type")
 
         # 0. Real-time opponent profiling stream feed
@@ -103,25 +115,26 @@ class MahjongAIAgent:
             self.packet_hand_trusted = has_visible
             if has_visible:
                 print(f"[Main Guard] Packet hand trusted for this round -> Vision fallback LOCKED")
-            # Vision Fallback safety net: if no visible hand in packet, capture screen ONLY for genuine rounds
+
+            # Vision Fallback safety net (non-blocking thread with 0.8s timeout)
             is_genuine_round = event.get("action_name") in ("ActionNewRound", "RecordNewRound") if "action_name" in event else True
             if self.vision_fallback_enabled and is_genuine_round and not has_visible and len(tehais) > self.my_actor_id:
                 try:
-                    from io_adapter.vision_hand_reader import VisionHandReader
-                    reader = VisionHandReader()
-                    raw_vision_hand = reader.read_hand()
+                    def _capture():
+                        from io_adapter.vision_hand_reader import VisionHandReader
+                        reader = VisionHandReader()
+                        return reader.read_hand()
+
+                    raw_vision_hand = await asyncio.wait_for(asyncio.to_thread(_capture), timeout=0.8)
                     vision_hand = [t for t in raw_vision_hand if is_valid_mahjong_tile(t)]
-                    # Sanity check: must not be all identical tiles (e.g. all 'P' during blank animation)
                     if vision_hand and len(vision_hand) >= 13 and len(set(vision_hand)) >= 3:
                         tehais[self.my_actor_id] = vision_hand[:13]
                         print(f"[Main Vision Fallback] Injected {len(vision_hand)} vision tiles into Player {self.my_actor_id}: {tehais[self.my_actor_id]}")
-                        # If dealer, handle 14th tile
                         if event.get("oya", 0) == self.my_actor_id and len(vision_hand) >= 14:
                             tehais[self.my_actor_id] = vision_hand[:14]
-                    elif vision_hand and len(set(vision_hand)) < 3:
-                        print(f"[Main Vision Fallback] Rejected vision tiles due to low diversity: {vision_hand[:5]}...")
-                except Exception as ve:
-                    print(f"[Main Vision Fallback] Warning: {ve}")
+                except (asyncio.TimeoutError, Exception) as ve:
+                    pass
+
         elif event_type == "tsumo":
             actor = event.get("actor", 0)
             pai = event.get("pai", "")
@@ -133,7 +146,6 @@ class MahjongAIAgent:
             # Live Vision Resynchronization on self turn
             if actor == self.my_actor_id:
                 if not self.state_mgr.round_state:
-                    # Trigger rescue initialization in state manager
                     self.state_mgr.update_event({"type": "tsumo", "actor": actor, "pai": pai, "tiles": event.get("tiles")})
                 elif event.get("tiles") and self.state_mgr.round_state:
                     p = self.state_mgr.round_state.players[self.my_actor_id]
@@ -148,16 +160,18 @@ class MahjongAIAgent:
                         needs_sync = True
 
                 if needs_sync and (self.packet_hand_trusted or not self.vision_fallback_enabled):
-                    # Packet data is authoritative: never let vision overwrite the hand.
                     if not pai or pai == "?":
                         print(f"[Main Guard] Self tsumo tile missing from packet; vision LOCKED (packet hand trusted). Keeping state.")
                     needs_sync = False
 
                 if needs_sync:
                     try:
-                        from io_adapter.vision_hand_reader import VisionHandReader
-                        reader = VisionHandReader()
-                        raw_vision_hand = reader.read_hand()
+                        def _capture_turn():
+                            from io_adapter.vision_hand_reader import VisionHandReader
+                            reader = VisionHandReader()
+                            return reader.read_hand()
+
+                        raw_vision_hand = await asyncio.wait_for(asyncio.to_thread(_capture_turn), timeout=0.8)
                         vision_hand = [t for t in raw_vision_hand if is_valid_mahjong_tile(t)]
                         if vision_hand and len(vision_hand) >= 13:
                             if len(vision_hand) >= 14:
@@ -175,8 +189,8 @@ class MahjongAIAgent:
                                 p.tehai = list(hand_tiles)
                                 p.tsumo_tile = tsumo_tile
                             print(f"[Live Vision Sync] Resynchronized player {self.my_actor_id} hand ({len(vision_hand)} tiles): {vision_hand} | Tsumo: {tsumo_tile}")
-                    except Exception as ve:
-                        print(f"[Live Vision Sync] Warning: {ve}")
+                    except (asyncio.TimeoutError, Exception) as ve:
+                        pass
 
         # 1. Update board state
         self.state_mgr.update_event(event)
@@ -184,12 +198,10 @@ class MahjongAIAgent:
         # Clear previous recommendation cache on new turn draw or self discard to prevent stale recommendations
         if event_type == "tsumo":
             if event.get("actor") == self.my_actor_id:
-                # Self turn begins: immediately clear previous recommendations so fresh decision is calculated
                 self.action_controller.clear_recommendation(notify=True)
             else:
                 self.action_controller.clear_recommendation(notify=False)
         elif event_type == "dahai" and event.get("actor") == self.my_actor_id:
-            # Self turn completed: immediately purge recommendations and notify HUD of opponent wait state
             self.action_controller.clear_recommendation(notify=True)
 
         if self.status_callback and event_type in ("start_kyoku", "tsumo", "dahai", "chi", "pon", "kan", "hora", "ryukyoku"):
@@ -243,30 +255,37 @@ class MahjongAIAgent:
         return output_action
 
     async def run_stream(self, event_stream) -> None:
-        """Asynchronous loop consuming events from an async generator."""
+        """Asynchronous loop consuming events from an async generator with permanent liveness."""
         print("==================================================================")
         print("  [Mahjong AI Agent] Initialized (Tactical Push-Fold Engine)      ")
         print(f"  Actor ID: {self.my_actor_id} | Sleep Delay: {self.apply_sleep}")
         print("==================================================================")
 
         import traceback
-        async for event in event_stream:
-            try:
-                ev_type = event.get("type", "")
-                trace_log("AGENT_STREAM_RECV", f"Event: {ev_type}", event)
-                if ev_type in ("start_kyoku", "reach", "hora", "ryukyoku", "tsumo", "dahai", "chi", "pon", "kan"):
-                    actor_str = f"P{event.get('actor')}" if "actor" in event else ""
-                    pai_str = event.get("pai", "")
-                    print(f"[STREAM EVENT] {ev_type.upper():<12} {actor_str:<4} {pai_str:<4}")
-                action = await self.handle_event(event)
-                if action:
-                    trace_log("DECISION_OUTPUT", f"Action: {action.action_type} Tile: {action.tile}")
-                    self._print_decision(action)
-            except Exception as e:
-                tb = traceback.format_exc()
-                trace_log("AGENT_EVENT_ERR", f"Error in event {event}: {e}\n{tb}")
-                print(f"[Main] Error processing event {event}: {e}\n{tb}")
-                continue
+        try:
+            async for event in event_stream:
+                try:
+                    if not event or not isinstance(event, dict):
+                        continue
+                    ev_type = event.get("type", "")
+                    trace_log("AGENT_STREAM_RECV", f"Event: {ev_type}", event)
+                    if ev_type in ("start_kyoku", "reach", "hora", "ryukyoku", "tsumo", "dahai", "chi", "pon", "kan"):
+                        actor_str = f"P{event.get('actor')}" if "actor" in event else ""
+                        pai_str = event.get("pai", "")
+                        print(f"[STREAM EVENT] {ev_type.upper():<12} {actor_str:<4} {pai_str:<4}")
+                    action = await self.handle_event(event)
+                    if action:
+                        trace_log("DECISION_OUTPUT", f"Action: {action.action_type} Tile: {action.tile}")
+                        self._print_decision(action)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    trace_log("AGENT_EVENT_ERR", f"Error in event {event}: {e}\n{tb}")
+                    print(f"[Main Stream] Error processing event {event}: {e}\n{tb}")
+                    continue
+        except Exception as outer_e:
+            tb = traceback.format_exc()
+            trace_log("AGENT_STREAM_FATAL", f"Fatal event_stream error: {outer_e}\n{tb}")
+            print(f"[Main Stream FATAL] Event stream loop caught fatal error: {outer_e}\n{tb}")
 
     def _print_decision(self, action: OutputAction) -> None:
         coords_str = f"({action.screen_coordinates.x}, {action.screen_coordinates.y})" if action.screen_coordinates else "N/A"

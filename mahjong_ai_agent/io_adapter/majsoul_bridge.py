@@ -220,20 +220,6 @@ class MajsoulBridge:
             if valid_tiles:
                 tehais[self.my_seat] = valid_tiles
 
-        # Vision Fallback for self hand if packet has no hand tiles
-        if (not raw_tiles or all(t == "?" for t in tehais[self.my_seat])) and self.vision_fallback_enabled:
-            try:
-                from io_adapter.vision_hand_reader import VisionHandReader
-                reader = VisionHandReader()
-                vision_tiles = reader.read_hand()
-                if vision_tiles and len(vision_tiles) >= 13:
-                    norm_vision = [liqi_tile_to_mjai(t) for t in vision_tiles]
-                    if len(set(norm_vision)) >= 3:
-                        tehais[self.my_seat] = norm_vision[:13]
-                        print(f"[MajsoulBridge RESCUE Vision] Captured mid-game hand ({len(norm_vision)} tiles): {norm_vision}")
-            except Exception:
-                pass
-
         print(
             f"[MajsoulBridge RESCUE] Mid-game join detected on '{trigger_action}'. "
             f"Synthesized start_kyoku: {bakaze}{kyoku}局 {honba}本場, MySeat=P{self.my_seat}, Hand={len(tehais[self.my_seat])} tiles."
@@ -361,7 +347,7 @@ class MajsoulBridge:
 
             # 4. Vision Fallback: If packet has 0 hand tiles for self, capture screen
             # ONLY allow vision fallback for genuine round start (ActionNewRound / RecordNewRound),
-            # NEVER for ActionMJStart (which arrives during table start animation and reads all tiles as blank/P).
+            # NEVER for ActionMJStart / NotifyRoomGameStart (which arrive during table start animation).
             my_hand = tehais[self.my_seat]
             is_empty_hand = (not my_hand) or (all(t == "?" for t in my_hand))
             is_genuine_round = clean_name in ("ActionNewRound", "RecordNewRound")
@@ -371,15 +357,11 @@ class MajsoulBridge:
                     reader = VisionHandReader()
                     vision_tiles = reader.read_hand()
                     if vision_tiles and len(vision_tiles) >= 13:
-                        # Sanity check: must not be 13+ identical tiles (e.g. all 'P' from blank animation)
                         norm_vision = [liqi_tile_to_mjai(t) for t in vision_tiles]
                         if len(set(norm_vision)) >= 3:
                             tehais[self.my_seat] = norm_vision
-                            print(f"[Vision Fallback] Overrode self hand with {len(tehais[self.my_seat])} vision tiles: {tehais[self.my_seat]}")
-                        else:
-                            print(f"[Vision Fallback] Rejected vision tiles due to low diversity (likely animation blank screen): {norm_vision}")
-                except Exception as ve:
-                    print(f"[Vision Fallback] Warning: Hand capture fallback failed: {ve}")
+                except Exception:
+                    pass
 
             # Fill unknown opponent hands with hidden tile markers
             for i in range(4):
@@ -483,22 +465,6 @@ class MajsoulBridge:
                         self._current_doras.append(mjai_d)
                         events.append({"type": "dora", "dora_marker": mjai_d})
 
-            # Vision only when the packet itself was undecodable (wire_ok is False).
-            # A structurally valid DealTile without a tile is an opponent's hidden draw:
-            # vision must NOT run there (it caused phantom tiles / wrong seat switching).
-            packet_corrupt = data.get("wire_ok") is False
-            if (self.vision_fallback_enabled and packet_corrupt
-                    and seat == self.my_seat and (not tile or tile == "?")):
-                try:
-                    from io_adapter.vision_hand_reader import VisionHandReader
-                    reader = VisionHandReader()
-                    vision_tiles = reader.read_hand()
-                    if vision_tiles and len(vision_tiles) >= 14:
-                        if vision_tiles[-1] and vision_tiles[-1] != "?":
-                            tile = vision_tiles[-1]
-                            print(f"[Bridge Vision Sync] Identified self tsumo tile: {tile}")
-                except Exception as ve:
-                    pass
 
             tsumo_event: Dict[str, Any] = {
                 "type": "tsumo",

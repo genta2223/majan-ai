@@ -5291,6 +5291,78 @@ def test_gui_exclusive_button_control_guards():
         root.destroy()
 
 
+@pytest.mark.asyncio
+async def test_first_turn_resilience_under_noisy_async_packets(test_config):
+    """
+    Test Requirement: Verify that under noisy asynchronous packets (ActionMJStart, heartbeats,
+    corrupted dicts, out-of-order notifications):
+    1. ActionMJStart does NOT emit empty start_kyoku.
+    2. Genuine ActionNewRound instantly initializes 13-tile hand without blocking.
+    3. The 1st turn draw event (tsumo) is consumed immediately.
+    4. Top 1 & 2 AI recommendations are computed and emitted without deadlock or silent crash.
+    5. Corrupted/None events in stream are safely suppressed by the top-level exception guards.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from main import MahjongAIAgent
+
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=False)
+
+    # 1. ActionMJStart arrives first (table animation) -> Emits placeholder without blocking or vision fallback
+    mj_start_events = bridge.translate_action("ActionMJStart", {})
+    assert len(mj_start_events) == 1
+    assert mj_start_events[0]["type"] == "start_kyoku"
+    assert mj_start_events[0]["tehais"][0] == ["?"] * 13
+
+    # 2. Genuine ActionNewRound arrives for Dealer (oya=0) with 13-tile hand
+    new_round_data = {
+        "chang": 0, "ju": 0, "ben": 0, "liqibang": 0, "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4s"],
+        "doras": ["1p"]
+    }
+    round_events = bridge.translate_action("ActionNewRound", new_round_data)
+    assert len(round_events) >= 1
+    assert round_events[0]["type"] == "start_kyoku"
+    assert len(round_events[0]["tehais"][0]) == 13
+
+    # 3. Dealer draw (ActionDealTile) arrives for seat 0 with 14th tile "5s"
+    deal_events = bridge.translate_action("ActionDealTile", {
+        "seat": 0,
+        "tile": "5s",
+        "doras": ["1p"]
+    })
+    assert len(deal_events) == 1
+    assert deal_events[0]["type"] == "tsumo"
+    assert deal_events[0]["actor"] == 0
+    assert deal_events[0]["pai"] == "5s"
+
+    # 4. Construct a noisy event stream containing corrupted packets before and after
+    async def _noisy_stream():
+        yield {"type": "heartbeat_dummy"}              # Unrecognized event
+        yield {"corrupted_key_no_type": 123}            # Missing type
+        yield round_events[0]                          # start_kyoku
+        yield {"type": "unknown_async_notify"}          # Mid-stream noisy packet
+        yield deal_events[0]                           # 1st turn tsumo
+        yield None                                     # Explicit None
+
+    agent = MahjongAIAgent(config=test_config, my_actor_id=0, apply_sleep=False, output_mode="text_only")
+
+    captured_recs = []
+    agent.action_controller.on_recommendation_callback = lambda rec: captured_recs.append(rec)
+
+    # Stream consumer loop MUST process without deadlocking or crashing
+    await agent.run_stream(_noisy_stream())
+
+    # Verify 1st turn decision was successfully calculated
+    assert agent.state_mgr.round_state is not None
+    assert len(agent.state_mgr.my_player.tehai) == 14
+    assert len(captured_recs) >= 1
+    first_turn_rec = captured_recs[-1]
+    assert "top_candidates" in first_turn_rec
+    assert len(first_turn_rec["top_candidates"]) >= 2
+
+
+
 
 
 

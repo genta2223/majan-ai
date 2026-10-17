@@ -356,7 +356,18 @@ class MahjongStateManager:
         )
 
     def update_event(self, event: Dict[str, Any]) -> None:
-        """Consume a single mjai-formatted event and update state."""
+        """Consume a single mjai-formatted event with top-level robust exception guard."""
+        try:
+            self._update_event_impl(event)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            ev_type = event.get("type", "unknown") if isinstance(event, dict) else "unknown"
+            print(f"[StateManager GUARD ALERT] Suppressed exception updating event '{ev_type}': {e}\n{tb}")
+            trace_log("STATE_UPDATE_EXCEPTION", f"Event '{ev_type}' error: {e}\n{tb}")
+
+    def _update_event_impl(self, event: Dict[str, Any]) -> None:
+        """Internal consumption logic for a single mjai-formatted event."""
         event_type = event.get("type", "")
         trace_log("STATE_CONSUME_EVENT", f"Type: {event_type}", event)
 
