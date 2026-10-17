@@ -181,39 +181,30 @@ class PaifuDownloader:
         except Exception:
             return None
 
-        target_ws_url = None
-        # 1. First priority: type == 'page' and ('mahjongsoul' or 'maj-soul' or '雀魂')
-        for t in targets:
-            t_type = t.get("type", "")
+        def _target_score(t: dict) -> int:
+            score = 0
             url = t.get("url", "").lower()
             title = t.get("title", "").lower()
-            if t_type == "page" and ("mahjongsoul" in url or "maj-soul" in url or "雀魂" in title):
-                target_ws_url = t.get("webSocketDebuggerUrl")
-                print(f"[PaifuDownloader] Selected Majsoul page target: Title='{t.get('title')}', URL='{t.get('url')}'")
-                break
+            t_type = t.get("type", "").lower()
+            if "mahjongsoul" in url or "maj-soul" in url:
+                score += 50
+            if "雀魂" in title:
+                score += 50
+            if t_type == "page":
+                score += 20
+            elif t_type == "iframe":
+                score += 15
+            elif t_type == "other":
+                score += 5
+            return score
 
-        # 2. Second priority: any type with matching URL/title
-        if not target_ws_url:
-            for t in targets:
-                url = t.get("url", "").lower()
-                title = t.get("title", "").lower()
-                if "mahjongsoul" in url or "maj-soul" in url or "雀魂" in title:
-                    target_ws_url = t.get("webSocketDebuggerUrl")
-                    print(f"[PaifuDownloader] Selected fallback matching target: Title='{t.get('title')}', URL='{t.get('url')}'")
-                    break
+        candidate_targets = sorted(
+            [t for t in targets if t.get("webSocketDebuggerUrl")],
+            key=_target_score,
+            reverse=True
+        )
 
-        # 3. Third priority: first type == 'page'
-        if not target_ws_url:
-            for t in targets:
-                if t.get("type") == "page":
-                    target_ws_url = t.get("webSocketDebuggerUrl")
-                    print(f"[PaifuDownloader] Selected first active page target: Title='{t.get('title')}', URL='{t.get('url')}'")
-                    break
-
-        if not target_ws_url and targets:
-            target_ws_url = targets[0].get("webSocketDebuggerUrl")
-
-        if not target_ws_url:
+        if not candidate_targets:
             print(f"[PaifuDownloader] No usable CDP WebSocket targets found on port {self.cdp_port}")
             return None
 
@@ -221,7 +212,7 @@ class PaifuDownloader:
             import websockets
             import asyncio
 
-            async def _query():
+            async def _execute_on_ws(target_ws_url: str):
                 async with websockets.connect(target_ws_url, open_timeout=3.0) as ws:
                     msg_counter = 100
                     discovered_contexts = []
@@ -568,6 +559,60 @@ class PaifuDownloader:
                     finally:
                         reader_task.cancel()
 
+            async def _scan_and_execute():
+                probe_expr = "Boolean((typeof app !== 'undefined' && app && app.NetAgent) || (window.app && window.app.NetAgent))"
+                probe_ui_expr = "Boolean((typeof uiscript !== 'undefined' && uiscript && uiscript.UI_GameRecord) || (window.uiscript && window.uiscript.UI_GameRecord))"
+
+                best_ws_url = None
+                matched_target = None
+
+                # 1. Probe candidate targets to find which WebSocket target holds app.NetAgent
+                for t in candidate_targets:
+                    ws_url = t.get("webSocketDebuggerUrl")
+                    t_title = t.get("title", "")
+                    t_type = t.get("type", "")
+                    try:
+                        async with websockets.connect(ws_url, open_timeout=2.0) as probe_ws:
+                            cmd = {
+                                "id": 1,
+                                "method": "Runtime.evaluate",
+                                "params": {"expression": probe_expr, "returnByValue": True}
+                            }
+                            await probe_ws.send(json.dumps(cmd))
+                            resp_str = await asyncio.wait_for(probe_ws.recv(), timeout=1.5)
+                            resp = json.loads(resp_str)
+                            val = resp.get("result", {}).get("result", {}).get("value")
+                            if val is True:
+                                print(f"[PaifuDownloader] Discovered game target [{t_type}] Title='{t_title}': app.NetAgent active!")
+                                matched_target = t
+                                best_ws_url = ws_url
+                                break
+
+                            cmd_ui = {
+                                "id": 2,
+                                "method": "Runtime.evaluate",
+                                "params": {"expression": probe_ui_expr, "returnByValue": True}
+                            }
+                            await probe_ws.send(json.dumps(cmd_ui))
+                            resp_ui_str = await asyncio.wait_for(probe_ws.recv(), timeout=1.5)
+                            resp_ui = json.loads(resp_ui_str)
+                            val_ui = resp_ui.get("result", {}).get("result", {}).get("value")
+                            if val_ui is True:
+                                print(f"[PaifuDownloader] Discovered UI target [{t_type}] Title='{t_title}': uiscript active!")
+                                matched_target = t
+                                best_ws_url = ws_url
+                                break
+                    except Exception:
+                        continue
+
+                # 2. If no target directly responded True to probe, fallback to highest scored target
+                if not best_ws_url:
+                    matched_target = candidate_targets[0]
+                    best_ws_url = matched_target.get("webSocketDebuggerUrl")
+                    print(f"[PaifuDownloader] Selected primary target for evaluation: Title='{matched_target.get('title')}', Type='{matched_target.get('type')}', URL='{matched_target.get('url')}'")
+
+                return await _execute_on_ws(best_ws_url)
+
             try:
                 try:
                     running_loop = asyncio.get_running_loop()
@@ -577,10 +622,10 @@ class PaifuDownloader:
                 if running_loop and running_loop.is_running():
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(lambda: asyncio.run(_query()))
-                        return future.result(timeout=20.0)
+                        future = executor.submit(lambda: asyncio.run(_scan_and_execute()))
+                        return future.result(timeout=25.0)
                 else:
-                    return asyncio.run(_query())
+                    return asyncio.run(_scan_and_execute())
             except Exception as e:
                 print(f"[PaifuDownloader] On-demand RPC fetch failed: {e}")
                 return None

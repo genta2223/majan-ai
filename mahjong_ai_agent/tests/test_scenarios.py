@@ -3134,7 +3134,7 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
     assert connected_urls[-1] == "ws://dummy/majsoul"
 
     captured = capsys.readouterr().out
-    assert "Selected Majsoul page target" in captured
+    assert "Selected primary target for evaluation" in captured
     assert "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません" in captured
     assert "検出iframe数: 1" in captured
     assert "Majsoul RPC Error for 261017-error-test-uuid" in captured
@@ -3168,6 +3168,64 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
 
     captured_success = capsys.readouterr().out
     assert "Identified MahjongSoul game context: contextId=2" in captured_success
+
+    # Test 3: Multi-target scanning (Site Isolation) finds game iframe target directly
+    multi_targets = [
+        {"type": "page", "title": "雀魂 -じゃんたま-", "url": "https://game.mahjongsoul.com/", "webSocketDebuggerUrl": "ws://dummy/outer_page"},
+        {"type": "iframe", "title": "Game Engine", "url": "https://game.mahjongsoul.com/game_canvas", "webSocketDebuggerUrl": "ws://dummy/game_iframe"},
+    ]
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockHTTPResponse(json.dumps(multi_targets).encode("utf-8")))
+
+    class MultiTargetWebSocket:
+        def __init__(self, url):
+            self.url = url
+            self._incoming = asyncio.Queue()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def send(self, msg):
+            cmd = json.loads(msg)
+            cid = cmd.get("id")
+            method = cmd.get("method")
+            params = cmd.get("params", {})
+            if method == "Runtime.enable":
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
+            elif method == "Runtime.evaluate":
+                expr = params.get("expression", "")
+                if "Boolean((typeof app" in expr:
+                    # Outer page returns False, game_iframe returns True
+                    is_active = (self.url == "ws://dummy/game_iframe")
+                    await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "boolean", "value": is_active}}}))
+                elif "Boolean((typeof uiscript" in expr:
+                    await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "boolean", "value": False}}}))
+                else:
+                    await self._incoming.put(json.dumps({
+                        "id": cid,
+                        "result": {
+                            "result": {
+                                "type": "string",
+                                "value": json.dumps({
+                                    "success": True,
+                                    "payload": {"uuid": "261017-multi-target-uuid", "head": {}, "rounds": []}
+                                })
+                            }
+                        }
+                    }))
+
+        async def recv(self):
+            return await self._incoming.get()
+
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MultiTargetWebSocket(url))
+    res_multi = downloader._fetch_via_rpc("261017-multi-target-uuid")
+    assert res_multi is not None
+    assert res_multi.get("uuid") == "261017-multi-target-uuid"
+
+    captured_multi = capsys.readouterr().out
+    assert "Discovered game target [iframe] Title='Game Engine': app.NetAgent active!" in captured_multi
 
     # Test 3: CDP exceptionDetails returned (must print exception details, not empty)
     exc_eval_result = {
