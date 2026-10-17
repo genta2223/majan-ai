@@ -228,18 +228,83 @@ class PaifuDownloader:
                         try {{
                             let targetUuid = "{uuid}";
 
-                            // Diagnostics: Check presence of core objects
-                            let hasApp = Boolean(window.app);
-                            let hasNetAgent = Boolean(window.app && window.app.NetAgent);
-                            let hasLobby = Boolean(hasNetAgent && typeof window.app.NetAgent.sendReq2Lobby === "function");
-                            let hasUI = Boolean(window.uiscript && window.uiscript.UI_GameRecord);
+                            function findGameContext() {{
+                                let contexts = [window];
+                                let visited = new Set();
+                                try {{
+                                    let queue = [window];
+                                    while (queue.length > 0) {{
+                                        let cur = queue.shift();
+                                        if (!cur || visited.has(cur)) continue;
+                                        try {{ visited.add(cur); }} catch (e) {{}}
 
-                            if (!hasApp && !hasUI) {{
+                                        try {{
+                                            if (cur.frames) {{
+                                                for (let i = 0; i < cur.frames.length; i++) {{
+                                                    try {{
+                                                        let f = cur.frames[i];
+                                                        if (f && !visited.has(f)) {{
+                                                            contexts.push(f);
+                                                            queue.push(f);
+                                                        }}
+                                                    }} catch (e) {{}}
+                                                }}
+                                            }}
+                                        }} catch (e) {{}}
+
+                                        try {{
+                                            if (cur.document) {{
+                                                let iframes = cur.document.querySelectorAll("iframe, frame");
+                                                for (let i = 0; i < iframes.length; i++) {{
+                                                    try {{
+                                                        let cw = iframes[i].contentWindow;
+                                                        if (cw && !visited.has(cw)) {{
+                                                            contexts.push(cw);
+                                                            queue.push(cw);
+                                                        }}
+                                                    }} catch (e) {{}}
+                                                }}
+                                            }}
+                                        }} catch (e) {{}}
+                                    }}
+                                }} catch (e) {{}}
+
+                                for (let ctx of contexts) {{
+                                    try {{
+                                        if (ctx && ctx.app && ctx.app.NetAgent) return ctx;
+                                    }} catch (e) {{}}
+                                }}
+                                for (let ctx of contexts) {{
+                                    try {{
+                                        if (ctx && ctx.uiscript && ctx.uiscript.UI_GameRecord) return ctx;
+                                    }} catch (e) {{}}
+                                }}
+                                return null;
+                            }}
+
+                            let gameCtx = findGameContext();
+                            if (!gameCtx) {{
+                                let iframeCount = 0;
+                                try {{
+                                    iframeCount = document.querySelectorAll("iframe, frame").length;
+                                }} catch (e) {{}}
+                                let windowKeys = [];
+                                try {{
+                                    windowKeys = Object.keys(window).filter(function(k) {{
+                                        return !k.startsWith("webkit") && !k.startsWith("chrome") && typeof window[k] !== "function";
+                                    }}).slice(0, 30);
+                                }} catch (e) {{}}
+
                                 return JSON.stringify({{
                                     success: false,
-                                    error: "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません。現在のタブが雀魂のゲーム画面であることを確認してください (現在URL: " + location.href + ")"
+                                    error: "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: " + iframeCount + ", 現在URL: " + location.href + ", 主なwindow変数: " + windowKeys.join(", ") + ")"
                                 }});
                             }}
+
+                            let hasApp = Boolean(gameCtx.app);
+                            let hasNetAgent = Boolean(gameCtx.app && gameCtx.app.NetAgent);
+                            let hasLobby = Boolean(hasNetAgent && typeof gameCtx.app.NetAgent.sendReq2Lobby === "function");
+                            let hasUI = Boolean(gameCtx.uiscript && gameCtx.uiscript.UI_GameRecord);
 
                             return await new Promise(function(resolve) {{
                                 let timer = setTimeout(function() {{
@@ -314,15 +379,17 @@ class PaifuDownloader:
                                     }}));
                                 }}
 
-                                // 1. Primary RPC: app.NetAgent.sendReq2Lobby
+                                // 1. Primary RPC: gameCtx.app.NetAgent.sendReq2Lobby
                                 if (hasLobby) {{
-                                    let clientVer = (window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "";
-                                    window.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
+                                    let clientVer = (gameCtx.GameMgr && gameCtx.GameMgr.Inst && gameCtx.GameMgr.Inst.client_version) 
+                                        ? gameCtx.GameMgr.Inst.client_version 
+                                        : ((window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "");
+                                    gameCtx.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
                                         if (!err && res) {{
                                             handleSuccess(res);
                                         }} else {{
                                             // Fallback: fetchCustomizedContestGameRecord
-                                            window.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
+                                            gameCtx.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
                                                 if (!err2 && res2) {{
                                                     handleSuccess(res2);
                                                 }} else {{
@@ -335,18 +402,18 @@ class PaifuDownloader:
                                     return;
                                 }}
 
-                                // 2. Secondary RPC: uiscript.UI_GameRecord.getRecord
-                                if (hasUI && typeof window.uiscript.UI_GameRecord.getRecord === "function") {{
-                                    window.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
+                                // 2. Secondary RPC: gameCtx.uiscript.UI_GameRecord.getRecord
+                                if (hasUI && typeof gameCtx.uiscript.UI_GameRecord.getRecord === "function") {{
+                                    gameCtx.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
                                         if (res) handleSuccess(res);
                                         else handleFailure("uiscript.UI_GameRecord.getRecord が空を返しました");
                                     }});
                                     return;
                                 }}
 
-                                // 3. Fallback: app.NetAgent.cached_records
-                                if (window.app && window.app.NetAgent && window.app.NetAgent.cached_records && window.app.NetAgent.cached_records[targetUuid]) {{
-                                    handleSuccess(window.app.NetAgent.cached_records[targetUuid]);
+                                // 3. Fallback: gameCtx.app.NetAgent.cached_records
+                                if (gameCtx.app && gameCtx.app.NetAgent && gameCtx.app.NetAgent.cached_records && gameCtx.app.NetAgent.cached_records[targetUuid]) {{
+                                    handleSuccess(gameCtx.app.NetAgent.cached_records[targetUuid]);
                                     return;
                                 }}
 

@@ -3087,7 +3087,8 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
     downloader = PaifuDownloader(cdp_port=9222)
 
     import websockets
-    # Test 1: Structured failure response (e.g. window.app.NetAgent is undefined)
+    sent_commands = []
+    # Test 1: Structured failure response (e.g. game object not found in any frame)
     fail_ws_resp = {
         "id": 201,
         "result": {
@@ -3095,20 +3096,32 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
                 "type": "string",
                 "value": json.dumps({
                     "success": False,
-                    "error": "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません。"
+                    "error": "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: 2, 現在URL: https://game.mahjongsoul.com/, 主なwindow変数: Laya, Config)"
                 })
             }
         }
     }
-    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, fail_ws_resp))
+    class TrackingWebSocket(MockWebSocket):
+        async def send(self, msg):
+            sent_commands.append(json.loads(msg))
+
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: TrackingWebSocket(url, fail_ws_resp))
 
     res_fail = downloader._fetch_via_rpc("261017-error-test-uuid")
     assert res_fail is None
     assert connected_urls[-1] == "ws://dummy/majsoul"
 
+    # Verify that the generated JS code includes cross-frame and iframe traversal logic
+    assert len(sent_commands) == 1
+    eval_expr = sent_commands[0].get("params", {}).get("expression", "")
+    assert "findGameContext" in eval_expr
+    assert 'querySelectorAll("iframe, frame")' in eval_expr
+    assert "cur.frames" in eval_expr
+
     captured = capsys.readouterr().out
     assert "Selected Majsoul page target" in captured
-    assert "雀魂のゲームオブジェクト (window.app / window.uiscript) が見つかりません" in captured
+    assert "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません" in captured
+    assert "検出iframe数: 2" in captured
     assert "Majsoul RPC Error for 261017-error-test-uuid" in captured
 
     # Test 2: Structured success response
