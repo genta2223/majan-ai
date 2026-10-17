@@ -1569,8 +1569,18 @@ class PaifuSniffer:
             import websockets
             async with websockets.connect(target_ws_url, open_timeout=4.0, max_size=None, ping_interval=None) as ws:
                 self._ws = ws
-                await ws.send(json.dumps({"id": 1, "method": "Network.enable", "params": {}}))
-                print(f"[PaifuSniffer] Attached to main tab WebSocket. Network.enable activated.")
+                cmd_id = 100
+                await ws.send(json.dumps({
+                    "id": 10,
+                    "method": "Target.setAutoAttach",
+                    "params": {
+                        "autoAttach": True,
+                        "waitForDebuggerOnStart": False,
+                        "flatten": True
+                    }
+                }))
+                await ws.send(json.dumps({"id": 11, "method": "Network.enable", "params": {}}))
+                print(f"[PaifuSniffer] Attached to main tab WebSocket. Target.setAutoAttach and Network.enable activated.")
 
                 while self.is_running and len(self.captured_records) < self.max_games:
                     try:
@@ -1582,9 +1592,26 @@ class PaifuSniffer:
                         break
 
                     method = msg.get("method", "")
-                    if method == "Network.webSocketFrameReceived":
-                        params = msg.get("params", {})
-                        payload_data = params.get("response", {}).get("payloadData", "")
+                    params = msg.get("params", {})
+
+                    if method == "Target.attachedToTarget":
+                        target_session_id = params.get("sessionId")
+                        target_info = params.get("targetInfo", {})
+                        t_type = target_info.get("type", "unknown")
+                        t_url = target_info.get("url", "")
+                        print(f"[PaifuSniffer] Attached to sub-target: type={t_type}, session={target_session_id}, url={t_url}")
+                        if target_session_id:
+                            cmd_id += 1
+                            await ws.send(json.dumps({
+                                "id": cmd_id,
+                                "sessionId": target_session_id,
+                                "method": "Network.enable",
+                                "params": {}
+                            }))
+                    elif method == "Network.webSocketFrameReceived":
+                        resp = params.get("response", {})
+                        opcode = resp.get("opcode", 0)
+                        payload_data = resp.get("payloadData", "")
                         if not payload_data:
                             continue
 
@@ -1597,30 +1624,30 @@ class PaifuSniffer:
                                 raw_bytes = payload_data.encode("latin1", errors="ignore")
 
                         frame_len = len(raw_bytes)
-                        # Replay match packet ResGameRecord is large (>8KB) containing full round logs
-                        if frame_len >= 8000:
-                            rec = self.process_frame(raw_bytes)
-                            if rec:
-                                count = len(self.captured_records)
-                                uuid = rec.get("uuid", "unknown")
-                                print(f"[PaifuSniffer] Successfully captured paifu #{count}: {uuid}")
+                        print(f"[PaifuSniffer] Received Frame: len={frame_len}, opcode={opcode}")
 
-                                # Convert to MJAI events
-                                try:
-                                    events = convert_record_to_mjai(rec, my_seat=0)
-                                except Exception as ce:
-                                    print(f"[PaifuSniffer] MJAI conversion error: {ce}")
-                                    events = []
+                        rec = self.process_frame(raw_bytes)
+                        if rec:
+                            count = len(self.captured_records)
+                            uuid = rec.get("uuid", "unknown")
+                            print(f"[PaifuSniffer] Successfully captured paifu #{count}: {uuid}")
 
-                                if on_captured:
-                                    on_captured(rec, count, self.max_games, events)
+                            # Convert to MJAI events
+                            try:
+                                events = convert_record_to_mjai(rec, my_seat=0)
+                            except Exception as ce:
+                                print(f"[PaifuSniffer] MJAI conversion error: {ce}")
+                                events = []
 
-                                if on_status:
-                                    on_status(f"牌譜画面の『詳細』をクリックしてください（取得中: {count}/{self.max_games}件）")
+                            if on_captured:
+                                on_captured(rec, count, self.max_games, events)
 
-                                if count >= self.max_games:
-                                    print(f"[PaifuSniffer] Reached target {self.max_games} games. Stopping.")
-                                    break
+                            if on_status:
+                                on_status(f"牌譜画面の『詳細』をクリックしてください（取得中: {count}/{self.max_games}件）")
+
+                            if count >= self.max_games:
+                                print(f"[PaifuSniffer] Reached target {self.max_games} games. Stopping.")
+                                break
         except Exception as e:
             print(f"[PaifuSniffer] Listener error: {e}")
             if on_error:

@@ -3972,3 +3972,120 @@ def test_paifu_authentic_player_names_and_round_action_profiling(tmp_path):
     p_winner = profiler.get_profile("ブロコフ")
     assert p_winner.hora_count >= 1
     assert p_winner.hora_rate > 0.0
+
+
+@pytest.mark.asyncio
+async def test_paifu_sniffer_child_session_auto_attach_and_frame_logging(tmp_path, monkeypatch, capsys):
+    """
+    Verifies that PaifuSniffer issues Target.setAutoAttach (with flatten=True) and Network.enable,
+    automatically activates Network.enable on newly attached child sessions (Target.attachedToTarget),
+    logs every received WebSocket binary frame (len and opcode),
+    and successfully processes matches without the 8000-byte length threshold.
+    """
+    from tools.paifu_to_mjai import PaifuSniffer
+    import gzip
+    import base64
+    import json
+
+    sniffer = PaifuSniffer(cache_dir=str(tmp_path), max_games=1)
+    sent_messages = []
+
+    # Construct authentic match frame (around 2KB, under old 8000 byte threshold)
+    test_uuid = "261017-child-session-test"
+    action_1 = b"\x0a\x0eRecordNewRound\x12\x02\x08\x00"
+    action_2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x01\x10\x12"
+    records_payload = b"\x0a" + bytes([len(action_1)]) + action_1 + b"\x0a" + bytes([len(action_2)]) + action_2
+    gzipped_records = gzip.compress(records_payload)
+    head_payload = b"\x0a" + bytes([len(test_uuid)]) + test_uuid.encode("utf-8")
+    def encode_varint(n: int) -> bytes:
+        res = bytearray()
+        while n >= 0x80:
+            res.append((n & 0x7F) | 0x80)
+            n >>= 7
+        res.append(n)
+        return bytes(res)
+    res_record = (
+        b"\x12" + encode_varint(len(gzipped_records)) + gzipped_records +
+        b"\x1a" + encode_varint(len(head_payload)) + head_payload
+    )
+    frame_bytes = b"\x03\x05\x00" + res_record
+    assert len(frame_bytes) < 8000, "Should be smaller than 8000 bytes to test limit relaxation"
+    frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
+
+    # Sequence of incoming CDP messages:
+    # 1. Target.attachedToTarget for child session (e.g. Unity WebGL worker/target)
+    # 2. Network.webSocketFrameReceived on child session
+    messages_to_receive = [
+        {
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "SESSION_CHILD_12345",
+                "targetInfo": {"type": "worker", "url": "blob:https://mahjongsoul.game.yo-star.com/worker.js"}
+            }
+        },
+        {
+            "method": "Network.webSocketFrameReceived",
+            "sessionId": "SESSION_CHILD_12345",
+            "params": {
+                "response": {
+                    "opcode": 2,
+                    "payloadData": frame_b64
+                }
+            }
+        }
+    ]
+
+    class MockWS:
+        def __init__(self):
+            self.msg_idx = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+        async def send(self, msg_text):
+            sent_messages.append(json.loads(msg_text))
+
+        async def recv(self):
+            if self.msg_idx < len(messages_to_receive):
+                m = messages_to_receive[self.msg_idx]
+                self.msg_idx += 1
+                return json.dumps(m)
+            await asyncio.sleep(0.05)
+            raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(sniffer, "_find_majsoul_target", lambda: "ws://127.0.0.1:9222/devtools/page/MAIN")
+    import websockets
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: MockWS())
+
+    captured_list = []
+    sniffer.is_running = True
+    await sniffer._listen_async(
+        on_captured=lambda rec, cnt, mx, ev: captured_list.append(rec),
+        on_status=None,
+        on_finished=None,
+        on_error=None
+    )
+
+    # 1. Verify Target.setAutoAttach was sent with flatten: True
+    auto_attach_msgs = [m for m in sent_messages if m.get("method") == "Target.setAutoAttach"]
+    assert len(auto_attach_msgs) >= 1
+    assert auto_attach_msgs[0]["params"].get("autoAttach") is True
+    assert auto_attach_msgs[0]["params"].get("flatten") is True
+
+    # 2. Verify Network.enable was sent both globally and to the child sessionId
+    net_enable_msgs = [m for m in sent_messages if m.get("method") == "Network.enable"]
+    assert len(net_enable_msgs) >= 2
+    assert any(m.get("sessionId") == "SESSION_CHILD_12345" for m in net_enable_msgs)
+
+    # 3. Verify match was successfully captured even though < 8000 bytes
+    assert len(captured_list) == 1
+    assert captured_list[0]["uuid"] == test_uuid
+
+    # 4. Verify stdout captured received frame log with opcode and len
+    captured_stdout = capsys.readouterr().out
+    assert "[PaifuSniffer] Received Frame: len=" in captured_stdout
+    assert "opcode=2" in captured_stdout
+
