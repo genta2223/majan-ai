@@ -3363,7 +3363,18 @@ def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
 
     def mock_cdp_urlopen(req, timeout=None):
         url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "127.0.0.1" in url and "/json" in url:
+        if "/json/new" in url:
+            new_tab_info = {
+                "id": "temp-tab-123",
+                "type": "page",
+                "title": "",
+                "url": url,
+                "webSocketDebuggerUrl": "ws://dummy/unity_target"
+            }
+            return MockCDPTargetResponse(json.dumps(new_tab_info).encode("utf-8"))
+        elif "/json/close" in url:
+            return MockCDPTargetResponse(b"Target is closing")
+        elif "127.0.0.1" in url and "/json" in url:
             return MockCDPTargetResponse(json.dumps(targets_data).encode("utf-8"))
         raise urllib.error.URLError("Not found")
 
@@ -3390,9 +3401,6 @@ def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
 
             if method in ("Page.enable", "Network.enable", "Runtime.enable"):
                 await self._incoming.put(json.dumps({"id": cid, "result": {}}))
-            elif method == "Page.navigate":
-                # Acknowledge Page.navigate
-                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
                 # Emit Network.responseReceived with paipu url
                 await self._incoming.put(json.dumps({
                     "method": "Network.responseReceived",
@@ -3401,6 +3409,8 @@ def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
                         "response": {"url": f"https://game.mahjongsoul.com/api/record/{test_uuid}", "status": 200}
                     }
                 }))
+            elif method == "Page.navigate":
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
             elif method == "Network.getResponseBody":
                 # Return JSON game record
                 record_payload = {
@@ -3448,7 +3458,6 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
     test_uuid = "261017-ws-frame-uuid"
 
     # Construct mock protobuf payload wrapped in gzip
-    # Field 1: repeated wrapper (tag 1: (1<<3)|2 = 0x0a)
     name_bytes = b"RecordNewRound"
     wrapper_bytes = b"\x0a" + bytes([len(name_bytes)]) + name_bytes + b"\x12\x02\x08\x00"
     payload = b"\x0a" + bytes([len(wrapper_bytes)]) + wrapper_bytes
@@ -3477,7 +3486,22 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
         def __exit__(self, exc_type, exc_val, exc_tb):
             pass
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockCDPTargetResponse(json.dumps(targets_data).encode("utf-8")))
+    def mock_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "/json/new" in url:
+            new_tab = {
+                "id": "temp-ws-tab",
+                "type": "page",
+                "title": "",
+                "url": url,
+                "webSocketDebuggerUrl": "ws://dummy/temp_ws"
+            }
+            return MockCDPTargetResponse(json.dumps(new_tab).encode("utf-8"))
+        elif "/json/close" in url:
+            return MockCDPTargetResponse(b"Closed")
+        return MockCDPTargetResponse(json.dumps(targets_data).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
 
     class MockBinaryWSWebSocket:
         def __init__(self, url):
@@ -3494,8 +3518,6 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
             cid = msg.get("id")
             method = msg.get("method")
             if method in ("Page.enable", "Network.enable", "Runtime.enable"):
-                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
-            elif method == "Page.navigate":
                 await self._incoming.put(json.dumps({"id": cid, "result": {}}))
                 # Push binary WebSocket frame containing gzipped game detail records
                 await self._incoming.put(json.dumps({
@@ -3519,6 +3541,33 @@ def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_pa
     assert res.get("uuid") == test_uuid
     assert len(res.get("rounds", [])) == 1
     assert res["rounds"][0]["actions"][0]["action_name"] == "RecordNewRound"
+
+
+def test_paifu_downloader_skips_legacy_rpc_on_unity(monkeypatch, tmp_path, capsys):
+    """
+    Verifies that when Unity WebGL is detected, PaifuDownloader skips obsolete LayaAir app.NetAgent probe.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+
+    monkeypatch.setattr(downloader, "_fetch_from_http", lambda uuid: None)
+    monkeypatch.setattr(downloader, "_fetch_via_unity_cdp", lambda uuid: None)
+    monkeypatch.setattr(downloader, "_is_unity_environment", lambda: True)
+
+    rpc_called = False
+    def mock_rpc(uuid):
+        nonlocal rpc_called
+        rpc_called = True
+        return None
+
+    monkeypatch.setattr(downloader, "_fetch_via_rpc", mock_rpc)
+
+    res = downloader._fetch_from_remote("261017-skip-rpc-uuid")
+    assert res is None
+    assert not rpc_called, "Legacy RPC should NOT be called in Unity WebGL environment!"
+    captured = capsys.readouterr().out
+    assert "Unity WebGL environment detected: Skipping obsolete LayaAir app.NetAgent RPC probe." in captured
+
 
 
 

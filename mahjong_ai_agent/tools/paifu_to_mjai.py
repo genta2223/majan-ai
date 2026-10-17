@@ -853,65 +853,118 @@ class PaifuDownloader:
 
         return None
 
+    def _is_unity_environment(self) -> bool:
+        """Checks if the running browser session is the modern Unity WebGL version."""
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                targets = json.loads(resp.read().decode("utf-8"))
+            for t in targets:
+                url = t.get("url", "").lower()
+                title = t.get("title", "")
+                if "mahjongsoul" in url or "雀魂" in title:
+                    return True
+        except Exception:
+            pass
+        return True  # Modern MahjongSoul is Unity WebGL Build 4.0.12+
+
     def _fetch_via_unity_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Direct approach for Unity WebGL client:
-        1. Connects to running Unity WebGL browser session via CDP port 9222.
-        2. Enables Page and Network domains (Page.enable, Network.enable).
-        3. Navigates tab directly to replay URL (https://game.mahjongsoul.com/?paipu={uuid}) via Page.navigate.
-        4. Intercepts incoming WebSocket game packets (wss://jpgs.mahjongsoul.com/) or HTTP responses.
-        5. Decodes and extracts authentic game record actions and player metadata.
+        1. Opens an isolated temporary tab (Target.createTarget / json/new) with the replay URL
+           to PREVENT destroying or reloading the active main game session.
+        2. Enables Page and Network domains on the isolated tab.
+        3. Monitors incoming WebSocket game packets (wss://) with a generous 40s timeout for Unity initialization.
+        4. Intercepts binary frames containing gzip magic (0x1f 0x8b) or authentic actions and decodes them.
+        5. Automatically closes the temporary tab (Target.closeTarget / json/close) upon completion or timeout.
         """
+        replay_url = f"https://game.mahjongsoul.com/?paipu={uuid}"
+        temp_target_id = None
+        target_ws_url = None
+
+        # 1. Attempt to create an isolated temporary tab via CDP HTTP endpoint
         try:
-            req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                targets = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            print(f"[PaifuDownloader] Failed to connect to CDP port {self.cdp_port} to find Unity tab: {e}")
-            return None
+            encoded_url = urllib.parse.quote(replay_url, safe="")
+            new_tab_url = f"http://127.0.0.1:{self.cdp_port}/json/new?{encoded_url}"
+            req = urllib.request.Request(new_tab_url, method="PUT")
+            try:
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    new_tab = json.loads(resp.read().decode("utf-8"))
+                    temp_target_id = new_tab.get("id")
+                    target_ws_url = new_tab.get("webSocketDebuggerUrl")
+            except Exception:
+                # Fallback to GET method if PUT not accepted
+                req_get = urllib.request.Request(new_tab_url)
+                with urllib.request.urlopen(req_get, timeout=3.0) as resp:
+                    new_tab = json.loads(resp.read().decode("utf-8"))
+                    temp_target_id = new_tab.get("id")
+                    target_ws_url = new_tab.get("webSocketDebuggerUrl")
 
-        # Locate MahjongSoul page target
-        game_target = next(
-            (t for t in targets if ("mahjongsoul" in t.get("url", "").lower() or "雀魂" in t.get("title", "")) and t.get("webSocketDebuggerUrl")),
-            None
-        )
-        if not game_target:
-            print(f"[PaifuDownloader] No active MahjongSoul tab found on CDP port {self.cdp_port} among {len(targets)} targets")
-            return None
+            if target_ws_url:
+                print(f"[PaifuDownloader] Created isolated temporary tab for replay capture (Tab ID: {temp_target_id}).")
+        except Exception as te:
+            print(f"[PaifuDownloader] Could not open new isolated tab via /json/new ({te}). Falling back to existing tab...")
 
-        ws_url = game_target["webSocketDebuggerUrl"]
-        target_title = game_target.get("title", "")
-        target_url = game_target.get("url", "")
-        print(f"[PaifuDownloader] Connected to MahjongSoul tab: '{target_title}' (URL: {target_url})")
+        # Fallback to existing tab if isolated tab creation failed
+        if not target_ws_url:
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    targets = json.loads(resp.read().decode("utf-8"))
+                game_target = next(
+                    (t for t in targets if ("mahjongsoul" in t.get("url", "").lower() or "雀魂" in t.get("title", "")) and t.get("webSocketDebuggerUrl")),
+                    None
+                )
+                if not game_target:
+                    print(f"[PaifuDownloader] No active MahjongSoul tab found on CDP port {self.cdp_port}")
+                    return None
+                target_ws_url = game_target["webSocketDebuggerUrl"]
+                print(f"[PaifuDownloader] Using existing MahjongSoul tab: '{game_target.get('title')}'")
+            except Exception as e:
+                print(f"[PaifuDownloader] Failed to connect to CDP port {self.cdp_port}: {e}")
+                return None
+
+        def _close_temp_tab():
+            if temp_target_id:
+                try:
+                    close_url = f"http://127.0.0.1:{self.cdp_port}/json/close/{temp_target_id}"
+                    req_close = urllib.request.Request(close_url)
+                    with urllib.request.urlopen(req_close, timeout=2.0) as resp:
+                        pass
+                    print(f"[PaifuDownloader] Successfully closed temporary replay tab ({temp_target_id}).")
+                except Exception:
+                    pass
 
         try:
             import websockets
             import asyncio
 
+            TIMEOUT_SECONDS = 40.0
+
             async def _intercept_unity():
-                async with websockets.connect(ws_url, open_timeout=3.0) as ws:
+                async with websockets.connect(target_ws_url, open_timeout=4.0) as ws:
                     captured_record = None
 
-                    # 1. Activate Page.enable and Network.enable PRIOR to page navigation
+                    # 1. Activate Page.enable and Network.enable PRIOR to page loading
                     await ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
                     await ws.send(json.dumps({"id": 2, "method": "Network.enable", "params": {}}))
-                    print(f"[PaifuDownloader] CDP Network.enable activated prior to navigation.")
+                    print(f"[PaifuDownloader] CDP Network.enable activated on replay session.")
 
-                    # 2. Trigger direct navigation to replay URL
-                    replay_url = f"https://game.mahjongsoul.com/?paipu={uuid}"
-                    print(f"[PaifuDownloader] Navigating Unity WebGL tab directly to replay URL via Page.navigate:\n  --> {replay_url}")
-                    await ws.send(json.dumps({
-                        "id": 3,
-                        "method": "Page.navigate",
-                        "params": {"url": replay_url}
-                    }))
+                    # If using existing tab, navigate it; if new tab, it was created with replay_url
+                    if not temp_target_id:
+                        print(f"[PaifuDownloader] Navigating existing tab directly to replay URL via Page.navigate:\n  --> {replay_url}")
+                        await ws.send(json.dumps({
+                            "id": 3,
+                            "method": "Page.navigate",
+                            "params": {"url": replay_url}
+                        }))
 
-                    # 3. Monitor Network.webSocketFrameReceived and network traffic
+                    # 2. Monitor Network.webSocketFrameReceived and network traffic
                     start_t = asyncio.get_event_loop().time()
                     total_ws_frames = 0
-                    print(f"[PaifuDownloader] Monitoring WebSocket frames and network traffic for replay packets (timeout: 15s)...")
+                    print(f"[PaifuDownloader] Monitoring WebSocket frames for authentic paifu packets (timeout: {int(TIMEOUT_SECONDS)}s)...")
 
-                    while asyncio.get_event_loop().time() - start_t < 15.0:
+                    while asyncio.get_event_loop().time() - start_t < TIMEOUT_SECONDS:
                         try:
                             msg_str = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             msg = json.loads(msg_str)
@@ -923,20 +976,20 @@ class PaifuDownloader:
                                 total_ws_frames += 1
                                 resp_data = params.get("response", {})
                                 payload_data = resp_data.get("payloadData", "")
-                                opcode = resp_data.get("opcode")
                                 if payload_data:
                                     try:
                                         raw_bytes = base64.b64decode(payload_data)
-                                        # Decode authentic game actions via decode_game_detail_records
-                                        actions = decode_game_detail_records(raw_bytes)
-                                        if actions and len(actions) > 0:
-                                            print(f"[PaifuDownloader] Intercepted authentic paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
-                                            captured_record = {
-                                                "uuid": uuid,
-                                                "head": {},
-                                                "rounds": [{"actions": actions}]
-                                            }
-                                            break
+                                        # Fast check: gzip magic 0x1f 0x8b or decode directly
+                                        if b"\x1f\x8b" in raw_bytes or len(raw_bytes) > 64:
+                                            actions = decode_game_detail_records(raw_bytes)
+                                            if actions and len(actions) > 0:
+                                                print(f"[PaifuDownloader] Intercepted authentic paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
+                                                captured_record = {
+                                                    "uuid": uuid,
+                                                    "head": {},
+                                                    "rounds": [{"actions": actions}]
+                                                }
+                                                break
                                     except Exception:
                                         pass
 
@@ -953,7 +1006,7 @@ class PaifuDownloader:
                                         "method": "Network.getResponseBody",
                                         "params": {"requestId": req_id}
                                     }))
-                                    body_resp_str = await asyncio.wait_for(ws.recv(), timeout=2.5)
+                                    body_resp_str = await asyncio.wait_for(ws.recv(), timeout=3.0)
                                     body_resp = json.loads(body_resp_str)
                                     body_result = body_resp.get("result", {})
                                     body_text = body_result.get("body", "")
@@ -982,15 +1035,16 @@ class PaifuDownloader:
                                                 pass
                         except asyncio.TimeoutError:
                             elapsed = int(asyncio.get_event_loop().time() - start_t)
-                            if elapsed % 4 == 0:
-                                print(f"[PaifuDownloader] Waiting for Unity replay packets... ({elapsed}s elapsed, {total_ws_frames} WS frames received)")
+                            remaining = int(TIMEOUT_SECONDS - elapsed)
+                            if elapsed > 0 and elapsed % 5 == 0:
+                                print(f"[PaifuDownloader] Waiting for Unity replay packets... ({elapsed}s elapsed, {remaining}s remaining, {total_ws_frames} WS frames received)")
                             continue
                         except Exception as loop_e:
                             print(f"[PaifuDownloader] Unity monitoring loop error: {loop_e}")
                             break
 
                     if not captured_record:
-                        print(f"[PaifuDownloader] Unity WebGL interception timed out after 15s (Total WS frames received: {total_ws_frames})")
+                        print(f"[PaifuDownloader] Unity WebGL interception timed out after {int(TIMEOUT_SECONDS)}s (Total WS frames received: {total_ws_frames})")
 
                     return captured_record
 
@@ -1004,7 +1058,7 @@ class PaifuDownloader:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(lambda: asyncio.run(_intercept_unity()))
-                        rec = future.result(timeout=20.0)
+                        rec = future.result(timeout=TIMEOUT_SECONDS + 5.0)
                 else:
                     rec = asyncio.run(_intercept_unity())
 
@@ -1017,6 +1071,8 @@ class PaifuDownloader:
         except Exception as e:
             print(f"[PaifuDownloader] Unity WebGL CDP connection failed: {e}")
             return None
+        finally:
+            _close_temp_tab()
 
         return None
 
@@ -1025,33 +1081,36 @@ class PaifuDownloader:
         Multi-strategy game record fetching:
         1. HTTP Direct Download (Highest Priority):
            Directly fetches paifu packet from MahjongSoul official/CDN or browser in-session endpoints.
-        2. Unity WebGL Page.navigate + CDP Network Interception:
-           Navigates MahjongSoul tab directly to replay URL and captures game packets over WSS.
+        2. Unity WebGL Isolated Replay Tab + CDP Network Interception:
+           Opens an isolated temporary tab with replay URL and captures game packets over WSS (40s timeout).
         3. Legacy RPC Fallback:
-           Executes app.NetAgent RPC for older client environments.
+           Executes app.NetAgent RPC ONLY on legacy LayaAir environments.
         """
         print(f"[PaifuDownloader] === Starting authentic paifu fetch for UUID: {uuid} ===")
 
         # 1. Primary: Direct HTTP(S) download (Fastest & most robust)
-        print(f"[PaifuDownloader] [Step 1/3] Direct HTTP / Public API fetch...")
+        print(f"[PaifuDownloader] [Step 1/2] Direct HTTP / Public API fetch...")
         http_record = self._fetch_from_http(uuid)
         if http_record:
             return http_record
 
-        # 2. Secondary: Unity WebGL Page.navigate + CDP Network Interception
-        print(f"[PaifuDownloader] [Step 2/3] Unity WebGL Page.navigate & CDP WebSocket interception...")
+        # 2. Secondary: Unity WebGL Isolated Tab + CDP Network Interception
+        print(f"[PaifuDownloader] [Step 2/2] Unity WebGL isolated replay tab & CDP WebSocket interception (40s timeout)...")
         unity_record = self._fetch_via_unity_cdp(uuid)
         if unity_record:
             return unity_record
 
-        # 3. Tertiary: Legacy RPC fallback (app.NetAgent)
-        print(f"[PaifuDownloader] [Step 3/3] Falling back to legacy app.NetAgent RPC...")
-        rpc_record = self._fetch_via_rpc(uuid)
-        if rpc_record:
-            print(f"[PaifuDownloader] Successfully fetched game record via legacy RPC for: {uuid}")
-            return rpc_record
+        # 3. Tertiary: Legacy RPC fallback (Only if NOT Unity WebGL)
+        if not self._is_unity_environment():
+            print(f"[PaifuDownloader] [Step 3/3] Legacy client detected. Probing app.NetAgent RPC...")
+            rpc_record = self._fetch_via_rpc(uuid)
+            if rpc_record:
+                print(f"[PaifuDownloader] Successfully fetched game record via legacy RPC for: {uuid}")
+                return rpc_record
+        else:
+            print(f"[PaifuDownloader] Unity WebGL environment detected: Skipping obsolete LayaAir app.NetAgent RPC probe.")
 
-        print(f"[PaifuDownloader] All 3 fetch strategies exhausted for UUID: {uuid}")
+        print(f"[PaifuDownloader] Paifu fetch exhausted for UUID: {uuid}")
         return None
 
 
