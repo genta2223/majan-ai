@@ -100,6 +100,22 @@ def extract_paifu_uuids(multi_line_text: str) -> List[Tuple[str, Optional[int]]]
     return results
 
 
+def _is_meaningful_actions(actions: List[Dict[str, Any]]) -> bool:
+    """Checks whether the decoded action list contains authentic mahjong events."""
+    if not actions:
+        return False
+    meaningful_count = 0
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("action_name") or a.get("name") or ""
+        if name and name != "UnknownAction" and (
+            name.startswith("Record") or name.startswith("Action") or name in ("hora", "ryukyoku", "chi", "pon", "reach")
+        ):
+            meaningful_count += 1
+    return meaningful_count >= 1
+
+
 class PaifuDownloader:
     """Fetches raw paifu record binary or JSON from Majsoul gateway, CDP browser session, or local cache."""
 
@@ -894,11 +910,103 @@ class PaifuDownloader:
             pass
         return None
 
+    def _extract_accounts_from_protobuf(self, fields: Dict[int, List[Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Recursively inspects protobuf wire fields from ResGameRecord / RecordGame
+        to robustly extract match UUID and authentic accounts list:
+        [{'seat': 0, 'nickname': 'genta2223'}, {'seat': 1, 'nickname': 'ブロコフ'}, ...]
+        Works regardless of field tag order (Format A: seat/nick/id, Format B: id/seat/nick, etc).
+        """
+        extracted_uuid = ""
+        seat_to_account: Dict[int, Dict[str, Any]] = {}
+        unseated_nicks: List[str] = []
+
+        def _walk(d: Dict[int, List[Any]], depth: int = 0):
+            nonlocal extracted_uuid
+            if depth > 5:
+                return
+
+            for tag, vals in d.items():
+                for v in vals:
+                    if isinstance(v, (bytes, bytearray)):
+                        b = bytes(v)
+                        # Check for UUID string format
+                        try:
+                            s = b.decode("utf-8", errors="ignore").strip()
+                            m = PAIFU_UUID_REGEX.search(s)
+                            if m and not extracted_uuid:
+                                extracted_uuid = m.group(1).strip()
+                            else:
+                                m2 = re.search(r'([0-9]{6}-[a-zA-Z0-9_-]{5,40})', s)
+                                if m2 and not extracted_uuid:
+                                    extracted_uuid = m2.group(1).strip()
+                        except Exception:
+                            pass
+
+                        # Try parsing as nested sub-message
+                        sub = decode_raw_protobuf(b)
+                        if sub:
+                            nick = None
+                            seat = None
+                            acc_id = None
+                            for stag, svals in sub.items():
+                                for sv in svals:
+                                    if isinstance(sv, int):
+                                        if 0 <= sv <= 3 and seat is None:
+                                            seat = sv
+                                        elif sv > 100 and acc_id is None:
+                                            acc_id = sv
+                                    elif isinstance(sv, (bytes, bytearray)):
+                                        try:
+                                            text = sv.decode("utf-8").strip()
+                                            # Validate as nickname: reasonable length, not action name, no hyphens (UUIDs)
+                                            is_tile = bool(re.match(r'^[0-9][mpsz]$', text))
+                                            is_cpu = text.startswith("CPU") or "CPUプレイヤー" in text
+                                            if (
+                                                1 <= len(text) <= 30
+                                                and text.isprintable()
+                                                and "-" not in text
+                                                and not text.startswith("Record")
+                                                and not text.startswith("Action")
+                                                and not is_tile
+                                                and not is_cpu
+                                            ):
+                                                nick = text
+                                        except Exception:
+                                            pass
+
+                            if nick and seat is not None:
+                                if seat not in seat_to_account:
+                                    seat_to_account[seat] = {
+                                        "seat": seat,
+                                        "nickname": nick,
+                                        "account_id": acc_id or (10001 + seat)
+                                    }
+                            elif nick and seat is None:
+                                unseated_nicks.append(nick)
+                            _walk(sub, depth + 1)
+
+        _walk(fields, 0)
+
+        # Assign any unseated authentic nicknames to empty seats 0..3
+        for unseated in unseated_nicks:
+            for s in range(4):
+                if s not in seat_to_account:
+                    seat_to_account[s] = {
+                        "seat": s,
+                        "nickname": unseated,
+                        "account_id": 10001 + s
+                    }
+                    break
+
+        accounts = [seat_to_account[s] for s in sorted(seat_to_account.keys())]
+        return extracted_uuid, accounts
+
     def _try_decode_records(self, raw_bytes: bytes, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Attempts to decode GameDetailRecords actions or ResGameRecord protobuf structure
         across various Liqi packet offsets (offset 3 for Liqi RPC response, offset 0, offset 1, etc).
-        Prioritizes structured ResGameRecord protobuf parsing (field 2 data + field 4/1 head)
+        Prioritizes structured ResGameRecord protobuf parsing (field 2 data + multi-format head accounts)
         so that authentic player nicknames/accounts and all rounds/actions are restored.
         """
         if not raw_bytes or len(raw_bytes) < 10:
@@ -919,56 +1027,32 @@ class PaifuDownloader:
                 continue
             chunk = raw_bytes[off:]
 
-            # 1. First priority: Protobuf wire decode for ResGameRecord (field 2 = data, field 4/1 = head)
+            # 1. First priority: Protobuf wire decode for ResGameRecord
             try:
                 fields = decode_raw_protobuf(chunk)
-                if fields and (2 in fields or 4 in fields or 1 in fields):
-                    head_data: Dict[str, Any] = {}
-                    accounts: List[Dict[str, Any]] = []
-                    extracted_uuid = ""
+                if fields:
+                    extracted_uuid, accounts = self._extract_accounts_from_protobuf(fields)
 
-                    # Field 4 / Field 1: head (RecordGame)
-                    h_blobs = fields.get(4, []) or (fields.get(1, []) if 2 in fields else [])
-                    for h_blob in h_blobs:
-                        if isinstance(h_blob, (bytes, bytearray)):
-                            try:
-                                h_fields = decode_raw_protobuf(bytes(h_blob))
-                                # Field 1 in RecordGame: uuid
-                                if 1 in h_fields:
-                                    u_raw = h_fields[1][0]
-                                    if isinstance(u_raw, (bytes, bytearray)):
-                                        extracted_uuid = u_raw.decode("utf-8", errors="replace").strip()
-                                    elif isinstance(u_raw, str):
-                                        extracted_uuid = u_raw.strip()
-                                # Field 3 in RecordGame: repeated accounts
-                                if 3 in h_fields:
-                                    for acc_blob in h_fields[3]:
-                                        if isinstance(acc_blob, (bytes, bytearray)):
-                                            acc_fields = decode_raw_protobuf(bytes(acc_blob))
-                                            seat = acc_fields.get(1, [0])[0]
-                                            nick_raw = acc_fields.get(2, [b""])[0]
-                                            nick = nick_raw.decode("utf-8", errors="replace") if isinstance(nick_raw, (bytes, bytearray)) else str(nick_raw)
-                                            accounts.append({
-                                                "seat": int(seat) if isinstance(seat, int) else 0,
-                                                "nickname": nick,
-                                                "account_id": 10001 + (int(seat) if isinstance(seat, int) else 0)
-                                            })
-                            except Exception:
-                                pass
+                    # Look for data blob (often field 2 or any field with gzip / large content)
+                    candidate_blobs = list(fields.get(2, []))
+                    if not candidate_blobs:
+                        for tag, vals in fields.items():
+                            if tag != 1:  # skip error
+                                for val in vals:
+                                    if isinstance(val, (bytes, bytearray)) and (b"\x1f\x8b" in val or len(val) > 1000):
+                                        candidate_blobs.append(val)
 
-                    # Field 2: data (GameDetailRecords bytes, often gzip compressed)
-                    if 2 in fields and fields[2]:
-                        data_blob = fields[2][0]
+                    for data_blob in candidate_blobs:
                         if isinstance(data_blob, (bytes, bytearray)):
                             d_bytes = bytes(data_blob)
                             decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
                             inner_actions = decode_game_detail_records(decomp)
-                            if inner_actions and len(inner_actions) > 0:
+                            if _is_meaningful_actions(inner_actions):
                                 final_uuid = uuid or extracted_uuid
                                 if not final_uuid:
                                     import hashlib
                                     final_uuid = f"paifu_{hashlib.md5(d_bytes[:512]).hexdigest()[:12]}"
-                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord.data at offset {off} (UUID: {final_uuid})!")
+                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord at offset {off} (UUID: {final_uuid}, Accounts: {len(accounts)})!")
                                 payload = {
                                     "uuid": final_uuid,
                                     "head": {"accounts": accounts, "uuid": final_uuid} if accounts else {"uuid": final_uuid},
@@ -976,21 +1060,8 @@ class PaifuDownloader:
                                 }
                                 if accounts:
                                     payload["accounts"] = accounts
+                                    payload["players"] = accounts
                                 return payload
-
-                    # If accounts were found from head, but data was in another field or stream:
-                    if accounts:
-                        gzip_decomp = self._decompress_gzip_slice(chunk)
-                        if gzip_decomp:
-                            actions = decode_game_detail_records(gzip_decomp)
-                            if actions and len(actions) > 0:
-                                final_uuid = uuid or extracted_uuid or f"paifu_{int(time.time())}"
-                                return {
-                                    "uuid": final_uuid,
-                                    "head": {"accounts": accounts, "uuid": final_uuid},
-                                    "accounts": accounts,
-                                    "rounds": [{"actions": actions}]
-                                }
             except Exception:
                 pass
 
@@ -998,7 +1069,7 @@ class PaifuDownloader:
             gzip_decomp = self._decompress_gzip_slice(chunk)
             if gzip_decomp:
                 actions = decode_game_detail_records(gzip_decomp)
-                if actions and len(actions) > 0:
+                if _is_meaningful_actions(actions):
                     import hashlib
                     final_uuid = uuid or f"paifu_{hashlib.md5(chunk[:512]).hexdigest()[:12]}"
                     print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from gzip stream at offset {off}!")
@@ -1010,7 +1081,7 @@ class PaifuDownloader:
 
             # 3. Third priority: Direct GameDetailRecords decode on uncompressed chunk
             actions = decode_game_detail_records(chunk)
-            if actions and len(actions) > 0:
+            if _is_meaningful_actions(actions):
                 final_uuid = uuid or f"paifu_{int(time.time())}"
                 print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions directly at offset {off}!")
                 return {
@@ -1381,7 +1452,15 @@ class PaifuSniffer:
         Returns the decoded record if newly captured, or None if skipped/invalid/duplicate.
         """
         rec = self.downloader._try_decode_records(raw_bytes, "")
-        if not rec or (not rec.get("rounds") and not rec.get("actions")):
+        if not rec:
+            return None
+
+        # Double check actions validity (must have meaningful mahjong events)
+        rounds = rec.get("rounds") or []
+        actions = rec.get("actions") or []
+        if not actions and rounds:
+            actions = rounds[0].get("actions", [])
+        if not _is_meaningful_actions(actions):
             return None
 
         uuid = rec.get("uuid") or f"sniffed_{int(time.time())}_{len(self.captured_records)+1}"
@@ -1518,8 +1597,8 @@ class PaifuSniffer:
                                 raw_bytes = payload_data.encode("latin1", errors="ignore")
 
                         frame_len = len(raw_bytes)
-                        # High-priority detection: large payload (>10KB) or gzip magic
-                        if frame_len > 10000 or b"\x1f\x8b" in raw_bytes:
+                        # Replay match packet ResGameRecord is large (>8KB) containing full round logs
+                        if frame_len >= 8000:
                             rec = self.process_frame(raw_bytes)
                             if rec:
                                 count = len(self.captured_records)
@@ -1703,19 +1782,36 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
     SEAT_DEFAULTS = ["東家", "南家", "西家", "北家"]
 
     head = record.get("head") or {}
-    accounts = head.get("accounts") or record.get("accounts") or []
-    if accounts and isinstance(accounts, (list, tuple)):
-        for acc in accounts:
+    accounts = head.get("accounts") or record.get("accounts") or record.get("players") or []
+
+    # 1. Direct dictionary mapping: {0: "genta2223", 1: "ブロコフ", ...}
+    if isinstance(accounts, dict):
+        for s_key, val in accounts.items():
+            try:
+                s = int(s_key)
+                name = val.get("nickname") or val.get("name") if isinstance(val, dict) else str(val)
+                if 0 <= s < 4 and name and not is_cpu_player_name(str(name)):
+                    player_names[s] = str(name).strip()
+            except Exception:
+                pass
+
+    # 2. List of account dicts: [{'seat': 0, 'nickname': 'genta2223'}, ...]
+    elif accounts and isinstance(accounts, (list, tuple)):
+        for idx, acc in enumerate(accounts):
             if isinstance(acc, dict):
                 seat = acc.get("seat", -1)
                 nickname = acc.get("nickname") or acc.get("name") or ""
-                acc_id = acc.get("account_id", 0)
                 if 0 <= seat < 4:
                     if nickname and not is_cpu_player_name(str(nickname)):
                         player_names[seat] = str(nickname).strip()
-                    elif not player_names[seat]:
-                        player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
+                elif nickname and not is_cpu_player_name(str(nickname)):
+                    # Unseated authentic nickname: assign to next available empty seat
+                    for s in range(4):
+                        if not player_names[s]:
+                            player_names[s] = str(nickname).strip()
+                            break
 
+    # 3. Check record['players'] if still missing
     if any(not n for n in player_names):
         players = record.get("players") or head.get("players") or []
         if players and isinstance(players, (list, tuple)):
@@ -1726,9 +1822,8 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                     if 0 <= seat < 4 and not player_names[seat]:
                         if name and not is_cpu_player_name(str(name)):
                             player_names[seat] = str(name).strip()
-                        else:
-                            player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
 
+    # 4. Check result.players if still missing
     if any(not n for n in player_names):
         result_players = head.get("result", {}).get("players") or []
         if result_players and isinstance(result_players, (list, tuple)):
@@ -1739,8 +1834,6 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                     if 0 <= seat < 4 and not player_names[seat]:
                         if name and not is_cpu_player_name(str(name)):
                             player_names[seat] = str(name).strip()
-                        else:
-                            player_names[seat] = f"CPUプレイヤー ({SEAT_DEFAULTS[seat]})"
 
     for i in range(4):
         if not player_names[i] or is_cpu_player_name(player_names[i]):

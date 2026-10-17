@@ -362,10 +362,12 @@ class MahjongHUDApp:
 
         exp_btn_row = tk.Frame(exploit_frame, bg=self.c_card)
         exp_btn_row.pack(fill=tk.X, pady=(4, 2))
+        exp_btn_row.columnconfigure(0, weight=1)
+        exp_btn_row.columnconfigure(1, weight=1)
 
         self.btn_sniffer = tk.Button(
             exp_btn_row,
-            text="📡 牌譜取り込み準備（スニッファー開始）",
+            text="📡 取り込み開始",
             command=self._toggle_sniffer,
             font=("Meiryo", 8, "bold"),
             bg="#7c3aed",
@@ -373,15 +375,15 @@ class MahjongHUDApp:
             activebackground="#6d28d9",
             activeforeground="#ffffff",
             relief=tk.FLAT,
-            padx=6,
+            padx=4,
             pady=3,
             cursor="hand2",
         )
-        self.btn_sniffer.pack(side=tk.LEFT)
+        self.btn_sniffer.grid(row=0, column=0, sticky="ew", padx=(0, 3))
 
         self.btn_finish_sniffer = tk.Button(
             exp_btn_row,
-            text="👥 完了 / プロファイラー表示",
+            text="👥 完了・分析",
             command=self._finish_and_show_profiler,
             font=("Meiryo", 8, "bold"),
             bg="#2563eb",
@@ -389,11 +391,11 @@ class MahjongHUDApp:
             activebackground="#1d4ed8",
             activeforeground="#ffffff",
             relief=tk.FLAT,
-            padx=6,
+            padx=4,
             pady=3,
             cursor="hand2",
         )
-        self.btn_finish_sniffer.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_finish_sniffer.grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         self.chk_exploit = tk.Checkbutton(
             exp_btn_row,
@@ -406,7 +408,7 @@ class MahjongHUDApp:
             activebackground=self.c_card,
             activeforeground=self.c_purple,
         )
-        self.chk_exploit.pack(side=tk.LEFT, padx=(6, 0))
+        self.chk_exploit.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         self.lbl_exploit_summary = tk.Label(
             exploit_frame,
@@ -531,7 +533,7 @@ class MahjongHUDApp:
 
         if self.paifu_sniffer and self.paifu_sniffer.is_running:
             self.paifu_sniffer.stop()
-            self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+            self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
             self.lbl_exploit_summary.config(text="スニッファーを停止しました。", fg=self.c_text_dim)
             self._log("[Paifu Sniffer] スニッファーを手動停止しました。")
             return
@@ -560,7 +562,7 @@ class MahjongHUDApp:
 
         def _on_finished(records):
             def _ui_finish():
-                self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+                self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
                 count = len(records)
                 if count > 0:
                     self.lbl_exploit_summary.config(
@@ -578,12 +580,12 @@ class MahjongHUDApp:
 
         def _on_error(err_msg):
             def _ui_err():
-                self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+                self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
                 self.lbl_exploit_summary.config(text=err_msg, fg=self.c_red)
                 self._log_err(f"[Paifu Sniffer Error] {err_msg}")
             self.root.after(0, _ui_err)
 
-        self.btn_sniffer.config(text="⏳ スニッファー監視中 (クリックで停止)", bg="#b91c1c")
+        self.btn_sniffer.config(text="⏳ 監視中...", bg="#b91c1c")
         self.lbl_exploit_summary.config(
             text="牌譜画面の『詳細』をクリックしてください（取得中: 0/3件）",
             fg=self.c_yellow
@@ -601,7 +603,7 @@ class MahjongHUDApp:
         """Stops sniffer if running and opens the PlayerProfilerDialog."""
         if self.paifu_sniffer and self.paifu_sniffer.is_running:
             self.paifu_sniffer.stop()
-            self.btn_sniffer.config(text="📡 牌譜取り込み準備（スニッファー開始）", bg="#7c3aed")
+            self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
 
         self._update_exploit_summary()
         self._open_profiler_dialog()

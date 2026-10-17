@@ -3879,3 +3879,96 @@ async def test_paifu_sniffer_sequential_capture_and_profiler_integration(tmp_pat
     # 4. Verify profiler updated
     assert len(profiler.profiles) > 0
 
+
+def test_paifu_authentic_player_names_and_round_action_profiling(tmp_path):
+    """
+    Verifies that authentic player nicknames (genta2223, ブロコフ, 龍斗たっちゃん, 横丁の隠居)
+    are accurately extracted from protobuf head.accounts across seats 0..3,
+    passed to mjai events, and correctly populate OpponentProfiler round stats (not 0 rounds / 0.0%).
+    """
+    from tools.paifu_to_mjai import PaifuDownloader, extract_player_names_from_record, convert_record_to_mjai
+    from core.opponent_profiler import OpponentProfiler
+    import gzip
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-authentic-names-match"
+
+    expected_players = ["genta2223", "ブロコフ", "龍斗たっちゃん", "横丁の隠居"]
+
+    def encode_varint(n: int) -> bytes:
+        res = bytearray()
+        while n >= 0x80:
+            res.append((n & 0x7F) | 0x80)
+            n >>= 7
+        res.append(n)
+        return bytes(res)
+
+    # 1. Build authentic account blobs for all 4 seats
+    acc_blobs = []
+    for seat, name in enumerate(expected_players):
+        nb = name.encode("utf-8")
+        # Format: field 1: acc_id, field 2: seat, field 3: nickname
+        acc_payload = (
+            b"\x08" + encode_varint(20001 + seat) +
+            b"\x10" + bytes([seat]) +
+            b"\x1a" + bytes([len(nb)]) + nb
+        )
+        acc_blobs.append(b"\x1a" + bytes([len(acc_payload)]) + acc_payload)
+
+    # 2. Build RecordGame head with UUID and repeated accounts
+    uuid_bytes = test_uuid.encode("utf-8")
+    head_payload = (
+        b"\x0a" + bytes([len(uuid_bytes)]) + uuid_bytes +
+        b"".join(acc_blobs)
+    )
+
+    # 3. Build multiple authentic round actions
+    action_1 = b"\x0a\x0eRecordNewRound\x12\x02\x08\x00"
+    action_2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x01\x10\x12"
+    action_3 = b"\x0a\x12RecordDiscardTile\x12\x04\x08\x01\x10\x12"
+    action_4 = b"\x0a\x0aRecordHule\x12\x06\x08\x01\x10\xc8\x01\x18\x00"
+    records_payload = (
+        b"\x0a" + bytes([len(action_1)]) + action_1 +
+        b"\x0a" + bytes([len(action_2)]) + action_2 +
+        b"\x0a" + bytes([len(action_3)]) + action_3 +
+        b"\x0a" + bytes([len(action_4)]) + action_4
+    )
+    gzipped_records = gzip.compress(records_payload)
+
+    # 4. Assemble ResGameRecord (field 2 = data, field 3 = head)
+    res_record = (
+        b"\x12" + encode_varint(len(gzipped_records)) + gzipped_records +
+        b"\x1a" + encode_varint(len(head_payload)) + head_payload
+    )
+    frame = b"\x03\x05\x00" + res_record + (b"\x00" * 12000)
+
+    # Decode frame
+    rec = downloader._try_decode_records(frame, test_uuid)
+    assert rec is not None, "Failed to decode frame with authentic accounts"
+    assert rec["uuid"] == test_uuid
+
+    # Check extracted names
+    names = extract_player_names_from_record(rec)
+    assert names == expected_players, f"Extracted names {names} does not match {expected_players}"
+
+    # Convert to MJAI events
+    events = convert_record_to_mjai(rec, my_seat=0)
+    assert len(events) >= 3
+    assert events[0]["type"] == "start_game"
+    assert events[0]["names"] == expected_players
+
+    # Feed into OpponentProfiler
+    profiler = OpponentProfiler()
+    profiler.analyze_game_events(events)
+
+    # Verify all 4 players have profiles created with actual round stats
+    for name in expected_players:
+        p = profiler.get_profile(name)
+        assert p is not None, f"Profile for {name} was not created!"
+        assert "CPUプレイヤー" not in p.name
+        assert p.total_rounds >= 1, f"Total rounds for {name} should be >= 1, got {p.total_rounds}"
+
+    # Verify winner (ブロコフ: seat 1) stats
+    p_winner = profiler.get_profile("ブロコフ")
+    assert p_winner.hora_count >= 1
+    assert p_winner.hora_rate > 0.0
