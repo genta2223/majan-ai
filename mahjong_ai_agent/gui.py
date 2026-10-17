@@ -100,6 +100,8 @@ class MahjongHUDApp:
         self.port_var = tk.StringVar(value="9222")
         self.is_exploit_mode = tk.BooleanVar(value=False)
         self.is_running = False
+        self.is_connecting = False
+        self.chrome_launched = False
 
         self.agent_thread: Optional[threading.Thread] = None
         self.agent_instance: Optional[MahjongAIAgent] = None
@@ -498,14 +500,19 @@ class MahjongHUDApp:
     def _update_button_states(self) -> None:
         """Centralized button state management to prevent duplicate operations."""
         sniffer_busy = bool(self.paifu_sniffer and self.paifu_sniffer.is_running)
-        if self.is_running or sniffer_busy:
+        if self.chrome_launched or self.is_running or self.is_connecting or sniffer_busy:
             self.btn_chrome.config(state="disabled")
         else:
             self.btn_chrome.config(state="normal")
 
+        if self.is_connecting:
+            self.btn_assist.config(state="disabled")
+        else:
+            self.btn_assist.config(state="normal")
+
     def _launch_chrome(self) -> None:
         """Launch Google Chrome with remote debugging flags."""
-        if str(self.btn_chrome["state"]) == "disabled":
+        if str(self.btn_chrome["state"]) == "disabled" or self.chrome_launched:
             return
 
         chrome_path = find_chrome_executable()
@@ -518,7 +525,6 @@ class MahjongHUDApp:
             return
 
         self.btn_chrome.config(state="disabled")
-        self.root.after(3000, self._update_button_states)
 
         user_data_dir = r"C:\ChromeDebugTemp"
         os.makedirs(user_data_dir, exist_ok=True)
@@ -533,6 +539,8 @@ class MahjongHUDApp:
 
         try:
             subprocess.Popen(cmd)
+            self.chrome_launched = True
+            self._update_button_states()
             self._log(f"[Chrome] 起動成功: Port {port}, Profile {user_data_dir}")
             self.lbl_conn_status.config(
                 text=f"● じゃんたま起動済 (Port: {port})", fg=self.c_yellow
@@ -540,7 +548,8 @@ class MahjongHUDApp:
         except Exception as e:
             messagebox.showerror("Chrome起動エラー", f"Chromeの起動に失敗しました:\n{e}")
             self._log_err(f"[ERROR] Chrome起動失敗: {e}")
-            self.btn_chrome.config(state="normal")
+            self.chrome_launched = False
+            self._update_button_states()
 
     def _open_profiler_dialog(self) -> None:
         """Opens the standalone Player Profiler analysis window."""
@@ -674,11 +683,9 @@ class MahjongHUDApp:
         self.lbl_exploit_summary.config(text=result_text, fg=self.c_green)
 
     def _toggle_assist(self) -> None:
-        """Start or stop the Mahjong AI assist agent loop with double-click guard."""
-        if str(self.btn_assist["state"]) == "disabled":
+        """Start or stop the Mahjong AI assist agent loop with robust state guards."""
+        if self.is_connecting or str(self.btn_assist["state"]) == "disabled":
             return
-        self.btn_assist.config(state="disabled")
-        self.root.after(1200, lambda: self.btn_assist.config(state="normal"))
 
         if not self.is_running:
             self._start_assist()
@@ -696,8 +703,9 @@ class MahjongHUDApp:
 
         mode = self.output_mode_var.get()
         self.is_running = True
+        self.is_connecting = True
         self._update_button_states()
-        self.btn_assist.config(text="⏹ アシスト停止", bg=self.c_btn_stop)
+        self.btn_assist.config(text="⏳ 接続中...", bg=self.c_yellow, state="disabled")
         self.lbl_conn_status.config(text=f"● 接続中 (Port: {port})...", fg=self.c_yellow)
         self._log(f"[Assist] 開始: mode={mode}, port={port}")
 
@@ -747,12 +755,15 @@ class MahjongHUDApp:
                 self.sniffer_instance = sniffer
 
                 # On CDP WebSocket connection success
-                sniffer.on_connected_callback = lambda: self.root.after(
-                    0,
-                    lambda: self.lbl_conn_status.config(
+                def _on_connected():
+                    self.is_connecting = False
+                    self.lbl_conn_status.config(
                         text="● 接続完了 (雀魂タブ監視中)", fg=self.c_green
-                    ),
-                )
+                    )
+                    self.btn_assist.config(text="⏹ アシスト停止", bg=self.c_btn_stop, state="normal")
+                    self._update_button_states()
+
+                sniffer.on_connected_callback = lambda: self.root.after(0, _on_connected)
 
                 # Auto-sync resolved seat to agent, state manager, and UI log
                 def _on_seat_change(new_seat: int):
@@ -805,8 +816,9 @@ class MahjongHUDApp:
     def _on_agent_stopped(self) -> None:
         """Update UI state when agent stops."""
         self.is_running = False
+        self.is_connecting = False
         self._update_button_states()
-        self.btn_assist.config(text="▶ アシスト開始", bg="#059669")
+        self.btn_assist.config(text="▶ アシスト開始", bg="#059669", state="normal")
         self.lbl_conn_status.config(text="● 停止中", fg=self.c_text_dim)
         self._log("[Assist] アシストが停止しました。")
 

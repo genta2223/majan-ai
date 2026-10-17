@@ -5423,6 +5423,67 @@ async def test_dealer_first_turn_autonomous_trigger_and_safety_net(test_config):
     assert len(latest_rec.get("top_candidates", [])) >= 1
 
 
+def test_no_phantom_discard_resurrection_and_packet_hard_sync():
+    """
+    Test Requirement: Verify that:
+    1. Discarding '2z' (Nan) never resurrects back into hand even if hand size drops below 13.
+    2. Real packet payload in tsumo forcibly overwrites hand (hard sync) accurately.
+    """
+    from core.state_manager import MahjongStateManager
+
+    sm = MahjongStateManager(my_actor_id=0)
+
+    # 1. Round start with 13-tile hand including 2z (Nan)
+    start_event = {
+        "type": "start_kyoku",
+        "bakaze": "E", "kyoku": 1, "honba": 0, "kyotaku": 0, "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [
+            ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "2z"],
+            ["?"] * 13, ["?"] * 13, ["?"] * 13
+        ],
+        "dora_marker": "1p"
+    }
+    sm.update_event(start_event)
+    p = sm.my_player
+    assert "2z" in p.tehai
+    assert len(p.tehai) == 13
+
+    # 2. Draw 14th tile '4s'
+    sm.update_event({"type": "tsumo", "actor": 0, "pai": "4s"})
+    assert len(p.tehai) == 14
+    assert "4s" in p.tehai
+
+    # 3. Discard '2z' (Nan)
+    sm.update_event({"type": "dahai", "actor": 0, "pai": "2z", "tsumogiri": False})
+    assert len(p.tehai) == 13
+    assert "2z" not in p.tehai
+    assert "2z" in p.discards
+
+    # 4. Simulate a situation where another tile is popped or hand has 12 tiles
+    # In the past, this caused 2z to be resurrected into hand from discards!
+    p.tehai.pop()
+    assert len(p.tehai) == 12
+    # Calling verify_hand_consistency MUST NOT resurrect 2z from discards!
+    sm.verify_hand_consistency(context="test_guard")
+    assert "2z" not in p.tehai, "CRITICAL ERROR: '2z' (Nan) was resurrected from discards!"
+    assert len(p.tehai) == 12
+
+    # 5. Subsequent tsumo with authentic packet hand forcibly syncs entire hand
+    new_packet_hand = ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s", "1m", "2m", "3m", "4m"]
+    sm.update_event({
+        "type": "tsumo",
+        "actor": 0,
+        "pai": "5m",
+        "tiles": new_packet_hand
+    })
+    # Hand MUST be hard-synced to packet hand + drawn tile
+    assert len(p.tehai) == 14
+    assert p.tehai[-1] == "5m"
+    assert "2z" not in p.tehai
+
+
+
 
 
 

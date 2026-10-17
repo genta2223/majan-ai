@@ -326,16 +326,10 @@ class MahjongStateManager:
                 trim_count = current_len - draw_size
                 print(f"[StateManager RECOVERY] Hand size {current_len} > {draw_size}. Trimming {trim_count} overflow tile(s) from hand end: {my_p.tehai[-trim_count:]}")
                 my_p.tehai = my_p.tehai[:draw_size]
-            # 2. If hand size has collapsed below base_size, resurrect missing tiles from discards to prevent crash
+            # 2. If hand size is below base_size, never fabricate tiles from discards!
+            # Await true server packet synchronization rather than polluting hand with phantom tiles.
             elif current_len < base_size:
-                needed = base_size - current_len
-                print(f"[StateManager RECOVERY] Hand size {current_len} < {base_size} in {context}. Reconstructing {needed} missing tile(s) to protect 13-tile integrity...")
-                for d in reversed(my_p.discards):
-                    if len(my_p.tehai) >= base_size:
-                        break
-                    if is_valid_mahjong_tile(d) and my_p.tehai.count(d) < 4:
-                        my_p.tehai.append(d)
-                        print(f"[StateManager RECOVERY] Restored '{d}' from discards into hand: {my_p.tehai}")
+                print(f"[StateManager WARNING] Hand size {current_len} < {base_size} in {context}. Awaiting server packet hand update (no phantom discard resurrection).")
             return False
 
         return True
@@ -436,12 +430,15 @@ class MahjongStateManager:
             p.tsumo_tile = pai
 
             if actor == self.my_actor_id:
-                # Mid-game rescue: If self hand is empty or filled with unknown '?' tiles, recover from event
-                if not p.tehai or all(t == "?" for t in p.tehai):
-                    raw_hand = event.get("tiles") or event.get("hand") or []
-                    if raw_hand:
-                        p.tehai = [t for t in raw_hand if is_valid_mahjong_tile(t)]
-                        print(f"[StateManager RESCUE] Recovered self hand from event payload: {p.tehai}")
+                # Latest packet hand synchronization:
+                # If authentic packet contains full hand tiles, prioritize and synchronize with authentic server data
+                raw_hand = event.get("tiles") or event.get("hand") or []
+                if raw_hand:
+                    valid_packet_hand = [t for t in raw_hand if is_valid_mahjong_tile(t)]
+                    if len(valid_packet_hand) >= 12:
+                        p.tehai = valid_packet_hand
+                        print(f"[StateManager SYNC] Synchronized self hand from authentic packet payload ({len(p.tehai)} tiles): {p.tehai}")
+                        trace_log("TSUMO_PACKET_SYNC", f"Synchronized hand {p.tehai}")
 
                 if pai and pai not in ("?", "None") and is_valid_mahjong_tile(pai):
                     expected_draw_len = 14 - (3 * len(p.melds))
@@ -510,20 +507,9 @@ class MahjongStateManager:
                         trace_log("TSUMOGIRI_MISSED_DRAW_PRESERVED", msg)
                     else:
                         # Tedashi: tile was discarded from hand, but draw tile was missing from packet.
-                        # Preserve hand size: if tile was found in hand, swap with the discard or preserve size
                         msg = f"[StateManager CRITICAL GUARD] Hand already at {len(p.tehai)} <= {expected_base_len}. Discard '{pai}' prohibited from reducing hand size."
                         print(msg)
                         trace_log("DAHAI_HAND_GUARD", msg)
-
-                # Final fallback safety net: if hand ever drops below expected_base_len, reconstruct by resurrecting discards
-                while len(p.tehai) < expected_base_len and p.discards:
-                    for d_tile in reversed(p.discards):
-                        if is_valid_mahjong_tile(d_tile) and p.tehai.count(d_tile) < 4:
-                            p.tehai.append(d_tile)
-                            print(f"[StateManager RECOVERY] Restored '{d_tile}' from discards into hand to maintain {len(p.tehai)} tiles.")
-                            break
-                    if len(p.tehai) < expected_base_len:
-                        break
 
                 self.verify_hand_consistency(context="dahai")
 
