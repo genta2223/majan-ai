@@ -892,21 +892,21 @@ class PaifuDownloader:
                 async with websockets.connect(ws_url, open_timeout=3.0) as ws:
                     captured_record = None
 
-                    # 1. Enable CDP Page, Network and Runtime domains
+                    # 1. Activate Page.enable and Network.enable PRIOR to page navigation
                     await ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
                     await ws.send(json.dumps({"id": 2, "method": "Network.enable", "params": {}}))
-                    await ws.send(json.dumps({"id": 3, "method": "Runtime.enable", "params": {}}))
+                    print(f"[PaifuDownloader] CDP Network.enable activated prior to navigation.")
 
                     # 2. Trigger direct navigation to replay URL
                     replay_url = f"https://game.mahjongsoul.com/?paipu={uuid}"
                     print(f"[PaifuDownloader] Navigating Unity WebGL tab directly to replay URL via Page.navigate:\n  --> {replay_url}")
                     await ws.send(json.dumps({
-                        "id": 4,
+                        "id": 3,
                         "method": "Page.navigate",
                         "params": {"url": replay_url}
                     }))
 
-                    # 3. Monitor network packets (up to 15 seconds for Unity load and WSS packets)
+                    # 3. Monitor Network.webSocketFrameReceived and network traffic
                     start_t = asyncio.get_event_loop().time()
                     total_ws_frames = 0
                     print(f"[PaifuDownloader] Monitoring WebSocket frames and network traffic for replay packets (timeout: 15s)...")
@@ -918,7 +918,7 @@ class PaifuDownloader:
                             method = msg.get("method", "")
                             params = msg.get("params", {})
 
-                            # Intercept WebSocket binary frames (Unity WebGL communicates via WSS)
+                            # Intercept WebSocket binary frames (Unity WebGL communicates with wss://)
                             if method == "Network.webSocketFrameReceived":
                                 total_ws_frames += 1
                                 resp_data = params.get("response", {})
@@ -927,10 +927,10 @@ class PaifuDownloader:
                                 if payload_data:
                                     try:
                                         raw_bytes = base64.b64decode(payload_data)
-                                        # Attempt decode GameDetailRecords / Liqi actions
+                                        # Decode authentic game actions via decode_game_detail_records
                                         actions = decode_game_detail_records(raw_bytes)
                                         if actions and len(actions) > 0:
-                                            print(f"[PaifuDownloader] Intercepted paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
+                                            print(f"[PaifuDownloader] Intercepted authentic paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
                                             captured_record = {
                                                 "uuid": uuid,
                                                 "head": {},
