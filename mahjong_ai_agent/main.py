@@ -132,10 +132,19 @@ class MahjongAIAgent:
 
             # Live Vision Resynchronization on self turn
             if actor == self.my_actor_id:
+                if not self.state_mgr.round_state:
+                    # Trigger rescue initialization in state manager
+                    self.state_mgr.update_event({"type": "tsumo", "actor": actor, "pai": pai, "tiles": event.get("tiles")})
+                elif event.get("tiles") and self.state_mgr.round_state:
+                    p = self.state_mgr.round_state.players[self.my_actor_id]
+                    if len(p.tehai) < 13 or all(t == "?" or not is_valid_mahjong_tile(t) for t in p.tehai):
+                        p.tehai = [t for t in event["tiles"] if is_valid_mahjong_tile(t)]
+                        print(f"[Main RESCUE] Synchronized self hand from tsumo event: {p.tehai}")
+
                 needs_sync = (not pai or pai == "?")
                 if not needs_sync and self.state_mgr.round_state:
                     p = self.state_mgr.round_state.players[self.my_actor_id]
-                    if len(p.tehai) < 13 or any(t == "?" or not is_valid_mahjong_tile(t) for t in p.tehai):
+                    if len(p.tehai) < 13 or all(t == "?" or not is_valid_mahjong_tile(t) for t in p.tehai):
                         needs_sync = True
 
                 if needs_sync and (self.packet_hand_trusted or not self.vision_fallback_enabled):

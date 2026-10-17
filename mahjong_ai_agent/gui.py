@@ -495,8 +495,19 @@ class MahjongHUDApp:
         """Log error text via sys.stderr redirector."""
         sys.stderr.write(message + "\n")
 
+    def _update_button_states(self) -> None:
+        """Centralized button state management to prevent duplicate operations."""
+        sniffer_busy = bool(self.paifu_sniffer and self.paifu_sniffer.is_running)
+        if self.is_running or sniffer_busy:
+            self.btn_chrome.config(state="disabled")
+        else:
+            self.btn_chrome.config(state="normal")
+
     def _launch_chrome(self) -> None:
         """Launch Google Chrome with remote debugging flags."""
+        if str(self.btn_chrome["state"]) == "disabled":
+            return
+
         chrome_path = find_chrome_executable()
         if not chrome_path:
             messagebox.showerror(
@@ -505,6 +516,9 @@ class MahjongHUDApp:
                 "Chromeがインストールされているか確認してください。",
             )
             return
+
+        self.btn_chrome.config(state="disabled")
+        self.root.after(3000, self._update_button_states)
 
         user_data_dir = r"C:\ChromeDebugTemp"
         os.makedirs(user_data_dir, exist_ok=True)
@@ -526,6 +540,7 @@ class MahjongHUDApp:
         except Exception as e:
             messagebox.showerror("Chrome起動エラー", f"Chromeの起動に失敗しました:\n{e}")
             self._log_err(f"[ERROR] Chrome起動失敗: {e}")
+            self.btn_chrome.config(state="normal")
 
     def _open_profiler_dialog(self) -> None:
         """Opens the standalone Player Profiler analysis window."""
@@ -544,6 +559,7 @@ class MahjongHUDApp:
             self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
             self.lbl_exploit_summary.config(text="スニッファーを停止しました。", fg=self.c_text_dim)
             self._log("[Paifu Sniffer] スニッファーを手動停止しました。")
+            self._update_button_states()
             return
 
         port = int(self.port_var.get().strip() or "9222")
@@ -572,6 +588,7 @@ class MahjongHUDApp:
         def _on_finished(records):
             def _ui_finish():
                 self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
+                self._update_button_states()
                 count = len(records)
                 if count > 0:
                     self.lbl_exploit_summary.config(
@@ -590,11 +607,13 @@ class MahjongHUDApp:
         def _on_error(err_msg):
             def _ui_err():
                 self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
+                self._update_button_states()
                 self.lbl_exploit_summary.config(text=err_msg, fg=self.c_red)
                 self._log_err(f"[Paifu Sniffer Error] {err_msg}")
             self.root.after(0, _ui_err)
 
         self.btn_sniffer.config(text="⏳ 監視中...", bg="#b91c1c")
+        self.btn_chrome.config(state="disabled")
         self.lbl_exploit_summary.config(
             text="牌譜画面の『詳細』をクリックしてください（取得中: 0/3件）",
             fg=self.c_yellow
@@ -613,6 +632,10 @@ class MahjongHUDApp:
         if self.paifu_sniffer and self.paifu_sniffer.is_running:
             self.paifu_sniffer.stop()
             self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
+            self._update_button_states()
+
+        self._update_exploit_summary()
+        self._open_profiler_dialog()
 
         self._update_exploit_summary()
         self._open_profiler_dialog()
@@ -651,7 +674,12 @@ class MahjongHUDApp:
         self.lbl_exploit_summary.config(text=result_text, fg=self.c_green)
 
     def _toggle_assist(self) -> None:
-        """Start or stop the Mahjong AI assist agent loop."""
+        """Start or stop the Mahjong AI assist agent loop with double-click guard."""
+        if str(self.btn_assist["state"]) == "disabled":
+            return
+        self.btn_assist.config(state="disabled")
+        self.root.after(1200, lambda: self.btn_assist.config(state="normal"))
+
         if not self.is_running:
             self._start_assist()
         else:
@@ -668,6 +696,7 @@ class MahjongHUDApp:
 
         mode = self.output_mode_var.get()
         self.is_running = True
+        self._update_button_states()
         self.btn_assist.config(text="⏹ アシスト停止", bg=self.c_btn_stop)
         self.lbl_conn_status.config(text=f"● 接続中 (Port: {port})...", fg=self.c_yellow)
         self._log(f"[Assist] 開始: mode={mode}, port={port}")
@@ -776,6 +805,7 @@ class MahjongHUDApp:
     def _on_agent_stopped(self) -> None:
         """Update UI state when agent stops."""
         self.is_running = False
+        self._update_button_states()
         self.btn_assist.config(text="▶ アシスト開始", bg="#059669")
         self.lbl_conn_status.config(text="● 停止中", fg=self.c_text_dim)
         self._log("[Assist] アシストが停止しました。")

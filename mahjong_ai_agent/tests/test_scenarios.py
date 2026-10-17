@@ -5154,6 +5154,144 @@ def test_bayesian_smoothing_and_live_session_blending():
     assert "[東風速攻警戒 1.3x]" in modifiers["exploit_note"]
 
 
+@pytest.mark.asyncio
+async def test_mid_game_join_dynamic_rescue_and_recommendation_trigger(test_config):
+    """
+    Test Requirement: Verify that attaching mid-game (e.g. South 1 round, Non-dealer)
+    without receiving ActionNewRound correctly:
+    1. Recovers self seat (my_seat) and synthesizes a rescue start_kyoku event.
+    2. Restores hand state and round_state in StateManager.
+    3. Successfully triggers AI recommendation (top 1 & 2 candidates) on self draw.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from main import MahjongAIAgent
+
+    # 1. Initialize bridge with default seat 0, but user is actually sitting at seat 2 (Nan 1, West/child)
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=False)
+    assert not bridge._in_round
+
+    # 2. Simulate mid-match stream without ActionNewRound:
+    # First: Mid-game sync packet arrives on WebSocket connection
+    sync_packet = {
+        "chang": 1,   # 1 = South round (Nanba)
+        "ju": 0,      # 0 = Kyoku 1 (Nan 1)
+        "ben": 1,     # Honba = 1
+        "scores": [24000, 26000, 25000, 25000],
+        "doras": ["1p"]
+    }
+    events_from_sync = bridge.translate_action("syncGame", sync_packet)
+
+    # Bridge MUST synthesize rescue start_kyoku from syncGame
+    assert len(events_from_sync) == 1
+    rescue_start = events_from_sync[0]
+    assert rescue_start["type"] == "start_kyoku"
+    assert rescue_start["bakaze"] == "S"  # South 1 round
+    assert rescue_start["kyoku"] == 1
+    assert rescue_start["honba"] == 1
+    assert bridge._in_round is True
+
+    # Next: Enemy at seat 1 discards 9m
+    discard_packet = {
+        "seat": 1,
+        "tile": "9m",
+    }
+    events_from_discard = bridge.translate_action("ActionDiscardTile", discard_packet)
+    assert len(events_from_discard) == 1
+    assert events_from_discard[0]["type"] == "dahai"
+
+    # 3. Next: Turn comes to Player 2 (Self), DealTile arrives with unmasked tile "4s" and full hand tiles
+    deal_packet = {
+        "seat": 2,
+        "tile": "4s",
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "7s", "8s", "4s"],
+        "doras": ["1p"]
+    }
+    events_from_deal = bridge.translate_action("ActionDealTile", deal_packet)
+
+    # Bridge MUST automatically resolve self seat to 2
+    assert bridge.my_seat == 2
+    assert any(ev.get("type") == "tsumo" and ev.get("actor") == 2 and ev.get("pai") == "4s" for ev in events_from_deal)
+
+    # 4. Feed events sequentially into MahjongAIAgent
+    agent = MahjongAIAgent(config=test_config, my_actor_id=0, apply_sleep=False, output_mode="text_only")
+
+    # Capture recommendations
+    recommendations = []
+    agent.action_controller.on_recommendation_callback = lambda rec: recommendations.append(rec)
+
+    # Process rescue start_kyoku & initial discard
+    for ev in events_from_sync + events_from_discard:
+        await agent.handle_event(ev)
+
+    assert agent.state_mgr.round_state is not None
+    assert agent.state_mgr.round_state.bakaze == "S"
+    assert agent.state_mgr.round_state.kyoku == 1
+
+    # Process self tsumo event
+    for ev in events_from_deal:
+        action = await agent.handle_event(ev)
+        if ev.get("type") == "tsumo" and ev.get("actor") == 2:
+            # Self actor ID must be updated to 2
+            assert agent.my_actor_id == 2
+            assert agent.state_mgr.my_actor_id == 2
+
+            # Self hand must be populated with 14 tiles
+            my_hand = agent.state_mgr.my_player.tehai
+            assert len(my_hand) == 14
+            assert "4s" in my_hand
+
+            # AI decision engine must be triggered and produce an OutputAction
+            assert action is not None
+            assert action.action_type in ("dahai", "reach")
+            assert len(recommendations) >= 1
+            rec = recommendations[-1]
+            assert "top_candidates" in rec
+            assert len(rec["top_candidates"]) >= 2  # 1st and 2nd choices present
+
+
+def test_gui_exclusive_button_control_guards():
+    """
+    Test GUI exclusive button control to guarantee:
+    1. During assist run or paifu sniffer sniffing, btn_chrome is disabled to prevent duplicate launch.
+    2. Assist button toggling prevents duplicate concurrent executions.
+    """
+    import tkinter as tk
+    from gui import MahjongHUDApp
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = MahjongHUDApp(root)
+
+        # Initially normal
+        assert str(app.btn_chrome["state"]) == "normal"
+        assert str(app.btn_assist["state"]) == "normal"
+
+        # 1. When assist is running: btn_chrome must be disabled
+        app.is_running = True
+        app._update_button_states()
+        assert str(app.btn_chrome["state"]) == "disabled"
+
+        # When stopped: restored to normal
+        app._on_agent_stopped()
+        assert str(app.btn_chrome["state"]) == "normal"
+
+        # 2. When paifu sniffer is running: btn_chrome must be disabled
+        class MockSniffer:
+            is_running = True
+        app.paifu_sniffer = MockSniffer()
+        app._update_button_states()
+        assert str(app.btn_chrome["state"]) == "disabled"
+
+        # When sniffer stops: restored to normal
+        app.paifu_sniffer.is_running = False
+        app._update_button_states()
+        assert str(app.btn_chrome["state"]) == "normal"
+    finally:
+        root.destroy()
+
+
+
 
 
 

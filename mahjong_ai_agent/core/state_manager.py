@@ -360,6 +360,26 @@ class MahjongStateManager:
         event_type = event.get("type", "")
         trace_log("STATE_CONSUME_EVENT", f"Type: {event_type}", event)
 
+        # Emergency Rescue Guard: If an in-game turn event arrives before start_kyoku
+        # (e.g. agent attached mid-game/mid-round), dynamically synthesize board state immediately.
+        if event_type in ("tsumo", "dahai", "chi", "pon", "kan", "daiminkan", "kankan", "ankan", "reach") and not self.round_state:
+            print(f"[StateManager RESCUE] In-game event '{event_type}' arrived without active round_state. Initializing emergency board state...")
+            bakaze = event.get("bakaze", "E")
+            kyoku = event.get("kyoku", 1)
+            scores = event.get("scores", self.initial_scores)
+            tehais = event.get("tehais", [["?"] * 13 for _ in range(4)])
+            dora_marker = event.get("dora_marker", "")
+            self.reset_round(
+                bakaze=bakaze,
+                kyoku=kyoku,
+                honba=event.get("honba", 0),
+                kyotaku=event.get("kyotaku", 0),
+                oya=event.get("oya", 0),
+                scores=scores,
+                tehais=tehais,
+                dora_marker=dora_marker
+            )
+
         if event_type == "start_game":
             self.game_active = True
             names = event.get("names", ["P0", "P1", "P2", "P3"])
@@ -405,6 +425,13 @@ class MahjongStateManager:
             p.tsumo_tile = pai
 
             if actor == self.my_actor_id:
+                # Mid-game rescue: If self hand is empty or filled with unknown '?' tiles, recover from event
+                if not p.tehai or all(t == "?" for t in p.tehai):
+                    raw_hand = event.get("tiles") or event.get("hand") or []
+                    if raw_hand:
+                        p.tehai = [t for t in raw_hand if is_valid_mahjong_tile(t)]
+                        print(f"[StateManager RESCUE] Recovered self hand from event payload: {p.tehai}")
+
                 if pai and pai not in ("?", "None") and is_valid_mahjong_tile(pai):
                     expected_draw_len = 14 - (3 * len(p.melds))
                     if len(p.tehai) >= expected_draw_len:

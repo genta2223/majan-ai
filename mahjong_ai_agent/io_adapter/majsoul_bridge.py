@@ -121,6 +121,8 @@ class MajsoulBridge:
         self.on_seat_changed: Optional[Callable[[int], None]] = None
         self._current_doras: List[str] = []
         self._last_discard_seat: Optional[int] = None
+        self._in_round: bool = False
+        self._last_round_params: Dict[str, Any] = {}
         # Vision is a last-resort fallback only. It must never override packet-decoded tiles.
         self.vision_fallback_enabled = vision_fallback_enabled
 
@@ -169,6 +171,96 @@ class MajsoulBridge:
                     return seat_val
         return None
 
+    def _generate_rescue_start_kyoku(self, data: Dict[str, Any], trigger_action: str) -> Dict[str, Any]:
+        """
+        Dynamically synthesizes a start_kyoku event when sniffing starts in the middle of a game/round.
+        Recovers self seat, wind/round indicators, and hand tiles if available.
+        """
+        raw_chang = safe_coerce_int(data.get("chang", self._last_round_params.get("chang", 0)), 0)
+        chang_idx = raw_chang if 0 <= raw_chang < len(WIND_CHARS) else 0
+        bakaze = WIND_CHARS[chang_idx]
+
+        ju = safe_coerce_int(data.get("ju", self._last_round_params.get("ju", 0)), 0)
+        kyoku = ju + 1
+        honba = safe_coerce_int(data.get("ben", self._last_round_params.get("ben", 0)), 0)
+        kyotaku = safe_coerce_int(data.get("liqibang", self._last_round_params.get("liqibang", 0)), 0)
+        oya = safe_coerce_int(data.get("oya", ju % 4), ju % 4)
+
+        scores = safe_coerce_int_list(
+            data.get("scores", self._last_round_params.get("scores")),
+            default=[25000, 25000, 25000, 25000],
+            expected_len=4
+        )
+
+        # Dora extraction
+        raw_doras = data.get("doras") or data.get("dora") or data.get("dora_marker") or []
+        if isinstance(raw_doras, str):
+            raw_doras = [raw_doras]
+        doras = [d for d in raw_doras if is_valid_tile_code(d)]
+        dora_marker = liqi_tile_to_mjai(doras[0]) if doras else ""
+        if dora_marker:
+            self._current_doras = [dora_marker]
+
+        # Dynamic seat resolution (only on deal actions where self tile is unmasked):
+        deal_seat = data.get("seat")
+        raw_tile = data.get("tile", "")
+        if trigger_action in ("ActionDealTile", "RecordDealTile", "NotifyDealTile"):
+            if deal_seat is not None and 0 <= safe_coerce_int(deal_seat, -1) <= 3:
+                s_int = safe_coerce_int(deal_seat)
+                if raw_tile and is_valid_tile_code(raw_tile):
+                    self.set_my_seat(s_int)
+                elif "operation_list" in data or "operations" in data:
+                    self.set_my_seat(s_int)
+
+        # Hand setup
+        tehais: List[List[str]] = [["?"] * 13 for _ in range(4)]
+        raw_tiles = data.get("tiles") or data.get("hand") or []
+        if isinstance(raw_tiles, (list, tuple)):
+            valid_tiles = [liqi_tile_to_mjai(t) for t in raw_tiles if is_valid_tile_code(t)]
+            if valid_tiles:
+                tehais[self.my_seat] = valid_tiles
+
+        # Vision Fallback for self hand if packet has no hand tiles
+        if (not raw_tiles or all(t == "?" for t in tehais[self.my_seat])) and self.vision_fallback_enabled:
+            try:
+                from io_adapter.vision_hand_reader import VisionHandReader
+                reader = VisionHandReader()
+                vision_tiles = reader.read_hand()
+                if vision_tiles and len(vision_tiles) >= 13:
+                    norm_vision = [liqi_tile_to_mjai(t) for t in vision_tiles]
+                    if len(set(norm_vision)) >= 3:
+                        tehais[self.my_seat] = norm_vision[:13]
+                        print(f"[MajsoulBridge RESCUE Vision] Captured mid-game hand ({len(norm_vision)} tiles): {norm_vision}")
+            except Exception:
+                pass
+
+        print(
+            f"[MajsoulBridge RESCUE] Mid-game join detected on '{trigger_action}'. "
+            f"Synthesized start_kyoku: {bakaze}{kyoku}局 {honba}本場, MySeat=P{self.my_seat}, Hand={len(tehais[self.my_seat])} tiles."
+        )
+
+        rescue_event: Dict[str, Any] = {
+            "type": "start_kyoku",
+            "action_name": "RescueNewRound",
+            "bakaze": bakaze,
+            "kyoku": kyoku,
+            "honba": honba,
+            "kyotaku": kyotaku,
+            "oya": oya,
+            "scores": scores,
+            "tehais": tehais,
+            "dora_marker": dora_marker,
+            "is_rescue": True,
+        }
+        if any(self.player_nicknames):
+            rescue_event["names"] = list(self.player_nicknames)
+        if self.current_game_uuid:
+            rescue_event["game_uuid"] = self.current_game_uuid
+        if self.match_mode:
+            rescue_event["match_mode"] = self.match_mode
+
+        return rescue_event
+
     def translate_action(self, action_name: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Translates a single Liqi action and its payload data into a list of mjai events.
@@ -186,15 +278,24 @@ class MajsoulBridge:
                 self.current_game_uuid = str(uuid)
             return []
 
-        # 2. Player info updates or Auth responses
-        if clean_name in ("ResAuthGame", "NotifyRoomPlayerUpdate", "NotifyPlayerLoadGameReady"):
+        # 2. Player info updates, Auth responses, or mid-game sync
+        if clean_name in (
+            "ResAuthGame", "NotifyRoomPlayerUpdate", "NotifyPlayerLoadGameReady",
+            "syncGame", "ResSyncGame", "fetchGamePlayerState"
+        ):
             plist = data.get("players") or data.get("player_list") or data.get("seat_list") or []
             if plist:
                 self.resolve_seat_from_player_list(plist)
             uuid = data.get("game_uuid") or data.get("uuid")
             if uuid:
                 self.current_game_uuid = str(uuid)
-            return []
+
+            # If mid-game state sync has game details and we are not in round, initialize
+            if clean_name in ("syncGame", "ResSyncGame", "fetchGamePlayerState") and not self._in_round:
+                rescue_start = self._generate_rescue_start_kyoku(data, clean_name)
+                events.append(rescue_start)
+                self._in_round = True
+            return events
 
         if clean_name in ("ActionNewRound", "RecordNewRound", "ActionMJStart", "NotifyRoomGameStart"):
             # New Round (start_kyoku)
@@ -322,6 +423,15 @@ class MajsoulBridge:
             if self.match_mode:
                 start_event["match_mode"] = self.match_mode
 
+            self._in_round = True
+            self._last_round_params = {
+                "chang": raw_chang,
+                "ju": ju,
+                "ben": honba,
+                "liqibang": kyotaku,
+                "scores": list(scores),
+                "oya": oya,
+            }
             events.append(start_event)
 
             # If dealer has initial draw tile, immediately trigger initial draw event
@@ -336,6 +446,18 @@ class MajsoulBridge:
             seat = data.get("seat", 0)
             raw_tile = data.get("tile", "")
             
+            # Dynamic Seat resolution:
+            # If live packet contains operations or multi-tile self hand, this seat IS self!
+            has_self_indicators = (
+                bool(data.get("operation_list") or data.get("operations"))
+                or (isinstance(data.get("tiles"), (list, tuple)) and len(data.get("tiles")) >= 2)
+                or (isinstance(data.get("hand"), (list, tuple)) and len(data.get("hand")) >= 2)
+            )
+            if not clean_name.startswith("Record") and has_self_indicators:
+                if self.my_seat != seat and 0 <= safe_coerce_int(seat, -1) <= 3:
+                    print(f"[MajsoulBridge AutoSeat] Identified self seat {seat} from deal operations/hand. Switched self seat {self.my_seat} -> {seat}.")
+                    self.set_my_seat(safe_coerce_int(seat))
+
             # Opponent draw isolation:
             # If seat != self.my_seat and not a replay Record, non-self draws are always hidden ('?')
             # to strictly prevent accidental seat switching or phantom tile leaks.
@@ -383,6 +505,12 @@ class MajsoulBridge:
                 "actor": seat,
                 "pai": tile if tile else "?",
             }
+            raw_hand = data.get("tiles") or data.get("hand")
+            if raw_hand and isinstance(raw_hand, (list, tuple)):
+                valid_hand = [liqi_tile_to_mjai(t) for t in raw_hand if is_valid_tile_code(t)]
+                if valid_hand:
+                    tsumo_event["tiles"] = valid_hand
+
             raw_ops = data.get("operation_list") or data.get("operations") or data.get("operation") or []
             if isinstance(raw_ops, dict):
                 raw_ops = [raw_ops]
@@ -548,9 +676,11 @@ class MajsoulBridge:
                     "score": score_val,
                     "deltas": deltas,
                 })
+            self._in_round = False
             events.append({"type": "end_kyoku"})
 
         elif clean_name in ("ActionNoTile", "RecordNoTile", "ActionLiuJu", "RecordLiuJu"):
+            self._in_round = False
             events.append({
                 "type": "ryukyoku",
                 "deltas": safe_coerce_int_list(data.get("delta_scores"), default=[0, 0, 0, 0], expected_len=4),
