@@ -638,8 +638,8 @@ class PaifuDownloader:
     def _fetch_from_http(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Fetches authentic game record directly via HTTP(S) endpoints or public APIs:
-        1. Official MahjongSoul public/CDN gateway endpoints.
-        2. Browser session fetch() with same-origin credentials via CDP if available.
+        1. Browser session fetch() with same-origin credentials via CDP if available.
+        2. Official MahjongSoul public/CDN gateway endpoints.
         3. Public aggregator / replay endpoints.
         """
         # 1. Attempt browser same-origin fetch via CDP (carries session cookies & credentials)
@@ -666,16 +666,21 @@ class PaifuDownloader:
                                 "/record?uuid=" + targetUuid,
                                 "https://passport.mahjongsoul.com/record?uuid=" + targetUuid
                             ];
+                            let results = [];
                             for (let ep of endpoints) {{
                                 try {{
                                     let r = await fetch(ep, {{ credentials: "include" }});
                                     if (r.ok) {{
                                         let text = await r.text();
                                         return JSON.stringify({{ success: true, url: ep, data: text }});
+                                    }} else {{
+                                        results.push(ep + " -> status " + r.status);
                                     }}
-                                }} catch(e) {{}}
+                                }} catch(e) {{
+                                    results.push(ep + " -> error " + e.toString());
+                                }}
                             }}
-                            return JSON.stringify({{ success: false }});
+                            return JSON.stringify({{ success: false, log: results.join("; ") }});
                         }})()
                         """
                         cmd = {
@@ -697,20 +702,24 @@ class PaifuDownloader:
                                 raw_text = data["data"]
                                 try:
                                     parsed = json.loads(raw_text)
-                                    return self._normalize_record_dict(parsed, uuid)
-                                except Exception:
-                                    pass
+                                    norm = self._normalize_record_dict(parsed, uuid)
+                                    if norm:
+                                        print(f"[PaifuDownloader] Browser in-session fetch succeeded via {data.get('url')} for: {uuid}")
+                                        return norm
+                                except Exception as pe:
+                                    print(f"[PaifuDownloader] Browser in-session JSON parse error: {pe}")
+                            else:
+                                print(f"[PaifuDownloader] Browser in-session fetch failed: {data.get('log', 'unknown')}")
                     return None
 
                 try:
                     res = asyncio.run(_browser_fetch())
                     if res:
-                        print(f"[PaifuDownloader] Successfully fetched record via browser in-session HTTP for: {uuid}")
                         return res
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as bfe:
+                    print(f"[PaifuDownloader] Browser in-session fetch exception: {bfe}")
+        except Exception as cdpe:
+            print(f"[PaifuDownloader] Browser in-session CDP connection skipped/failed: {cdpe}")
 
         # 2. Direct HTTP requests to candidate public/CDN endpoints
         candidate_urls = [
@@ -733,9 +742,11 @@ class PaifuDownloader:
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=2.5) as resp:
-                    if resp.status == 200:
+                    status_code = resp.status
+                    if status_code == 200:
                         raw = resp.read()
                         if not raw:
+                            print(f"[PaifuDownloader] HTTP {url} returned empty body")
                             continue
 
                         # Check if JSON
@@ -745,6 +756,8 @@ class PaifuDownloader:
                             if normalized:
                                 print(f"[PaifuDownloader] Successfully fetched record via HTTP ({url}) for: {uuid}")
                                 return normalized
+                            else:
+                                print(f"[PaifuDownloader] HTTP {url} returned JSON but could not normalize: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             # Try Protobuf decode on raw binary
                             actions = decode_game_detail_records(raw)
@@ -762,9 +775,17 @@ class PaifuDownloader:
                                     "head": {},
                                     "rounds": [{"actions": [decoded_action]}],
                                 }
-            except Exception:
-                continue
+                            print(f"[PaifuDownloader] HTTP {url} returned binary ({len(raw)} bytes) but failed protobuf decode")
+                    else:
+                        print(f"[PaifuDownloader] HTTP {url} returned unexpected status: {status_code}")
+            except urllib.error.HTTPError as he:
+                print(f"[PaifuDownloader] HTTP endpoint returned status {he.code}: {url}")
+            except urllib.error.URLError as ue:
+                print(f"[PaifuDownloader] HTTP endpoint unreachable: {url} -> {ue.reason}")
+            except Exception as e:
+                print(f"[PaifuDownloader] HTTP request error: {url} -> {e}")
 
+        print(f"[PaifuDownloader] Step 1 (HTTP direct download) failed: No valid paifu found across {len(candidate_urls)} endpoints")
         return None
 
     def _normalize_record_dict(self, record_data: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
@@ -772,6 +793,12 @@ class PaifuDownloader:
         Normalizes various API response formats into standard MahjongSoul game record dict.
         """
         if not isinstance(record_data, dict):
+            return None
+
+        # Check for error responses
+        if record_data.get("error") and not record_data.get("data") and not record_data.get("rounds"):
+            return None
+        if record_data.get("statusCode") == 404 or record_data.get("result") == -1:
             return None
 
         # If wrapped under data or result
@@ -829,16 +856,18 @@ class PaifuDownloader:
     def _fetch_via_unity_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Direct approach for Unity WebGL client:
-        1. Connects to running Unity WebGL browser session via CDP.
-        2. Enables CDP Network monitoring (Network.webSocketFrameReceived & Network.responseReceived).
-        3. Dispatches replay navigation to Unity instance (window.unityInstance.SendMessage or history.pushState).
-        4. Intercepts incoming game packets and decodes authentic paifu record.
+        1. Connects to running Unity WebGL browser session via CDP port 9222.
+        2. Enables Page and Network domains (Page.enable, Network.enable).
+        3. Navigates tab directly to replay URL (https://game.mahjongsoul.com/?paipu={uuid}) via Page.navigate.
+        4. Intercepts incoming WebSocket game packets (wss://jpgs.mahjongsoul.com/) or HTTP responses.
+        5. Decodes and extracts authentic game record actions and player metadata.
         """
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
-            with urllib.request.urlopen(req, timeout=1.0) as resp:
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
-        except Exception:
+        except Exception as e:
+            print(f"[PaifuDownloader] Failed to connect to CDP port {self.cdp_port} to find Unity tab: {e}")
             return None
 
         # Locate MahjongSoul page target
@@ -847,60 +876,42 @@ class PaifuDownloader:
             None
         )
         if not game_target:
+            print(f"[PaifuDownloader] No active MahjongSoul tab found on CDP port {self.cdp_port} among {len(targets)} targets")
             return None
 
         ws_url = game_target["webSocketDebuggerUrl"]
+        target_title = game_target.get("title", "")
+        target_url = game_target.get("url", "")
+        print(f"[PaifuDownloader] Connected to MahjongSoul tab: '{target_title}' (URL: {target_url})")
 
         try:
             import websockets
             import asyncio
 
             async def _intercept_unity():
-                async with websockets.connect(ws_url, open_timeout=2.5) as ws:
+                async with websockets.connect(ws_url, open_timeout=3.0) as ws:
                     captured_record = None
 
-                    # 1. Enable CDP Network and Runtime domains
-                    await ws.send(json.dumps({"id": 1, "method": "Network.enable", "params": {}}))
-                    await ws.send(json.dumps({"id": 2, "method": "Runtime.enable", "params": {}}))
+                    # 1. Enable CDP Page, Network and Runtime domains
+                    await ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
+                    await ws.send(json.dumps({"id": 2, "method": "Network.enable", "params": {}}))
+                    await ws.send(json.dumps({"id": 3, "method": "Runtime.enable", "params": {}}))
 
-                    # 2. Trigger Unity WebGL to fetch paifu replay
-                    kick_script = f"""
-                    (function() {{
-                        let targetUuid = {json.dumps(uuid)};
-                        let triggers = [];
-
-                        // A. Push paipu URL state to browser history
-                        try {{
-                            let newUrl = "/?paipu=" + targetUuid;
-                            window.history.pushState(null, "", newUrl);
-                            window.dispatchEvent(new PopStateEvent("popstate"));
-                            triggers.push("history.pushState");
-                        }} catch (e) {{}}
-
-                        // B. Send message to Unity instance if available
-                        if (window.unityInstance && typeof window.unityInstance.SendMessage === "function") {{
-                            try {{
-                                window.unityInstance.SendMessage("GameMgr", "OnUrlChange", "/?paipu=" + targetUuid);
-                                triggers.push("unityInstance.OnUrlChange");
-                            }} catch (e) {{}}
-                            try {{
-                                window.unityInstance.SendMessage("GameMgr", "OpenRecord", targetUuid);
-                                triggers.push("unityInstance.OpenRecord");
-                            }} catch (e) {{}}
-                        }}
-
-                        return JSON.stringify({{ success: true, triggers: triggers }});
-                    }})()
-                    """
+                    # 2. Trigger direct navigation to replay URL
+                    replay_url = f"https://game.mahjongsoul.com/?paipu={uuid}"
+                    print(f"[PaifuDownloader] Navigating Unity WebGL tab directly to replay URL via Page.navigate:\n  --> {replay_url}")
                     await ws.send(json.dumps({
-                        "id": 3,
-                        "method": "Runtime.evaluate",
-                        "params": {"expression": kick_script, "returnByValue": True}
+                        "id": 4,
+                        "method": "Page.navigate",
+                        "params": {"url": replay_url}
                     }))
 
-                    # 3. Monitor network packets for up to 5 seconds
+                    # 3. Monitor network packets (up to 15 seconds for Unity load and WSS packets)
                     start_t = asyncio.get_event_loop().time()
-                    while asyncio.get_event_loop().time() - start_t < 5.0:
+                    total_ws_frames = 0
+                    print(f"[PaifuDownloader] Monitoring WebSocket frames and network traffic for replay packets (timeout: 15s)...")
+
+                    while asyncio.get_event_loop().time() - start_t < 15.0:
                         try:
                             msg_str = await asyncio.wait_for(ws.recv(), timeout=1.0)
                             msg = json.loads(msg_str)
@@ -909,14 +920,17 @@ class PaifuDownloader:
 
                             # Intercept WebSocket binary frames (Unity WebGL communicates via WSS)
                             if method == "Network.webSocketFrameReceived":
+                                total_ws_frames += 1
                                 resp_data = params.get("response", {})
                                 payload_data = resp_data.get("payloadData", "")
+                                opcode = resp_data.get("opcode")
                                 if payload_data:
                                     try:
                                         raw_bytes = base64.b64decode(payload_data)
-                                        # Check if contains GameDetailRecords or Liqi actions
+                                        # Attempt decode GameDetailRecords / Liqi actions
                                         actions = decode_game_detail_records(raw_bytes)
                                         if actions and len(actions) > 0:
+                                            print(f"[PaifuDownloader] Intercepted paifu packet in WebSocket frame #{total_ws_frames} ({len(actions)} actions found)!")
                                             captured_record = {
                                                 "uuid": uuid,
                                                 "head": {},
@@ -932,14 +946,14 @@ class PaifuDownloader:
                                 r_url = resp_info.get("url", "")
                                 req_id = params.get("requestId")
                                 if ("record" in r_url or "paipu" in r_url or uuid in r_url) and req_id:
-                                    # Request response body
+                                    print(f"[PaifuDownloader] Intercepted candidate HTTP response: {r_url}")
                                     body_cmd_id = 999
                                     await ws.send(json.dumps({
                                         "id": body_cmd_id,
                                         "method": "Network.getResponseBody",
                                         "params": {"requestId": req_id}
                                     }))
-                                    body_resp_str = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                                    body_resp_str = await asyncio.wait_for(ws.recv(), timeout=2.5)
                                     body_resp = json.loads(body_resp_str)
                                     body_result = body_resp.get("result", {})
                                     body_text = body_result.get("body", "")
@@ -949,6 +963,7 @@ class PaifuDownloader:
                                             raw_b = base64.b64decode(body_text)
                                             actions = decode_game_detail_records(raw_b)
                                             if actions:
+                                                print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from HTTP response body!")
                                                 captured_record = {
                                                     "uuid": uuid,
                                                     "head": {},
@@ -960,14 +975,22 @@ class PaifuDownloader:
                                                 parsed = json.loads(body_text)
                                                 norm = self._normalize_record_dict(parsed, uuid)
                                                 if norm:
+                                                    print(f"[PaifuDownloader] Successfully extracted JSON record from HTTP response body!")
                                                     captured_record = norm
                                                     break
                                             except Exception:
                                                 pass
                         except asyncio.TimeoutError:
+                            elapsed = int(asyncio.get_event_loop().time() - start_t)
+                            if elapsed % 4 == 0:
+                                print(f"[PaifuDownloader] Waiting for Unity replay packets... ({elapsed}s elapsed, {total_ws_frames} WS frames received)")
                             continue
-                        except Exception:
+                        except Exception as loop_e:
+                            print(f"[PaifuDownloader] Unity monitoring loop error: {loop_e}")
                             break
+
+                    if not captured_record:
+                        print(f"[PaifuDownloader] Unity WebGL interception timed out after 15s (Total WS frames received: {total_ws_frames})")
 
                     return captured_record
 
@@ -981,7 +1004,7 @@ class PaifuDownloader:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(lambda: asyncio.run(_intercept_unity()))
-                        rec = future.result(timeout=10.0)
+                        rec = future.result(timeout=20.0)
                 else:
                     rec = asyncio.run(_intercept_unity())
 
@@ -991,7 +1014,8 @@ class PaifuDownloader:
             except Exception as e:
                 print(f"[PaifuDownloader] Unity WebGL CDP interception failed: {e}")
                 return None
-        except Exception:
+        except Exception as e:
+            print(f"[PaifuDownloader] Unity WebGL CDP connection failed: {e}")
             return None
 
         return None
@@ -1001,42 +1025,57 @@ class PaifuDownloader:
         Multi-strategy game record fetching:
         1. HTTP Direct Download (Highest Priority):
            Directly fetches paifu packet from MahjongSoul official/CDN or browser in-session endpoints.
-        2. Unity WebGL CDP Network Interception:
-           Hooks Unity WebGL client via CDP Network events and triggers replay fetch.
+        2. Unity WebGL Page.navigate + CDP Network Interception:
+           Navigates MahjongSoul tab directly to replay URL and captures game packets over WSS.
         3. Legacy RPC Fallback:
            Executes app.NetAgent RPC for older client environments.
         """
+        print(f"[PaifuDownloader] === Starting authentic paifu fetch for UUID: {uuid} ===")
+
         # 1. Primary: Direct HTTP(S) download (Fastest & most robust)
+        print(f"[PaifuDownloader] [Step 1/3] Direct HTTP / Public API fetch...")
         http_record = self._fetch_from_http(uuid)
         if http_record:
             return http_record
 
-        # 2. Secondary: Unity WebGL CDP Network Interception
+        # 2. Secondary: Unity WebGL Page.navigate + CDP Network Interception
+        print(f"[PaifuDownloader] [Step 2/3] Unity WebGL Page.navigate & CDP WebSocket interception...")
         unity_record = self._fetch_via_unity_cdp(uuid)
         if unity_record:
             return unity_record
 
         # 3. Tertiary: Legacy RPC fallback (app.NetAgent)
+        print(f"[PaifuDownloader] [Step 3/3] Falling back to legacy app.NetAgent RPC...")
         rpc_record = self._fetch_via_rpc(uuid)
         if rpc_record:
             print(f"[PaifuDownloader] Successfully fetched game record via legacy RPC for: {uuid}")
             return rpc_record
 
+        print(f"[PaifuDownloader] All 3 fetch strategies exhausted for UUID: {uuid}")
         return None
 
 
 def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
     """
-    Decodes GameDetailRecords protobuf payload (often gzip-compressed) from Majsoul RPC.
+    Decodes GameDetailRecords protobuf payload (often gzip-compressed) from Majsoul RPC or WebSocket frames.
     Extracts repeated Wrapper messages containing action_name and decoded payload data.
     """
     if not raw_bytes:
         return []
     import gzip
+    data = None
     try:
         data = gzip.decompress(raw_bytes)
     except Exception:
-        data = raw_bytes
+        # Search for embedded gzip magic header 0x1f 0x8b if buried inside packet framing
+        idx = raw_bytes.find(b"\x1f\x8b")
+        if idx != -1:
+            try:
+                data = gzip.decompress(raw_bytes[idx:])
+            except Exception:
+                pass
+        if data is None:
+            data = raw_bytes
 
     actions: List[Dict[str, Any]] = []
     fields = decode_raw_protobuf(data)

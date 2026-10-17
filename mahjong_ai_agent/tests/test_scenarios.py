@@ -3388,11 +3388,11 @@ def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
             method = msg.get("method")
             cid = msg.get("id")
 
-            if method in ("Network.enable", "Runtime.enable"):
+            if method in ("Page.enable", "Network.enable", "Runtime.enable"):
                 await self._incoming.put(json.dumps({"id": cid, "result": {}}))
-            elif method == "Runtime.evaluate":
-                # Acknowledge kick_script
-                await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "string", "value": json.dumps({"success": True})}}}))
+            elif method == "Page.navigate":
+                # Acknowledge Page.navigate
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
                 # Emit Network.responseReceived with paipu url
                 await self._incoming.put(json.dumps({
                     "method": "Network.responseReceived",
@@ -3429,5 +3429,96 @@ def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
     assert res.get("uuid") == test_uuid
     assert len(res.get("rounds", [])) == 1
     assert res.get("accounts", [])[0]["nickname"] == "genta2223"
+
+
+def test_paifu_downloader_unity_webgl_websocket_binary_frame(monkeypatch, tmp_path):
+    """
+    Verifies that PaifuDownloader intercepts binary WebSocket frames (WSS) and
+    extracts game actions via decode_game_detail_records.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader, LiqiProtoDecoder
+    import json
+    import gzip
+    import base64
+    import asyncio
+    import websockets
+    import urllib.request
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-ws-frame-uuid"
+
+    # Construct mock protobuf payload wrapped in gzip
+    # Field 1: repeated wrapper (tag 1: (1<<3)|2 = 0x0a)
+    name_bytes = b"RecordNewRound"
+    wrapper_bytes = b"\x0a" + bytes([len(name_bytes)]) + name_bytes + b"\x12\x02\x08\x00"
+    payload = b"\x0a" + bytes([len(wrapper_bytes)]) + wrapper_bytes
+    gzipped = gzip.compress(payload)
+    b64_payload = base64.b64encode(gzipped).decode("ascii")
+
+    targets_data = [
+        {
+            "id": "target-unity",
+            "type": "page",
+            "title": "雀魂 - Unity WebGL",
+            "url": "https://game.mahjongsoul.com/",
+            "webSocketDebuggerUrl": "ws://dummy/unity_ws"
+        }
+    ]
+
+    class MockCDPTargetResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+            self.status = 200
+            self.headers = {}
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockCDPTargetResponse(json.dumps(targets_data).encode("utf-8")))
+
+    class MockBinaryWSWebSocket:
+        def __init__(self, url):
+            self.url = url
+            self._incoming = asyncio.Queue()
+
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def send(self, msg_str):
+            msg = json.loads(msg_str)
+            cid = msg.get("id")
+            method = msg.get("method")
+            if method in ("Page.enable", "Network.enable", "Runtime.enable"):
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
+            elif method == "Page.navigate":
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
+                # Push binary WebSocket frame containing gzipped game detail records
+                await self._incoming.put(json.dumps({
+                    "method": "Network.webSocketFrameReceived",
+                    "params": {
+                        "response": {
+                            "opcode": 2,
+                            "payloadData": b64_payload
+                        }
+                    }
+                }))
+
+        async def recv(self):
+            return await self._incoming.get()
+
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockBinaryWSWebSocket(url))
+    monkeypatch.setattr(downloader, "_fetch_from_http", lambda uuid: None)
+
+    res = downloader._fetch_from_remote(test_uuid)
+    assert res is not None
+    assert res.get("uuid") == test_uuid
+    assert len(res.get("rounds", [])) == 1
+    assert res["rounds"][0]["actions"][0]["action_name"] == "RecordNewRound"
+
 
 
