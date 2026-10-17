@@ -691,14 +691,19 @@ class MahjongHUDApp:
                     agent.config.setdefault("mouse_control", {})["enable_pyautogui"] = True
                     agent.action_controller.mouse_cfg["enable_pyautogui"] = True
 
+                # Link active profiler with agent.profiler for hybrid consistency
+                if self.active_profiler and self.active_profiler.profiles:
+                    for p_name, p_prof in self.active_profiler.profiles.items():
+                        if p_name not in agent.profiler.profiles:
+                            agent.profiler.profiles[p_name] = p_prof
+                self.active_profiler = agent.profiler
+
                 # Wire up recommendation and status callbacks
                 agent.action_controller.on_recommendation_callback = self._on_recommendation
                 agent.status_callback = self._on_agent_status
 
                 # Exploit Mode integration
                 if self.is_exploit_mode.get():
-                    if self.active_profiler and self.active_profiler.profiles:
-                        agent.modifier.profiler = self.active_profiler
                     if self.active_custom_exploit:
                         agent.modifier.custom_exploit = self.active_custom_exploit
                         self._log(f"[Exploit Mode] 適用中: {self.active_custom_exploit.get('exploit_note')}")
@@ -783,6 +788,7 @@ class MahjongHUDApp:
                 round_info = status_info.get("round_info", "")
                 seat_name = status_info.get("seat_name", "")
                 event_type = status_info.get("event_type", "")
+                profiler_status = status_info.get("profiler_status", "")
                 trace_log("GUI_STATUS_UPDATE", f"Round: {round_info} Seat: {seat_name} Event: {event_type}")
                 if round_info:
                     text = f"対局中: {round_info} | 自席: {seat_name}"
@@ -790,6 +796,12 @@ class MahjongHUDApp:
                     self.lbl_conn_status.config(text="● 対局中 (監視同期中)", fg=self.c_green)
                 elif event_type in ("hora", "ryukyoku"):
                     self.lbl_round_info.config(text="局終了 / 次局待機中", fg=self.c_text_dim)
+
+                if profiler_status and not self.is_exploit_mode.get():
+                    self.lbl_exploit_summary.config(text=profiler_status, fg=self.c_green)
+
+                if event_type in ("hora", "ryukyoku"):
+                    self._update_exploit_summary()
             except Exception as e:
                 tb = traceback.format_exc()
                 trace_log("GUI_STATUS_ERR", f"Exception in _on_agent_status: {e}\n{tb}")

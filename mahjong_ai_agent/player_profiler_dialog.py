@@ -227,8 +227,9 @@ class PlayerProfilerDialog(tk.Toplevel):
 
         # Header
         self.lbl_p_name.config(text=f"【{prof.display_name}】 ({prof.archetype})")
+        live_info = f" [当対局Live: {prof.live_rounds}局]" if prof.live_rounds > 0 else ""
         self.lbl_p_meta.config(
-            text=f"総対局: {prof.total_games}半荘 / {prof.total_rounds}局 | リーチ: {prof.riichi_count}回 | 和了: {prof.hora_count}回 | 放銃: {prof.deal_in_count}回"
+            text=f"総対局: {prof.total_games}半荘 / {prof.total_rounds}局{live_info} | リーチ: {prof.riichi_count}回 | 和了: {prof.hora_count}回 | 放銃: {prof.deal_in_count}回"
         )
 
         # Clear old badges

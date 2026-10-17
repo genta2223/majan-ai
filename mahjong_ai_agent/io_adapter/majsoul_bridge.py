@@ -115,6 +115,9 @@ class MajsoulBridge:
     def __init__(self, my_seat: int = 0, vision_fallback_enabled: bool = True):
         self.my_seat = my_seat
         self.my_account_id: Optional[int] = None
+        self.current_game_uuid: Optional[str] = None
+        self.match_mode: str = "hanchan"       # "tonpuu" or "hanchan"
+        self.player_nicknames: List[str] = ["", "", "", ""]
         self.on_seat_changed: Optional[Callable[[int], None]] = None
         self._current_doras: List[str] = []
         self._last_discard_seat: Optional[int] = None
@@ -154,6 +157,9 @@ class MajsoulBridge:
                     acc_id = item.get("account_id") or item.get("accountId") or item.get("id")
                     if "seat" in item and 0 <= safe_coerce_int(item["seat"], -1) <= 3:
                         seat_val = safe_coerce_int(item["seat"], idx)
+                    nick = item.get("nickname") or item.get("name")
+                    if nick and 0 <= seat_val < 4:
+                        self.player_nicknames[seat_val] = str(nick)
                 elif isinstance(item, int):
                     acc_id = item
                     seat_val = idx
@@ -175,6 +181,9 @@ class MajsoulBridge:
             acc_id = safe_coerce_int(data.get("account_id", 0), 0)
             if acc_id > 0:
                 self.set_my_account_id(acc_id)
+            uuid = data.get("game_uuid") or data.get("uuid")
+            if uuid:
+                self.current_game_uuid = str(uuid)
             return []
 
         # 2. Player info updates or Auth responses
@@ -182,6 +191,9 @@ class MajsoulBridge:
             plist = data.get("players") or data.get("player_list") or data.get("seat_list") or []
             if plist:
                 self.resolve_seat_from_player_list(plist)
+            uuid = data.get("game_uuid") or data.get("uuid")
+            if uuid:
+                self.current_game_uuid = str(uuid)
             return []
 
         if clean_name in ("ActionNewRound", "RecordNewRound", "ActionMJStart", "NotifyRoomGameStart"):
@@ -291,7 +303,7 @@ class MajsoulBridge:
                 # Keep tehais[oya] at 13 tiles; the following tsumo event will transition hand to 14 tiles
                 tehais[oya] = list(tehais[oya][:13])
 
-            events.append({
+            start_event: Dict[str, Any] = {
                 "type": "start_kyoku",
                 "action_name": clean_name,
                 "bakaze": bakaze,
@@ -302,7 +314,15 @@ class MajsoulBridge:
                 "scores": scores,
                 "tehais": tehais,
                 "dora_marker": dora_marker,
-            })
+            }
+            if any(self.player_nicknames):
+                start_event["names"] = list(self.player_nicknames)
+            if self.current_game_uuid:
+                start_event["game_uuid"] = self.current_game_uuid
+            if self.match_mode:
+                start_event["match_mode"] = self.match_mode
+
+            events.append(start_event)
 
             # If dealer has initial draw tile, immediately trigger initial draw event
             if dealer_tsumo_tile:

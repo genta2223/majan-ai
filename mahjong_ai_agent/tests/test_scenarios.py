@@ -4976,6 +4976,185 @@ def test_dynamic_seat_resolution_fallback_to_plain_tiles():
     assert bridge2.my_seat == 3, f"Expected fallback to seat 3, got {bridge2.my_seat}"
 
 
+@pytest.mark.asyncio
+async def test_live_stream_opponent_profiling_and_tactical_adaptation():
+    """
+    Test 1: Verify that real-time live match events (chi/pon, reach, dahai pushes/folds)
+    are immediately ingested into OpponentProfiler during live play and dynamically reflected
+    in StrategyModifier candidate evaluation.
+    """
+    from main import MahjongAIAgent
+    from core.opponent_profiler import OpponentProfiler
+
+    agent = MahjongAIAgent(my_actor_id=0, apply_sleep=False, output_mode="text_only")
+    assert agent.profiler is not None
+
+    # 1. Start game with 3 named opponents
+    start_game_ev = {
+        "type": "start_game",
+        "names": ["Me", "BerserkerEnemy", "NormalEnemy", "WallEnemy"],
+        "game_uuid": "live_game_test_001",
+        "match_mode": "hanchan"
+    }
+    await agent.handle_event(start_game_ev)
+    assert "BerserkerEnemy" in agent.profiler.profiles
+    assert "NormalEnemy" in agent.profiler.profiles
+
+    # 2. Round 1 starts: East 1, Oya = 1 (BerserkerEnemy)
+    start_kyoku_ev = {
+        "type": "start_kyoku",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 1,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [
+            ["1m", "2m", "3m", "4m", "5m", "6p", "7p", "8p", "1s", "2s", "3s", "1z", "2z"],
+            ["?"] * 13, ["?"] * 13, ["?"] * 13
+        ],
+        "dora_marker": "1p"
+    }
+    await agent.handle_event(start_kyoku_ev)
+    assert agent.profiler.live_round_count == 1
+    assert agent.profiler.profiles["BerserkerEnemy"].live_rounds == 1
+
+    # 3. P1 (BerserkerEnemy) declares pon of Green Dragon (F)
+    pon_ev = {
+        "type": "pon",
+        "actor": 1,
+        "target": 0,
+        "pai": "F",
+        "consumed": ["F", "F"]
+    }
+    await agent.handle_event(pon_ev)
+    p1_prof = agent.profiler.profiles["BerserkerEnemy"]
+    assert p1_prof.call_count == 1
+    assert p1_prof.live_call_count == 1
+    assert p1_prof.yakuhai_call_count == 1
+
+    # 4. P1 declares Riichi
+    reach_ev = {"type": "reach", "actor": 1}
+    await agent.handle_event(reach_ev)
+    assert p1_prof.riichi_count == 1
+    assert p1_prof.live_riichi_count == 1
+
+    # 5. Under P1's riichi, P2 (NormalEnemy) pushes an unsafe tile '5s'
+    p2_dahai_unsafe = {"type": "dahai", "actor": 2, "pai": "5s", "tsumogiri": False}
+    await agent.handle_event(p2_dahai_unsafe)
+    p2_prof = agent.profiler.profiles["NormalEnemy"]
+    assert p2_prof.aggressiveness_total_turns == 1
+    assert p2_prof.live_aggressiveness_turns == 1
+    assert p2_prof.aggressiveness_pushes == 1
+    assert p2_prof.live_aggressiveness_pushes == 1
+
+    # 6. Self draws tile -> decision required
+    tsumo_ev = {"type": "tsumo", "actor": 0, "pai": "8m"}
+    action = await agent.handle_event(tsumo_ev)
+    assert action is not None
+    assert action.action_type in ("dahai", "reach")
+
+    # 7. End of round via Hora: P1 wins
+    hora_ev = {
+        "type": "hora",
+        "actor": 1,
+        "target": 2,
+        "score": 3900,
+        "deltas": [-3900, 3900, -3900, 0]
+    }
+    await agent.handle_event(hora_ev)
+    assert p1_prof.hora_count == 1
+    assert p1_prof.live_hora_count == 1
+    assert p2_prof.deal_in_count == 1
+    assert p2_prof.live_deal_in_count == 1
+    # Check that game_uuid was registered
+    assert "live_game_test_001" in p1_prof.recorded_game_uuids
+
+
+def test_game_uuid_deduplication_between_live_and_paifu_import():
+    """
+    Test 2: Verify that processing live events and then importing the same match's paifu
+    with matching game_uuid does NOT double-count statistics.
+    """
+    from core.opponent_profiler import OpponentProfiler
+
+    profiler = OpponentProfiler()
+    uuid = "match_uuid_dedup_998877"
+
+    # 1. Simulate real-time live events during the match
+    live_events = [
+        {"type": "start_game", "names": ["Player0", "EnemyA", "EnemyB", "EnemyC"], "game_uuid": uuid},
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "kyotaku": 0, "oya": 1},
+        {"type": "reach", "actor": 1},
+        {"type": "dahai", "actor": 1, "pai": "9m", "tsumogiri": True},
+        {"type": "hora", "actor": 1, "target": 2, "score": 8000},
+        {"type": "end_kyoku"}
+    ]
+    for ev in live_events:
+        profiler.consume_live_event(ev)
+
+    enemy_a = profiler.profiles["EnemyA"]
+    assert enemy_a.total_rounds == 1
+    assert enemy_a.hora_count == 1
+    assert enemy_a.riichi_count == 1
+    assert uuid in enemy_a.recorded_game_uuids
+
+    # 2. Later, paifu sniffer imports the exact same game with identical game_uuid
+    profiler.analyze_game_events(live_events, game_uuid=uuid)
+
+    # 3. Deduplication guard MUST prevent double-counting
+    assert enemy_a.total_rounds == 1, f"Double-counted total_rounds: {enemy_a.total_rounds}"
+    assert enemy_a.hora_count == 1, f"Double-counted hora_count: {enemy_a.hora_count}"
+    assert enemy_a.riichi_count == 1, f"Double-counted riichi_count: {enemy_a.riichi_count}"
+
+
+def test_bayesian_smoothing_and_live_session_blending():
+    """
+    Test 3: Verify that Bayesian smoothing prevents extreme 0%/100% distortions on small sample sizes,
+    and live session trends are blended appropriately (30% - 40%) into effective metrics.
+    """
+    from core.opponent_profiler import PlayerProfile, OpponentProfiler
+
+    # 1. Create a profile with only 1 round played (1 win, 0 calls)
+    prof = PlayerProfile(name="SmallSamplePlayer")
+    prof.total_rounds = 1
+    prof.hora_count = 1
+    prof.rounds_with_call = 0
+    prof.compute_metrics()
+
+    # Raw observed rates are extreme: 100% win, 0% calls
+    assert prof.hora_rate == 1.0
+    assert prof.open_rate == 0.0
+
+    # Bayesian smoothing with N_prior=10 mitigates extreme skew:
+    # Expected smoothed_hora_rate = (1 + 10 * 0.22) / (1 + 10) = 3.2 / 11 ~= 0.291
+    assert 0.25 <= prof.smoothed_hora_rate <= 0.35, f"Smoothed hora rate {prof.smoothed_hora_rate} not smoothed"
+    # Expected smoothed_open_rate = (0 + 10 * 0.30) / (1 + 10) = 3.0 / 11 ~= 0.273
+    assert 0.20 <= prof.smoothed_open_rate <= 0.32, f"Smoothed open rate {prof.smoothed_open_rate} not smoothed"
+
+    # 2. Test live session trend blending:
+    # SmallSamplePlayer historically melds little, but in the current live match, melded in 3 out of 3 rounds!
+    prof.live_rounds = 3
+    prof.live_rounds_with_call = 3
+
+    # Effective metrics blend historical smoothed (~0.273) with live (1.00) with weight ~0.35
+    eff = prof.get_effective_metrics(live_weight=0.35)
+    # Expected effective open rate ~= 0.65 * 0.273 + 0.35 * 1.0 ~= 0.177 + 0.35 ~= 0.527
+    assert eff["open_rate"] > prof.smoothed_open_rate, "Live high-calling trend was not reflected"
+    assert 0.45 <= eff["open_rate"] <= 0.60, f"Blended open_rate {eff['open_rate']} outside expected range"
+
+    # 3. Test Tonpuu (East-only) mode rapid speed exploitation:
+    profiler = OpponentProfiler()
+    profiler.profiles["SmallSamplePlayer"] = prof
+    profiler.set_match_mode("tonpuu")
+
+    # In Tonpuu mode with elevated call rate (eff_open > 0.35), danger penalty must be boosted by 1.3x
+    modifiers = profiler.get_exploit_modifiers("SmallSamplePlayer", current_bakaze="E", is_enemy_calling=True)
+    assert modifiers["danger_penalty_mult"] >= 1.30, f"Tonpuu call alert multiplier {modifiers['danger_penalty_mult']} < 1.30"
+    assert "[東風速攻警戒 1.3x]" in modifiers["exploit_note"]
+
+
+
 
 
 

@@ -98,15 +98,39 @@ class StrategyModifier:
             attack_scale *= self.custom_exploit.get("attack_scale_mult", 1.0)
             riichi_penalty_weight *= self.custom_exploit.get("danger_penalty_mult", 1.0)
             exploit_note = self.custom_exploit.get("exploit_note", "")
-        elif active_riichis and self.profiler:
-            primary_riichi_actor = active_riichis[0]
-            if primary_riichi_actor < len(state_mgr.round_state.players):
-                enemy_name = state_mgr.round_state.players[primary_riichi_actor].name
-                if enemy_name:
-                    exploit = self.profiler.get_exploit_modifiers(enemy_name)
+        elif self.profiler and state_mgr.round_state:
+            cur_bakaze = state_mgr.round_state.bakaze
+            if active_riichis:
+                primary_riichi_actor = active_riichis[0]
+                if primary_riichi_actor < len(state_mgr.round_state.players):
+                    enemy_p = state_mgr.round_state.players[primary_riichi_actor]
+                    enemy_name = enemy_p.name
+                    if enemy_name:
+                        enemy_melds = getattr(enemy_p, "melds", getattr(enemy_p, "furo", []))
+                        exploit = self.profiler.get_exploit_modifiers(
+                            enemy_name,
+                            current_bakaze=cur_bakaze,
+                            is_enemy_calling=len(enemy_melds) > 0
+                        )
+                        defense_scale *= exploit.get("defense_scale_mult", 1.0)
+                        attack_scale *= exploit.get("attack_scale_mult", 1.0)
+                        riichi_penalty_weight *= exploit.get("danger_penalty_mult", 1.0)
+                        exploit_note = exploit.get("exploit_note", "")
+            else:
+                calling_actors = [
+                    p.actor_id for p in state_mgr.round_state.players
+                    if p.actor_id != state_mgr.my_actor_id and len(getattr(p, "melds", getattr(p, "furo", []))) > 0 and p.name
+                ]
+                if calling_actors:
+                    primary_caller = calling_actors[0]
+                    enemy_p = state_mgr.round_state.players[primary_caller]
+                    exploit = self.profiler.get_exploit_modifiers(
+                        enemy_p.name,
+                        current_bakaze=cur_bakaze,
+                        is_enemy_calling=True
+                    )
                     defense_scale *= exploit.get("defense_scale_mult", 1.0)
                     attack_scale *= exploit.get("attack_scale_mult", 1.0)
-                    riichi_penalty_weight *= exploit.get("danger_penalty_mult", 1.0)
                     exploit_note = exploit.get("exploit_note", "")
 
         shanten_push_threshold = self.riichi_cfg.get("push_shanten_threshold", 1)

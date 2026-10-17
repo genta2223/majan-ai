@@ -60,6 +60,11 @@ class MahjongAIAgent:
             max_inference_time_ms=engine_cfg.get("max_inference_time_ms", 200)
         )
         self.modifier = StrategyModifier(self.config)
+        from core.opponent_profiler import OpponentProfiler
+        prof_path = self.config.get("opponent_profiles_path")
+        self.profiler = self.modifier.profiler or OpponentProfiler(prof_path)
+        self.modifier.profiler = self.profiler
+
         self.action_controller = ActionController(self.config)
         self.status_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         # Vision is a strict last-resort fallback. Once packet decoding delivered a real hand
@@ -67,8 +72,20 @@ class MahjongAIAgent:
         self.vision_fallback_enabled: bool = bool(self.config.get("vision_fallback_enabled", True))
         self.packet_hand_trusted: bool = False
 
+    def set_my_actor_id(self, seat: int) -> None:
+        """Dynamically updates self actor ID and state manager."""
+        self.my_actor_id = seat
+        self.state_mgr.my_actor_id = seat
+
     async def handle_event(self, event: Dict[str, Any]) -> Optional[OutputAction]:
         event_type = event.get("type")
+
+        # 0. Real-time opponent profiling stream feed
+        if self.profiler:
+            try:
+                self.profiler.consume_live_event(event)
+            except Exception as pe:
+                print(f"[Main Profiler] Warning processing live event: {pe}")
 
         # 0. Automatic Seat Detection from server messages
         if event_type == "start_kyoku":
@@ -171,11 +188,19 @@ class MahjongAIAgent:
                 round_st = self.state_mgr.round_state
                 round_str = f"{round_st.bakaze}{round_st.kyoku}局 {round_st.honba}本場" if round_st else "対局中"
                 seat_str = ["東家", "南家", "西家", "北家"][self.my_actor_id] if 0 <= self.my_actor_id <= 3 else f"P{self.my_actor_id}"
+                
+                profiler_status = ""
+                if self.profiler:
+                    mode_name = "東風戦" if self.profiler.match_mode == "tonpuu" else "半荘戦"
+                    live_rds = self.profiler.live_round_count
+                    profiler_status = f"[Live学習] {mode_name}モード: {live_rds}局蓄積済 (牌譜データとハイブリッド統合中)"
+
                 self.status_callback({
                     "status": "in_game",
                     "round_info": round_str,
                     "seat_name": seat_str,
                     "event_type": event_type,
+                    "profiler_status": profiler_status,
                 })
             except Exception:
                 pass
