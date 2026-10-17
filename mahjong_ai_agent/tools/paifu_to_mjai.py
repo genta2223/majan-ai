@@ -222,254 +222,351 @@ class PaifuDownloader:
             import asyncio
 
             async def _query():
-                async with websockets.connect(target_ws_url, open_timeout=2.5) as ws:
-                    js_code = f"""
-                    (async function() {{
-                        try {{
-                            let targetUuid = "{uuid}";
+                async with websockets.connect(target_ws_url, open_timeout=3.0) as ws:
+                    msg_counter = 100
+                    discovered_contexts = []
+                    pending_responses = {}
 
-                            function findGameContext() {{
-                                let contexts = [window];
-                                let visited = new Set();
-                                try {{
-                                    let queue = [window];
-                                    while (queue.length > 0) {{
-                                        let cur = queue.shift();
-                                        if (!cur || visited.has(cur)) continue;
-                                        try {{ visited.add(cur); }} catch (e) {{}}
+                    async def _reader():
+                        try:
+                            while True:
+                                msg_str = await ws.recv()
+                                msg = json.loads(msg_str)
+                                method = msg.get("method")
+                                if method == "Runtime.executionContextCreated":
+                                    ctx_info = msg.get("params", {}).get("context", {})
+                                    cid = ctx_info.get("id")
+                                    if cid is not None and cid not in discovered_contexts:
+                                        discovered_contexts.append(cid)
+                                elif "id" in msg:
+                                    mid = msg["id"]
+                                    if mid in pending_responses:
+                                        fut = pending_responses.pop(mid)
+                                        if not fut.done():
+                                            fut.set_result(msg)
+                                    elif pending_responses and ("result" in msg or "error" in msg):
+                                        # Fallback for mock responses that might have hardcoded ID
+                                        first_mid = next(iter(pending_responses.keys()))
+                                        fut = pending_responses.pop(first_mid)
+                                        if not fut.done():
+                                            fut.set_result(msg)
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
 
-                                        try {{
-                                            if (cur.frames) {{
-                                                for (let i = 0; i < cur.frames.length; i++) {{
-                                                    try {{
-                                                        let f = cur.frames[i];
-                                                        if (f && !visited.has(f)) {{
-                                                            contexts.push(f);
-                                                            queue.push(f);
-                                                        }}
-                                                    }} catch (e) {{}}
+                    async def _send_cmd(method: str, params: dict, timeout=5.0):
+                        nonlocal msg_counter
+                        msg_counter += 1
+                        mid = msg_counter
+                        loop = asyncio.get_running_loop()
+                        fut = loop.create_future()
+                        pending_responses[mid] = fut
+                        cmd = {"id": mid, "method": method, "params": params}
+                        await ws.send(json.dumps(cmd))
+                        return await asyncio.wait_for(fut, timeout=timeout)
+
+                    reader_task = asyncio.create_task(_reader())
+                    try:
+                        # 1. Enable Runtime to receive executionContextCreated notifications
+                        try:
+                            await _send_cmd("Runtime.enable", {}, timeout=1.5)
+                            await asyncio.sleep(0.08)
+                        except Exception:
+                            pass
+
+                        # 2. Build candidate context IDs to probe
+                        candidate_cids = []
+                        for cid in discovered_contexts + [1, 2, 3, 4, 5, 6, 7, 8] + [None]:
+                            if cid not in candidate_cids:
+                                candidate_cids.append(cid)
+
+                        # 3. Probe execution contexts for window.app.NetAgent
+                        target_context_id = None
+                        probe_expr = "Boolean((typeof app !== 'undefined' && app && app.NetAgent) || (window.app && window.app.NetAgent))"
+                        for cid in candidate_cids:
+                            params = {"expression": probe_expr, "returnByValue": True}
+                            if cid is not None:
+                                params["contextId"] = cid
+                            try:
+                                probe_resp = await _send_cmd("Runtime.evaluate", params, timeout=1.2)
+                                val = probe_resp.get("result", {}).get("result", {}).get("value")
+                                if val is True:
+                                    target_context_id = cid
+                                    print(f"[PaifuDownloader] Identified MahjongSoul game context: contextId={cid}")
+                                    break
+                            except Exception:
+                                continue
+
+                        if target_context_id is None:
+                            probe_ui_expr = "Boolean((typeof uiscript !== 'undefined' && uiscript && uiscript.UI_GameRecord) || (window.uiscript && window.uiscript.UI_GameRecord))"
+                            for cid in candidate_cids:
+                                params = {"expression": probe_ui_expr, "returnByValue": True}
+                                if cid is not None:
+                                    params["contextId"] = cid
+                                try:
+                                    probe_resp = await _send_cmd("Runtime.evaluate", params, timeout=1.2)
+                                    val = probe_resp.get("result", {}).get("result", {}).get("value")
+                                    if val is True:
+                                        target_context_id = cid
+                                        print(f"[PaifuDownloader] Identified MahjongSoul UI context: contextId={cid}")
+                                        break
+                                except Exception:
+                                    continue
+
+                        js_code = f"""
+                        (async function() {{
+                            try {{
+                                let targetUuid = "{uuid}";
+
+                                function findGameContext() {{
+                                    try {{
+                                        if (typeof app !== "undefined" && app && app.NetAgent) return (typeof window !== "undefined" ? window : globalThis);
+                                        if (typeof window !== "undefined" && window.app && window.app.NetAgent) return window;
+                                        if (typeof uiscript !== "undefined" && uiscript && uiscript.UI_GameRecord) return (typeof window !== "undefined" ? window : globalThis);
+                                        if (typeof window !== "undefined" && window.uiscript && window.uiscript.UI_GameRecord) return window;
+                                    }} catch (e) {{}}
+
+                                    let contexts = (typeof window !== "undefined" ? [window] : []);
+                                    let visited = new Set();
+                                    try {{
+                                        let queue = (typeof window !== "undefined" ? [window] : []);
+                                        while (queue.length > 0) {{
+                                            let cur = queue.shift();
+                                            if (!cur || visited.has(cur)) continue;
+                                            try {{ visited.add(cur); }} catch (e) {{}}
+
+                                            try {{
+                                                if (cur.frames) {{
+                                                    for (let i = 0; i < cur.frames.length; i++) {{
+                                                        try {{
+                                                            let f = cur.frames[i];
+                                                            if (f && !visited.has(f)) {{
+                                                                contexts.push(f);
+                                                                queue.push(f);
+                                                            }}
+                                                        }} catch (e) {{}}
+                                                    }}
                                                 }}
-                                            }}
-                                        }} catch (e) {{}}
+                                            }} catch (e) {{}}
 
-                                        try {{
-                                            if (cur.document) {{
-                                                let iframes = cur.document.querySelectorAll("iframe, frame");
-                                                for (let i = 0; i < iframes.length; i++) {{
-                                                    try {{
-                                                        let cw = iframes[i].contentWindow;
-                                                        if (cw && !visited.has(cw)) {{
-                                                            contexts.push(cw);
-                                                            queue.push(cw);
-                                                        }}
-                                                    }} catch (e) {{}}
+                                            try {{
+                                                if (cur.document) {{
+                                                    let iframes = cur.document.querySelectorAll("iframe, frame");
+                                                    for (let i = 0; i < iframes.length; i++) {{
+                                                        try {{
+                                                            let cw = iframes[i].contentWindow;
+                                                            if (cw && !visited.has(cw)) {{
+                                                                contexts.push(cw);
+                                                                queue.push(cw);
+                                                            }}
+                                                        }} catch (e) {{}}
+                                                    }}
                                                 }}
-                                            }}
+                                            }} catch (e) {{}}
+                                        }}
+                                    }} catch (e) {{}}
+
+                                    for (let ctx of contexts) {{
+                                        try {{
+                                            if (ctx && ctx.app && ctx.app.NetAgent) return ctx;
                                         }} catch (e) {{}}
                                     }}
-                                }} catch (e) {{}}
-
-                                for (let ctx of contexts) {{
-                                    try {{
-                                        if (ctx && ctx.app && ctx.app.NetAgent) return ctx;
-                                    }} catch (e) {{}}
+                                    for (let ctx of contexts) {{
+                                        try {{
+                                            if (ctx && ctx.uiscript && ctx.uiscript.UI_GameRecord) return ctx;
+                                        }} catch (e) {{}}
+                                    }}
+                                    return null;
                                 }}
-                                for (let ctx of contexts) {{
+
+                                let gameCtx = findGameContext();
+                                if (!gameCtx) {{
+                                    let iframeCount = 0;
                                     try {{
-                                        if (ctx && ctx.uiscript && ctx.uiscript.UI_GameRecord) return ctx;
+                                        iframeCount = document.querySelectorAll("iframe, frame").length;
                                     }} catch (e) {{}}
-                                }}
-                                return null;
-                            }}
+                                    let windowKeys = [];
+                                    try {{
+                                        windowKeys = Object.keys(window).filter(function(k) {{
+                                            return !k.startsWith("webkit") && !k.startsWith("chrome") && typeof window[k] !== "function";
+                                        }}).slice(0, 30);
+                                    }} catch (e) {{}}
 
-                            let gameCtx = findGameContext();
-                            if (!gameCtx) {{
-                                let iframeCount = 0;
-                                try {{
-                                    iframeCount = document.querySelectorAll("iframe, frame").length;
-                                }} catch (e) {{}}
-                                let windowKeys = [];
-                                try {{
-                                    windowKeys = Object.keys(window).filter(function(k) {{
-                                        return !k.startsWith("webkit") && !k.startsWith("chrome") && typeof window[k] !== "function";
-                                    }}).slice(0, 30);
-                                }} catch (e) {{}}
-
-                                return JSON.stringify({{
-                                    success: false,
-                                    error: "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: " + iframeCount + ", 現在URL: " + location.href + ", 主なwindow変数: " + windowKeys.join(", ") + ")"
-                                }});
-                            }}
-
-                            let hasApp = Boolean(gameCtx.app);
-                            let hasNetAgent = Boolean(gameCtx.app && gameCtx.app.NetAgent);
-                            let hasLobby = Boolean(hasNetAgent && typeof gameCtx.app.NetAgent.sendReq2Lobby === "function");
-                            let hasUI = Boolean(gameCtx.uiscript && gameCtx.uiscript.UI_GameRecord);
-
-                            return await new Promise(function(resolve) {{
-                                let timer = setTimeout(function() {{
-                                    resolve(JSON.stringify({{
+                                    return JSON.stringify({{
                                         success: false,
-                                        error: "雀魂サーバーからのRPC応答がタイムアウトしました (8000ms)"
-                                    }}));
-                                }}, 8000);
+                                        error: "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: " + iframeCount + ", 現在URL: " + location.href + ", 主なwindow変数: " + windowKeys.join(", ") + ")"
+                                    }});
+                                }}
 
-                                function handleSuccess(res) {{
-                                    clearTimeout(timer);
-                                    try {{
-                                        if (!res) {{
-                                            resolve(JSON.stringify({{
-                                                success: false,
-                                                error: "サーバーから空の牌譜レコードが返却されました"
-                                            }}));
-                                            return;
-                                        }}
-                                        let payload = {{
-                                            uuid: targetUuid,
-                                            head: res.head || {{}},
-                                            rounds: []
-                                        }};
+                                let netAgent = (gameCtx.app && gameCtx.app.NetAgent) || (typeof app !== "undefined" && app && app.NetAgent);
+                                let hasLobby = Boolean(netAgent && typeof netAgent.sendReq2Lobby === "function");
+                                let hasUI = Boolean(gameCtx.uiscript && gameCtx.uiscript.UI_GameRecord);
 
-                                        if (res.head && res.head.accounts) {{
-                                            payload.accounts = res.head.accounts;
-                                        }}
-
-                                        if (res.data) {{
-                                            let u8 = null;
-                                            if (res.data instanceof Uint8Array) {{
-                                                u8 = res.data;
-                                            }} else if (res.data.buffer && res.data.byteLength) {{
-                                                u8 = new Uint8Array(res.data.buffer, res.data.byteOffset || 0, res.data.byteLength);
-                                            }} else if (Array.isArray(res.data)) {{
-                                                u8 = new Uint8Array(res.data);
-                                            }}
-                                            if (u8) {{
-                                                let binary = '';
-                                                let len = u8.byteLength;
-                                                for (let i = 0; i < len; i++) {{
-                                                    binary += String.fromCharCode(u8[i]);
-                                                }}
-                                                payload.data_base64 = btoa(binary);
-                                            }} else if (typeof res.data === "object") {{
-                                                payload.data = res.data;
-                                            }}
-                                        }}
-
-                                        if (res.records) payload.records = res.records;
-                                        if (res.actions) payload.actions = res.actions;
-                                        if (res.rounds) payload.rounds = res.rounds;
-
-                                        resolve(JSON.stringify({{
-                                            success: true,
-                                            payload: payload
-                                        }}));
-                                    }} catch (err) {{
+                                return await new Promise(function(resolve) {{
+                                    let timer = setTimeout(function() {{
                                         resolve(JSON.stringify({{
                                             success: false,
-                                            error: "ペイロードシリアライズ例外: " + err.toString()
+                                            error: "雀魂サーバーからのRPC応答がタイムアウトしました (8000ms)"
+                                        }}));
+                                    }}, 8000);
+
+                                    function handleSuccess(res) {{
+                                        clearTimeout(timer);
+                                        try {{
+                                            if (!res) {{
+                                                resolve(JSON.stringify({{
+                                                    success: false,
+                                                    error: "サーバーから空の牌譜レコードが返却されました"
+                                                }}));
+                                                return;
+                                            }}
+                                            let payload = {{
+                                                uuid: targetUuid,
+                                                head: res.head || {{}},
+                                                rounds: []
+                                            }};
+
+                                            if (res.head && res.head.accounts) {{
+                                                payload.accounts = res.head.accounts;
+                                            }}
+
+                                            if (res.data) {{
+                                                let u8 = null;
+                                                if (res.data instanceof Uint8Array) {{
+                                                    u8 = res.data;
+                                                }} else if (res.data.buffer && res.data.byteLength) {{
+                                                    u8 = new Uint8Array(res.data.buffer, res.data.byteOffset || 0, res.data.byteLength);
+                                                }} else if (Array.isArray(res.data)) {{
+                                                    u8 = new Uint8Array(res.data);
+                                                }}
+                                                if (u8) {{
+                                                    let binary = '';
+                                                    let len = u8.byteLength;
+                                                    for (let i = 0; i < len; i++) {{
+                                                        binary += String.fromCharCode(u8[i]);
+                                                    }}
+                                                    payload.data_base64 = btoa(binary);
+                                                }} else if (typeof res.data === "object") {{
+                                                    payload.data = res.data;
+                                                }}
+                                            }}
+
+                                            if (res.records) payload.records = res.records;
+                                            if (res.actions) payload.actions = res.actions;
+                                            if (res.rounds) payload.rounds = res.rounds;
+
+                                            resolve(JSON.stringify({{
+                                                success: true,
+                                                payload: payload
+                                            }}));
+                                        }} catch (err) {{
+                                            resolve(JSON.stringify({{
+                                                success: false,
+                                                error: "ペイロードシリアライズ例外: " + err.toString()
+                                            }}));
+                                        }}
+                                    }}
+
+                                    function handleFailure(msg) {{
+                                        clearTimeout(timer);
+                                        resolve(JSON.stringify({{
+                                            success: false,
+                                            error: String(msg)
                                         }}));
                                     }}
-                                }}
 
-                                function handleFailure(msg) {{
-                                    clearTimeout(timer);
-                                    resolve(JSON.stringify({{
-                                        success: false,
-                                        error: String(msg)
-                                    }}));
-                                }}
+                                    // 1. Primary RPC: netAgent.sendReq2Lobby
+                                    if (hasLobby) {{
+                                        let clientVer = (gameCtx.GameMgr && gameCtx.GameMgr.Inst && gameCtx.GameMgr.Inst.client_version) 
+                                            ? gameCtx.GameMgr.Inst.client_version 
+                                            : ((typeof GameMgr !== "undefined" && GameMgr.Inst && GameMgr.Inst.client_version) ? GameMgr.Inst.client_version : "");
+                                        netAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
+                                            if (!err && res) {{
+                                                handleSuccess(res);
+                                            }} else {{
+                                                // Fallback: fetchCustomizedContestGameRecord
+                                                netAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
+                                                    if (!err2 && res2) {{
+                                                        handleSuccess(res2);
+                                                    }} else {{
+                                                        let errDetail = JSON.stringify(err || err2);
+                                                        handleFailure("雀魂Lobby RPCエラー (fetchGameRecord失敗): " + errDetail);
+                                                    }}
+                                                }});
+                                            }}
+                                        }});
+                                        return;
+                                    }}
 
-                                // 1. Primary RPC: gameCtx.app.NetAgent.sendReq2Lobby
-                                if (hasLobby) {{
-                                    let clientVer = (gameCtx.GameMgr && gameCtx.GameMgr.Inst && gameCtx.GameMgr.Inst.client_version) 
-                                        ? gameCtx.GameMgr.Inst.client_version 
-                                        : ((window.GameMgr && window.GameMgr.Inst && window.GameMgr.Inst.client_version) ? window.GameMgr.Inst.client_version : "");
-                                    gameCtx.app.NetAgent.sendReq2Lobby("fetchGameRecord", {{ game_uuid: targetUuid, client_version_string: clientVer }}, function(err, res) {{
-                                        if (!err && res) {{
-                                            handleSuccess(res);
-                                        }} else {{
-                                            // Fallback: fetchCustomizedContestGameRecord
-                                            gameCtx.app.NetAgent.sendReq2Lobby("fetchCustomizedContestGameRecord", {{ game_uuid: targetUuid }}, function(err2, res2) {{
-                                                if (!err2 && res2) {{
-                                                    handleSuccess(res2);
-                                                }} else {{
-                                                    let errDetail = JSON.stringify(err || err2);
-                                                    handleFailure("雀魂Lobby RPCエラー (fetchGameRecord失敗): " + errDetail);
-                                                }}
-                                            }});
-                                        }}
-                                    }});
-                                    return;
-                                }}
+                                    // 2. Secondary RPC: uiscript.UI_GameRecord.getRecord
+                                    if (hasUI && typeof gameCtx.uiscript.UI_GameRecord.getRecord === "function") {{
+                                        gameCtx.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
+                                            if (res) handleSuccess(res);
+                                            else handleFailure("uiscript.UI_GameRecord.getRecord が空を返しました");
+                                        }});
+                                        return;
+                                    }}
 
-                                // 2. Secondary RPC: gameCtx.uiscript.UI_GameRecord.getRecord
-                                if (hasUI && typeof gameCtx.uiscript.UI_GameRecord.getRecord === "function") {{
-                                    gameCtx.uiscript.UI_GameRecord.getRecord(targetUuid, function(res) {{
-                                        if (res) handleSuccess(res);
-                                        else handleFailure("uiscript.UI_GameRecord.getRecord が空を返しました");
-                                    }});
-                                    return;
-                                }}
+                                    // 3. Fallback: netAgent.cached_records
+                                    if (netAgent && netAgent.cached_records && netAgent.cached_records[targetUuid]) {{
+                                        handleSuccess(netAgent.cached_records[targetUuid]);
+                                        return;
+                                    }}
 
-                                // 3. Fallback: gameCtx.app.NetAgent.cached_records
-                                if (gameCtx.app && gameCtx.app.NetAgent && gameCtx.app.NetAgent.cached_records && gameCtx.app.NetAgent.cached_records[targetUuid]) {{
-                                    handleSuccess(gameCtx.app.NetAgent.cached_records[targetUuid]);
-                                    return;
-                                }}
+                                    handleFailure("雀魂RPC呼び出しメソッド (sendReq2Lobby) が初期化されていません。ログイン状態をご確認ください。");
+                                }});
+                            }} catch (e) {{
+                                return JSON.stringify({{
+                                    success: false,
+                                    error: "ブラウザ内スクリプト例外: " + e.toString() + "\\n" + (e.stack || "")
+                                }});
+                            }}
+                        }})()
+                        """
 
-                                handleFailure("雀魂RPC呼び出しメソッド (sendReq2Lobby) が初期化されていません。ログイン状態をご確認ください。");
-                            }});
-                        }} catch (e) {{
-                            return JSON.stringify({{
-                                success: false,
-                                error: "ブラウザ内スクリプト例外: " + e.toString() + "\\n" + (e.stack || "")
-                            }});
-                        }}
-                    }})()
-                    """
-                    cmd = {
-                        "id": 201,
-                        "method": "Runtime.evaluate",
-                        "params": {
+                        eval_params = {
                             "expression": js_code,
                             "awaitPromise": True,
                             "returnByValue": True,
                         }
-                    }
-                    await ws.send(json.dumps(cmd))
-                    resp_str = await asyncio.wait_for(ws.recv(), timeout=10.0)
-                    resp_obj = json.loads(resp_str)
+                        if target_context_id is not None:
+                            eval_params["contextId"] = target_context_id
 
-                    result_data = resp_obj.get("result", {})
-                    if "exceptionDetails" in result_data:
-                        exc = result_data["exceptionDetails"]
-                        exc_desc = exc.get("exception", {}).get("value") or exc.get("exception", {}).get("description") or exc.get("text", "")
-                        print(f"[PaifuDownloader] CDP Runtime evaluation exception: {exc_desc}")
+                        resp_obj = await _send_cmd("Runtime.evaluate", eval_params, timeout=12.0)
 
-                    val = result_data.get("result", {}).get("value")
-                    if val and isinstance(val, str):
-                        try:
-                            resp_json = json.loads(val)
-                            if isinstance(resp_json, dict) and "success" in resp_json:
-                                if not resp_json.get("success"):
-                                    err_msg = resp_json.get("error", "Unknown RPC failure")
-                                    print(f"[PaifuDownloader] Majsoul RPC Error for {uuid}:\n  --> {err_msg}")
-                                    return None
-                                payload = resp_json.get("payload") or resp_json.get("data")
-                                if isinstance(payload, dict):
-                                    if "data_base64" in payload and not payload.get("rounds"):
-                                        raw_bytes = base64.b64decode(payload["data_base64"])
-                                        actions = decode_game_detail_records(raw_bytes)
-                                        if actions:
-                                            payload["rounds"] = [{"actions": actions}]
-                                    return payload
-                            elif isinstance(resp_json, dict):
-                                return resp_json
-                        except Exception as e:
-                            print(f"[PaifuDownloader] JSON parse error on RPC response: {e}")
-                    elif isinstance(val, dict):
-                        return val
-                    return None
+                        result_data = resp_obj.get("result", {})
+                        if "exceptionDetails" in result_data:
+                            exc = result_data["exceptionDetails"]
+                            exc_desc = exc.get("exception", {}).get("value") or exc.get("exception", {}).get("description") or exc.get("text", "")
+                            print(f"[PaifuDownloader] CDP Runtime evaluation exception: {exc_desc}")
+
+                        val = result_data.get("result", {}).get("value")
+                        if val and isinstance(val, str):
+                            try:
+                                resp_json = json.loads(val)
+                                if isinstance(resp_json, dict) and "success" in resp_json:
+                                    if not resp_json.get("success"):
+                                        err_msg = resp_json.get("error", "Unknown RPC failure")
+                                        print(f"[PaifuDownloader] Majsoul RPC Error for {uuid}:\n  --> {err_msg}")
+                                        return None
+                                    payload = resp_json.get("payload") or resp_json.get("data")
+                                    if isinstance(payload, dict):
+                                        if "data_base64" in payload and not payload.get("rounds"):
+                                            raw_bytes = base64.b64decode(payload["data_base64"])
+                                            actions = decode_game_detail_records(raw_bytes)
+                                            if actions:
+                                                payload["rounds"] = [{"actions": actions}]
+                                        return payload
+                                elif isinstance(resp_json, dict):
+                                    return resp_json
+                            except Exception as e:
+                                print(f"[PaifuDownloader] JSON parse error on RPC response: {e}")
+                        elif isinstance(val, dict):
+                            return val
+                        return None
+                    finally:
+                        reader_task.cancel()
 
             try:
                 try:
@@ -481,7 +578,7 @@ class PaifuDownloader:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(lambda: asyncio.run(_query()))
-                        return future.result(timeout=12.0)
+                        return future.result(timeout=20.0)
                 else:
                     return asyncio.run(_query())
             except Exception as e:

@@ -3043,6 +3043,7 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
     """
     import io
     import json
+    import asyncio
     import urllib.request
     from tools.paifu_to_mjai import PaifuDownloader
 
@@ -3066,11 +3067,14 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
 
     connected_urls = []
 
-    class MockWebSocket:
-        def __init__(self, url, response_json):
+    class MockCDPWebSocket:
+        def __init__(self, url, main_eval_result, match_cid=2):
             self.url = url
-            self.response_json = response_json
+            self.main_eval_result = main_eval_result
+            self.match_cid = match_cid
+            self.sent_commands = []
             connected_urls.append(url)
+            self._incoming = asyncio.Queue()
 
         async def __aenter__(self):
             return self
@@ -3079,92 +3083,108 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
             pass
 
         async def send(self, msg):
-            pass
+            cmd = json.loads(msg)
+            self.sent_commands.append(cmd)
+            cid = cmd.get("id")
+            method = cmd.get("method")
+            params = cmd.get("params", {})
+
+            if method == "Runtime.enable":
+                # Simulate emission of executionContextCreated for context 2 (e.g. game iframe)
+                await self._incoming.put(json.dumps({
+                    "method": "Runtime.executionContextCreated",
+                    "params": {"context": {"id": 2, "origin": "https://game.mahjongsoul.com", "name": "game_iframe"}}
+                }))
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
+            elif method == "Runtime.evaluate":
+                expr = params.get("expression", "")
+                eval_cid = params.get("contextId")
+                if "Boolean((typeof app" in expr:
+                    # Probe check
+                    is_match = (eval_cid == self.match_cid)
+                    await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "boolean", "value": is_match}}}))
+                elif "Boolean((typeof uiscript" in expr:
+                    await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "boolean", "value": False}}}))
+                else:
+                    # Main evaluation script
+                    await self._incoming.put(json.dumps({"id": cid, "result": self.main_eval_result}))
 
         async def recv(self):
-            return json.dumps(self.response_json)
+            return await self._incoming.get()
 
     downloader = PaifuDownloader(cdp_port=9222)
 
     import websockets
-    sent_commands = []
-    # Test 1: Structured failure response (e.g. game object not found in any frame)
-    fail_ws_resp = {
-        "id": 201,
+    # Test 1: Structured failure response (e.g. game object not found in any context)
+    fail_eval_result = {
         "result": {
-            "result": {
-                "type": "string",
-                "value": json.dumps({
-                    "success": False,
-                    "error": "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: 2, 現在URL: https://game.mahjongsoul.com/, 主なwindow変数: Laya, Config)"
-                })
-            }
+            "type": "string",
+            "value": json.dumps({
+                "success": False,
+                "error": "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません。(検出iframe数: 1, 現在URL: https://game.mahjongsoul.com/, 主なwindow変数: Laya)"
+            })
         }
     }
-    class TrackingWebSocket(MockWebSocket):
-        async def send(self, msg):
-            sent_commands.append(json.loads(msg))
-
-    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: TrackingWebSocket(url, fail_ws_resp))
+    # match_cid=999 means no context matches the probe
+    ws_fail = MockCDPWebSocket("ws://dummy/majsoul", fail_eval_result, match_cid=999)
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: ws_fail)
 
     res_fail = downloader._fetch_via_rpc("261017-error-test-uuid")
     assert res_fail is None
     assert connected_urls[-1] == "ws://dummy/majsoul"
 
-    # Verify that the generated JS code includes cross-frame and iframe traversal logic
-    assert len(sent_commands) == 1
-    eval_expr = sent_commands[0].get("params", {}).get("expression", "")
-    assert "findGameContext" in eval_expr
-    assert 'querySelectorAll("iframe, frame")' in eval_expr
-    assert "cur.frames" in eval_expr
-
     captured = capsys.readouterr().out
     assert "Selected Majsoul page target" in captured
     assert "雀魂のゲームオブジェクト (app.NetAgent / uiscript) が見つかりません" in captured
-    assert "検出iframe数: 2" in captured
+    assert "検出iframe数: 1" in captured
     assert "Majsoul RPC Error for 261017-error-test-uuid" in captured
 
-    # Test 2: Structured success response
-    success_ws_resp = {
-        "id": 201,
+    # Test 2: Structured success response with contextId=2 targeted
+    success_eval_result = {
         "result": {
-            "result": {
-                "type": "string",
-                "value": json.dumps({
-                    "success": True,
-                    "payload": {
-                        "uuid": "261017-success-test-uuid",
-                        "head": {"accounts": [{"nickname": "genta2223"}]},
-                        "rounds": []
-                    }
-                })
-            }
+            "type": "string",
+            "value": json.dumps({
+                "success": True,
+                "payload": {
+                    "uuid": "261017-success-test-uuid",
+                    "head": {"accounts": [{"nickname": "genta2223"}]},
+                    "rounds": []
+                }
+            })
         }
     }
-    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, success_ws_resp))
+    ws_success = MockCDPWebSocket("ws://dummy/majsoul", success_eval_result, match_cid=2)
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: ws_success)
 
     res_success = downloader._fetch_via_rpc("261017-success-test-uuid")
     assert res_success is not None
     assert res_success.get("uuid") == "261017-success-test-uuid"
     assert res_success.get("head", {}).get("accounts", [])[0].get("nickname") == "genta2223"
 
+    # Verify that the main evaluation command was sent with contextId == 2
+    main_eval_cmds = [c for c in ws_success.sent_commands if c.get("method") == "Runtime.evaluate" and "targetUuid" in c.get("params", {}).get("expression", "")]
+    assert len(main_eval_cmds) == 1
+    assert main_eval_cmds[0]["params"].get("contextId") == 2
+
+    captured_success = capsys.readouterr().out
+    assert "Identified MahjongSoul game context: contextId=2" in captured_success
+
     # Test 3: CDP exceptionDetails returned (must print exception details, not empty)
-    exc_ws_resp = {
-        "id": 201,
-        "result": {
-            "exceptionDetails": {
-                "text": "Uncaught",
-                "exception": {
-                    "type": "object",
-                    "value": "ReferenceError: NetAgent is not defined"
-                }
+    exc_eval_result = {
+        "exceptionDetails": {
+            "text": "Uncaught",
+            "exception": {
+                "type": "object",
+                "value": "ReferenceError: NetAgent is not defined"
             }
         }
     }
-    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockWebSocket(url, exc_ws_resp))
+    ws_exc = MockCDPWebSocket("ws://dummy/majsoul", exc_eval_result, match_cid=2)
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: ws_exc)
 
     res_exc = downloader._fetch_via_rpc("261017-exc-test-uuid")
     assert res_exc is None
     captured_exc = capsys.readouterr().out
     assert "CDP Runtime evaluation exception: ReferenceError: NetAgent is not defined" in captured_exc
+
 
