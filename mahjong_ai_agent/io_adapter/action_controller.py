@@ -96,6 +96,23 @@ def format_tile_jp(tile: Optional[str], include_unicode: bool = False) -> str:
     return f"{uni}{jp_name} ({tile})"
 
 
+def format_tile_label(tile: Optional[str], include_unicode: bool = False) -> str:
+    """
+    Format tile code (mjai/liqi/honors) into friendly user-facing label:
+    e.g. '1z' -> '東 (1z)', 'E' -> '東 (E)', '7z' -> '中 (7z)', 'C' -> '中 (C)', '1m' -> '1萬 (1m)'
+    """
+    if not tile or tile.strip() in ("", "?", "None"):
+        return "？"
+    tile = tile.strip()
+    jp_name = TILE_JP_NAMES.get(tile)
+    if jp_name is None:
+        jp_name = TILE_JP_NAMES.get(tile.lower(), tile)
+    uni = f"{MAHJONG_UNICODE_TILES.get(tile, '')} " if include_unicode and tile in MAHJONG_UNICODE_TILES else ""
+    if jp_name and jp_name != tile:
+        return f"{uni}{jp_name} ({tile})"
+    return f"{uni}{tile}"
+
+
 def generate_cubic_bezier_trajectory(
     p0: ScreenPoint,
     p3: ScreenPoint,

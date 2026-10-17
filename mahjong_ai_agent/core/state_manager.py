@@ -459,10 +459,14 @@ class MahjongStateManager:
                         print(msg)
                         trace_log("DAHAI_UNMATCHED_TILE", msg)
                         # Hand was tedashi (from hand) but tile wasn't present.
-                        # Restore hand size safely: if hand has draw-size tile count (> expected_base_len), pop last.
+                        # Safe resynchronization:
+                        # 1. If hand has drawn-size (> expected_base_len), pop the last/drawn tile to restore base size.
+                        # 2. If hand is already at expected_base_len, check if a recent tsumo tile existed that can be substituted or maintain 13 tiles without shrinking.
                         if len(p.tehai) > expected_base_len:
                             popped_tile = p.tehai.pop()
                             print(f"[StateManager RECOVERY] Hand size was {len(p.tehai)+1} > {expected_base_len}. Popped '{popped_tile}' to restore valid hand size.")
+                        elif len(p.tehai) < expected_base_len:
+                            print(f"[StateManager RECOVERY] Hand size was {len(p.tehai)} < {expected_base_len}. Preserved hand without pop.")
 
                 self.verify_hand_consistency(context="dahai")
 

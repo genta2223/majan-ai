@@ -25,7 +25,7 @@ if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
 from core.opponent_profiler import OpponentProfiler, PlayerProfile
-from io_adapter.action_controller import format_tile_jp
+from io_adapter.action_controller import format_tile_jp, format_tile_label
 from io_adapter.live_sniffer import LiveSniffer
 from io_adapter.paifu_downloader import extract_paifu_uuids, parse_paifu_url
 from main import MahjongAIAgent
@@ -812,7 +812,8 @@ class MahjongHUDApp:
                     if c1_win is None:
                         # Fallback win_prob estimation
                         c1_win = 40 if shanten == 0 else (25 if shanten == 1 else 15)
-                    tile_label = f"{target_tile} ({jp_name})" if jp_name and jp_name != target_tile else target_tile
+                    c1_tile = c1.get("tile") or target_tile
+                    tile_label = format_tile_label(c1_tile)
                     c1_text = f"🥇 推奨 1位: 【 {tile_label} 】 (期待値: {score:+.1f}pt / 和了率 {c1_win}%){reach_suffix}"
                     self.lbl_rec_main.config(text=c1_text, fg=self.c_accent)
 
@@ -821,11 +822,12 @@ class MahjongHUDApp:
                     decision_note = ""
                     if len(top_candidates) >= 2:
                         c2 = top_candidates[1]
-                        c2_tile = c2.get("tile", "")
+                        c2_raw_tile = c2.get("tile", "")
+                        c2_label = format_tile_label(c2_raw_tile)
                         c2_q = c2.get("modified_q") if c2.get("modified_q") is not None else c2.get("expected_value", 0.0)
                         diff_q = c2_q - score
                         c2_reach = " [立直]" if c2.get("action_type") == "reach" else ""
-                        c2_text = f"🥈 候補 2位: 【 {c2_tile} 】 (期待値: {c2_q:+.1f}pt / 差 {diff_q:+.1f}pt){c2_reach}"
+                        c2_text = f"🥈 候補 2位: 【 {c2_label} 】 (期待値: {c2_q:+.1f}pt / 差 {diff_q:+.1f}pt){c2_reach}"
 
                         # Judgment: small gap vs solid choice
                         gap = abs(diff_q)

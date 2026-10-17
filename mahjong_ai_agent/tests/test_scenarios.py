@@ -4565,6 +4565,54 @@ def test_state_manager_moqie_tsumogiri_preserves_hand_on_unmatched_tile():
     assert len(my_p.tehai) == 13
 
 
+def test_format_tile_label_converts_honor_codes_to_japanese():
+    """Verify format_tile_label properly converts honors and number tiles to Japanese names."""
+    from io_adapter.action_controller import format_tile_label
+
+    # Winds
+    assert format_tile_label("1z") == "東 (1z)"
+    assert format_tile_label("E") == "東 (E)"
+    assert format_tile_label("2z") == "南 (2z)"
+    assert format_tile_label("S") == "南 (S)"
+    assert format_tile_label("3z") == "西 (3z)"
+    assert format_tile_label("W") == "西 (W)"
+    assert format_tile_label("4z") == "北 (4z)"
+    assert format_tile_label("N") == "北 (N)"
+
+    # Dragons
+    assert format_tile_label("5z") == "白 (5z)"
+    assert format_tile_label("P") == "白 (P)"
+    assert format_tile_label("6z") == "發 (6z)"
+    assert format_tile_label("F") == "發 (F)"
+    assert format_tile_label("7z") == "中 (7z)"
+    assert format_tile_label("C") == "中 (C)"
+
+    # Suits
+    assert format_tile_label("1m") == "1萬 (1m)"
+    assert format_tile_label("7s") == "7索 (7s)"
+    assert format_tile_label("9p") == "9筒 (9p)"
+
+
+def test_notify_room_game_start_does_not_trigger_vision_fallback(monkeypatch):
+    """Verify NotifyRoomGameStart does NOT trigger Vision fallback or corrupt hand."""
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from io_adapter.vision_hand_reader import VisionHandReader
+
+    called = False
+    def _fake_read(self):
+        nonlocal called
+        called = True
+        return ["P"] * 14
+    monkeypatch.setattr(VisionHandReader, "read_hand", _fake_read)
+
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=True)
+    events = bridge.translate_action("NotifyRoomGameStart", {})
+    assert not called, "Vision fallback must NEVER be triggered for NotifyRoomGameStart"
+    assert len(events) == 1
+    assert events[0]["type"] == "start_kyoku"
+    assert events[0]["tehais"][0] == ["?"] * 13
+
+
 
 
 

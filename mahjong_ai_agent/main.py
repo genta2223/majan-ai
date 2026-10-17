@@ -86,19 +86,23 @@ class MahjongAIAgent:
             self.packet_hand_trusted = has_visible
             if has_visible:
                 print(f"[Main Guard] Packet hand trusted for this round -> Vision fallback LOCKED")
-            # Vision Fallback safety net: if no visible hand in packet, capture screen
-            if self.vision_fallback_enabled and not has_visible and len(tehais) > self.my_actor_id:
+            # Vision Fallback safety net: if no visible hand in packet, capture screen ONLY for genuine rounds
+            is_genuine_round = event.get("action_name") in ("ActionNewRound", "RecordNewRound") if "action_name" in event else True
+            if self.vision_fallback_enabled and is_genuine_round and not has_visible and len(tehais) > self.my_actor_id:
                 try:
                     from io_adapter.vision_hand_reader import VisionHandReader
                     reader = VisionHandReader()
                     raw_vision_hand = reader.read_hand()
                     vision_hand = [t for t in raw_vision_hand if is_valid_mahjong_tile(t)]
-                    if vision_hand and len(vision_hand) >= 13:
+                    # Sanity check: must not be all identical tiles (e.g. all 'P' during blank animation)
+                    if vision_hand and len(vision_hand) >= 13 and len(set(vision_hand)) >= 3:
                         tehais[self.my_actor_id] = vision_hand[:13]
                         print(f"[Main Vision Fallback] Injected {len(vision_hand)} vision tiles into Player {self.my_actor_id}: {tehais[self.my_actor_id]}")
                         # If dealer, handle 14th tile
                         if event.get("oya", 0) == self.my_actor_id and len(vision_hand) >= 14:
                             tehais[self.my_actor_id] = vision_hand[:14]
+                    elif vision_hand and len(set(vision_hand)) < 3:
+                        print(f"[Main Vision Fallback] Rejected vision tiles due to low diversity: {vision_hand[:5]}...")
                 except Exception as ve:
                     print(f"[Main Vision Fallback] Warning: {ve}")
         elif event_type == "tsumo":

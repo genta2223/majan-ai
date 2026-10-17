@@ -217,6 +217,7 @@ class MajsoulBridge:
 
             events.append({
                 "type": "start_kyoku",
+                "action_name": clean_name,
                 "bakaze": bakaze,
                 "kyoku": kyoku,
                 "honba": honba,
