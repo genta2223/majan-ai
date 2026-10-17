@@ -5765,6 +5765,176 @@ async def test_first_turn_ready_trigger_child_north_autonomous(test_config):
     assert act_draw.tile in agent.state_mgr.my_player.tehai
 
 
+def test_paifu_profiler_single_round_and_multi_round_strict_percentages():
+    """
+    Test Suite for OpponentProfiler denominator and stat consistency:
+    1. Single-round Paifu (Ron):
+       - Exact 1-round sample size (total_rounds == 1, NOT 4 or 25%).
+       - Winner (Ron): hora_count=1, hora_rate=1.0 (100%), deal_in_count=0, deal_in_rate=0.0.
+       - Loser (Deal-in): hora_count=0, hora_rate=0.0, deal_in_count=1, deal_in_rate=1.0 (100%).
+       - Innocent bystander: hora_count=0, hora_rate=0.0, deal_in_count=0, deal_in_rate=0.0.
+    2. Single-round Paifu (Tsumo):
+       - Winner (Tsumo): hora_count=1, hora_rate=1.0 (100%), deal_in_count=0, deal_in_rate=0.0.
+       - Other 3 players: deal_in_count=0, deal_in_rate=0.0 (Tsumo win NEVER penalizes opponents as deal-ins).
+    3. Duplicate/CPU names in single round:
+       - Multiple slots with the same name (e.g. 'CPU') MUST NOT inflate total_rounds per round.
+    4. Direct Paifu Record Action parsing:
+       - Directly parsing raw RecordNewRound and RecordHule with explicit winner/loser/deltas.
+    """
+    from core.opponent_profiler import OpponentProfiler
+
+    # --- Scenario 1: Single Round Ron ---
+    p1_events = [
+        {"type": "start_game", "names": ["Alice", "Bob", "Charlie", "Dave"], "game_uuid": "test-single-ron"},
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "reach", "actor": 0},
+        {"type": "dahai", "actor": 0, "pai": "1m"},
+        {"type": "dahai", "actor": 1, "pai": "5m"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 1,
+            "winner": 0,
+            "loser": 1,
+            "pai": "5m",
+            "score": 8000,
+            "deltas": [8000, -8000, 0, 0],
+            "zimo": False
+        },
+        {"type": "end_kyoku"},
+        {"type": "end_game"}
+    ]
+
+    prof1 = OpponentProfiler()
+    prof1.analyze_game_events(p1_events)
+
+    alice = prof1.get_profile("Alice")
+    bob = prof1.get_profile("Bob")
+    charlie = prof1.get_profile("Charlie")
+    dave = prof1.get_profile("Dave")
+
+    assert alice is not None and bob is not None and charlie is not None and dave is not None
+
+    # Strict sample size verification: Exactly 1 round played!
+    assert alice.total_rounds == 1, f"Alice total_rounds should be 1, got {alice.total_rounds}"
+    assert bob.total_rounds == 1, f"Bob total_rounds should be 1, got {bob.total_rounds}"
+    assert charlie.total_rounds == 1, f"Charlie total_rounds should be 1, got {charlie.total_rounds}"
+    assert dave.total_rounds == 1, f"Dave total_rounds should be 1, got {dave.total_rounds}"
+
+    # Alice: Winner on Ron
+    assert alice.hora_count == 1
+    assert alice.deal_in_count == 0
+    assert alice.hora_rate == 1.0, f"Alice hora_rate should be 1.0 (100%), got {alice.hora_rate}"
+    assert alice.deal_in_rate == 0.0, f"Alice deal_in_rate should be 0.0, got {alice.deal_in_rate}"
+    assert alice.riichi_count == 1
+    assert alice.riichi_rate == 1.0
+
+    # Bob: Dealt in on Ron -> Must be exactly 1.0 (100%), NOT 0.25 (25%) or 0.0!
+    assert bob.hora_count == 0
+    assert bob.deal_in_count == 1
+    assert bob.hora_rate == 0.0
+    assert bob.deal_in_rate == 1.0, f"Bob deal_in_rate should be exactly 1.0 (100%), got {bob.deal_in_rate}"
+    assert bob.riichi_rate == 0.0
+
+    # Charlie & Dave: Did not win or deal in
+    assert charlie.hora_rate == 0.0 and charlie.deal_in_rate == 0.0
+    assert dave.hora_rate == 0.0 and dave.deal_in_rate == 0.0
+
+    # --- Scenario 2: Single Round Tsumo ---
+    p2_events = [
+        {"type": "start_game", "names": ["Player0", "Player1", "Player2", "Player3"], "game_uuid": "test-single-tsumo"},
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "tsumo", "actor": 2, "pai": "2s"},
+        {
+            "type": "hora",
+            "actor": 2,
+            "target": 2,
+            "winner": 2,
+            "loser": None,
+            "pai": "2s",
+            "score": 4000,
+            "deltas": [-1000, -1000, 3000, -1000],
+            "zimo": True
+        },
+        {"type": "end_kyoku"}
+    ]
+
+    prof2 = OpponentProfiler()
+    prof2.analyze_game_events(p2_events)
+
+    p0 = prof2.get_profile("Player0")
+    p2 = prof2.get_profile("Player2")
+
+    assert p2.total_rounds == 1
+    assert p2.hora_count == 1
+    assert p2.hora_rate == 1.0
+    assert p2.deal_in_count == 0
+    assert p2.deal_in_rate == 0.0
+
+    # Tsumo does NOT count as deal-in for any non-winners!
+    for seat in range(4):
+        p = prof2.get_profile(f"Player{seat}")
+        assert p.deal_in_count == 0, f"Player{seat} deal_in_count should be 0 on Tsumo, got {p.deal_in_count}"
+        assert p.deal_in_rate == 0.0
+
+    # --- Scenario 3: Duplicate/CPU names in single round ---
+    p3_events = [
+        {"type": "start_game", "names": ["Hero", "CPU", "CPU", "CPU"], "game_uuid": "test-duplicate-names"},
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "chi", "actor": 1, "consumed": ["2m", "3m"], "pai": "4m"},
+        {"type": "dahai", "actor": 1, "pai": "9p"},
+        {"type": "hora", "actor": 0, "target": 1, "score": 8000, "deltas": [8000, -8000, 0, 0], "zimo": False},
+        {"type": "end_kyoku"}
+    ]
+
+    prof3 = OpponentProfiler()
+    prof3.analyze_game_events(p3_events)
+
+    hero = prof3.get_profile("Hero")
+    cpu = prof3.get_profile("CPU")
+
+    assert hero.total_rounds == 1
+    # Despite 3 seats having name 'CPU', total_rounds for 'CPU' in this single round MUST be exactly 1!
+    assert cpu.total_rounds == 1, f"CPU total_rounds should be 1 per round, not inflated to {cpu.total_rounds}"
+    assert cpu.open_rate == 1.0, f"CPU open_rate should be 1.0, got {cpu.open_rate}"
+    assert cpu.deal_in_rate == 1.0, f"CPU deal_in_rate should be 1.0, got {cpu.deal_in_rate}"
+
+    # --- Scenario 4: Direct Paifu Record Actions parsing (RecordNewRound & RecordHule) ---
+    raw_actions = [
+        {"action_name": "RecordNewRound", "data": {"chang": 0, "ju": 0, "ben": 0, "scores": [25000, 25000, 25000, 25000], "names": ["P0", "P1", "P2", "P3"]}},
+        {"action_name": "RecordDiscardTile", "data": {"seat": 0, "tile": "1m", "is_liqi": True}},
+        {"action_name": "RecordDiscardTile", "data": {"seat": 3, "tile": "5p"}},
+        {
+            "action_name": "RecordHule",
+            "data": {
+                "hules": [
+                    {"seat": 0, "winner": 0, "loser": 3, "target": 3, "hu_tile": "5p", "zimo": False, "score": 12000}
+                ],
+                "delta_scores": [12000, 0, 0, -12000]
+            }
+        }
+    ]
+
+    prof4 = OpponentProfiler()
+    prof4.analyze_game_events(raw_actions, game_uuid="test-raw-record-actions")
+
+    p0_raw = prof4.get_profile("P0")
+    p3_raw = prof4.get_profile("P3")
+
+    assert p0_raw.total_rounds == 1
+    assert p0_raw.hora_count == 1
+    assert p0_raw.hora_rate == 1.0
+    assert p0_raw.riichi_count == 1
+    assert p0_raw.riichi_rate == 1.0
+
+    assert p3_raw.total_rounds == 1
+    assert p3_raw.deal_in_count == 1
+    assert p3_raw.deal_in_rate == 1.0
+    assert p3_raw.hora_count == 0
+    assert p3_raw.hora_rate == 0.0
+
+
+
 
 
 

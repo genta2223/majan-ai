@@ -570,6 +570,10 @@ class LiqiProtoDecoder:
 
         if name in ("ActionHule", "RecordHule"):
             # hules = 1 or 2, delta_scores = 2 or 3, scores = 3 or 4
+            del_sc = ints_of(2) or ints_of(3)
+            # Find negative scorer if Ron deal-in
+            neg_scorers = [i for i, d in enumerate(del_sc) if d < 0] if del_sc else []
+
             hules_list: List[Dict[str, Any]] = []
             raw_hules = f.get(1, []) or f.get(2, [])
             for h_blob in raw_hules:
@@ -577,10 +581,35 @@ class LiqiProtoDecoder:
                     hf = decode_raw_protobuf(bytes(h_blob))
                     h_dict: Dict[str, Any] = {}
                     # seat = tag 4 (or 1)
-                    h_dict["seat"] = coerce_int((hf.get(4) or hf.get(1) or [0])[0], 0)
-                    h_dict["zimo"] = bool(coerce_int((hf.get(5) or [0])[0], 0))
-                    # target = tag 9 (or 10 or 6)
-                    h_dict["target"] = coerce_int((hf.get(9) or hf.get(10) or hf.get(6) or [h_dict["seat"]])[0], h_dict["seat"])
+                    seat_val = coerce_int((hf.get(4) or hf.get(1) or [0])[0], 0)
+                    h_dict["seat"] = seat_val
+                    h_dict["winner"] = seat_val
+                    is_zimo = bool(coerce_int((hf.get(5) or [0])[0], 0))
+                    h_dict["zimo"] = is_zimo
+
+                    # Target / Loser determination:
+                    if is_zimo:
+                        h_dict["target"] = seat_val
+                        h_dict["loser"] = None
+                    else:
+                        target_val = None
+                        # 1. Prioritize negative scorer from delta_scores (direct financial deal-in)
+                        if neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat_val:
+                            target_val = neg_scorers[0]
+                        # 2. Check explicit target / loser tags (tag 6 or tag 9/10 if non-seat)
+                        if target_val is None:
+                            cand_target = coerce_int((hf.get(9) or hf.get(10) or hf.get(6) or [-1])[0], -1)
+                            if 0 <= cand_target < 4 and cand_target != seat_val:
+                                target_val = cand_target
+                        # 3. Fallback to candidate target or negative scorer
+                        if target_val is None and neg_scorers:
+                            valid_negs = [s for s in neg_scorers if s != seat_val]
+                            if valid_negs:
+                                target_val = valid_negs[0]
+
+                        h_dict["target"] = target_val if target_val is not None else seat_val
+                        h_dict["loser"] = target_val if (target_val is not None and target_val != seat_val) else None
+
                     # hu_tile = tag 3
                     t_cand = [s(v).strip() for v in (hf.get(3) or []) if is_tile(v)]
                     if t_cand:
@@ -618,17 +647,27 @@ class LiqiProtoDecoder:
                         target_val = f[3][0]
                     elif 6 in f and isinstance(f[6][0], int) and 0 <= f[6][0] <= 3:
                         target_val = f[6][0]
+                    elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat_val:
+                        target_val = neg_scorers[0]
+
                     is_zimo = (seat_val == target_val)
-                    h_dict = {"seat": seat_val, "target": target_val, "zimo": is_zimo}
+                    h_dict = {
+                        "seat": seat_val,
+                        "winner": seat_val,
+                        "target": target_val,
+                        "loser": target_val if not is_zimo else None,
+                        "zimo": is_zimo
+                    }
                     t_str = tiles_of(3) or tiles_of(2)
                     if t_str:
                         h_dict["hu_tile"] = t_str[0]
                     hules_list.append(h_dict)
                     m["seat"] = seat_val
+                    m["winner"] = seat_val
                     m["target"] = target_val
+                    m["loser"] = target_val if not is_zimo else None
 
             m["hules"] = hules_list
-            del_sc = ints_of(2) or ints_of(3)
             if del_sc:
                 m["delta_scores"] = del_sc
             return m

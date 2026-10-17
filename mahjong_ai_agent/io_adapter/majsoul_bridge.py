@@ -664,23 +664,45 @@ class MajsoulBridge:
 
         elif clean_name in ("ActionHule", "RecordHule"):
             hules = data.get("hules", [])
-            if not hules and ("seat" in data or "target" in data):
+            if not hules and ("seat" in data or "target" in data or "winner" in data):
                 hules = [data]
             deltas = safe_coerce_int_list(data.get("delta_scores"), default=[0, 0, 0, 0], expected_len=4)
+            neg_scorers = [i for i, d in enumerate(deltas) if d < 0]
+
             for h in hules:
-                seat = safe_coerce_int(h.get("seat", 0), 0)
+                raw_winner = h.get("winner") if "winner" in h else (data.get("winner") if "winner" in data else None)
+                seat = safe_coerce_int(raw_winner if raw_winner is not None else h.get("seat", 0), 0)
                 hu_tile = liqi_tile_to_mjai(h.get("hu_tile", ""))
                 is_zimo = bool(h.get("zimo", False))
+                raw_loser = h.get("loser") if "loser" in h else (data.get("loser") if "loser" in data else None)
                 raw_target = h.get("target")
 
                 if is_zimo:
                     target = seat
-                elif raw_target is not None and safe_coerce_int(raw_target, -1) != seat and 0 <= safe_coerce_int(raw_target, -1) < 4:
-                    target = safe_coerce_int(raw_target, seat)
-                elif self._last_discard_seat is not None and self._last_discard_seat != seat:
-                    target = self._last_discard_seat
+                    loser = None
                 else:
-                    target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None else seat)
+                    target = None
+                    # 1. Explicit loser field
+                    if raw_loser is not None and safe_coerce_int(raw_loser, -1) != seat and 0 <= safe_coerce_int(raw_loser, -1) < 4:
+                        target = safe_coerce_int(raw_loser, seat)
+                    # 2. Explicit target field
+                    elif raw_target is not None and safe_coerce_int(raw_target, -1) != seat and 0 <= safe_coerce_int(raw_target, -1) < 4:
+                        target = safe_coerce_int(raw_target, seat)
+                    # 3. Direct negative scorer from delta_scores on Ron
+                    elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat:
+                        target = neg_scorers[0]
+                    # 4. Last discard seat
+                    elif self._last_discard_seat is not None and self._last_discard_seat != seat:
+                        target = self._last_discard_seat
+                    # 5. Any negative scorer
+                    elif neg_scorers:
+                        valid_negs = [s for s in neg_scorers if s != seat]
+                        if valid_negs:
+                            target = valid_negs[0]
+
+                    if target is None or target == seat:
+                        target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None and self._last_discard_seat != seat else seat)
+                    loser = target if (target != seat and not is_zimo) else None
 
                 score_val = safe_coerce_int(h.get("score") or h.get("point_sum"), 0)
                 if not (0 < score_val <= 48000):
@@ -693,6 +715,9 @@ class MajsoulBridge:
                     "type": "hora",
                     "actor": seat,
                     "target": target,
+                    "winner": seat,
+                    "loser": loser,
+                    "zimo": is_zimo,
                     "pai": hu_tile,
                     "score": score_val,
                     "deltas": deltas,

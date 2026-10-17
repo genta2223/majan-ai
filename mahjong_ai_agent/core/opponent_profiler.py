@@ -140,10 +140,15 @@ class PlayerProfile(BaseModel):
         """Calculates normalized percentages, Bayesian smoothed rates, behavioral archetype, and badges."""
         # Raw observed percentages
         if self.total_rounds > 0:
-            self.hora_rate = round(self.hora_count / self.total_rounds, 3)
-            self.open_rate = round(self.rounds_with_call / self.total_rounds, 3)
-            self.riichi_rate = round(self.rounds_with_riichi / self.total_rounds, 3)
-            self.deal_in_rate = round(self.deal_in_count / self.total_rounds, 3)
+            self.hora_rate = round(min(1.0, self.hora_count / self.total_rounds), 3)
+            self.open_rate = round(min(1.0, self.rounds_with_call / self.total_rounds), 3)
+            self.riichi_rate = round(min(1.0, self.rounds_with_riichi / self.total_rounds), 3)
+            self.deal_in_rate = round(min(1.0, self.deal_in_count / self.total_rounds), 3)
+        else:
+            self.hora_rate = 0.0
+            self.open_rate = 0.0
+            self.riichi_rate = 0.0
+            self.deal_in_rate = 0.0
 
         if self.hora_count > 0:
             self.avg_hora_score = round(self.hora_scores_sum / self.hora_count, 1)
@@ -363,18 +368,22 @@ class OpponentProfiler:
 
         def _commit_live_round():
             if not self._live_round_committed:
+                visited_call = set()
                 for actor in self._live_round_calls:
                     if 0 <= actor < len(self.player_names):
                         name = self.player_names[actor]
-                        if name in self.profiles:
+                        if name in self.profiles and name not in visited_call:
                             self.profiles[name].rounds_with_call += 1
                             self.profiles[name].live_rounds_with_call += 1
+                            visited_call.add(name)
+                visited_riichi = set()
                 for actor in self._live_round_riichis:
                     if 0 <= actor < len(self.player_names):
                         name = self.player_names[actor]
-                        if name in self.profiles:
+                        if name in self.profiles and name not in visited_riichi:
                             self.profiles[name].rounds_with_riichi += 1
                             self.profiles[name].live_rounds_with_riichi += 1
+                            visited_riichi.add(name)
                 self._live_round_committed = True
 
         if etype == "start_game":
@@ -408,13 +417,15 @@ class OpponentProfiler:
             elif self.current_bakaze in ("S", "W", "N"):
                 self.set_match_mode("hanchan")
 
+            visited_round_names = set()
             for i in range(4):
                 name = self._ensure_seat_name(i)
                 if i in self.stats:
                     self.stats[i]["rounds"] += 1
-                if name and name in self.profiles:
+                if name and name in self.profiles and name not in visited_round_names:
                     self.profiles[name].total_rounds += 1
                     self.profiles[name].live_rounds += 1
+                    visited_round_names.add(name)
 
         elif etype in ("chi", "pon", "daiminkan", "kankan", "ankan"):
             actor = event.get("actor", 0)
@@ -516,9 +527,43 @@ class OpponentProfiler:
                     p.live_aggressiveness_pushes += 1
 
         elif etype == "hora":
-            actor = event.get("actor", 0)
-            target = event.get("target", actor)
+            actor = event.get("winner") if "winner" in event else event.get("actor", 0)
             deltas = event.get("deltas", [])
+            neg_scorers = [i for i, d in enumerate(deltas) if d < 0]
+
+            raw_zimo = event.get("zimo")
+            raw_target = event.get("target")
+            raw_loser = event.get("loser")
+
+            if raw_zimo is not None:
+                is_zimo = bool(raw_zimo)
+            elif raw_loser is not None and raw_loser != actor:
+                is_zimo = False
+            elif raw_target is not None:
+                is_zimo = (raw_target == actor)
+            elif len(neg_scorers) >= 2:
+                is_zimo = True
+            else:
+                is_zimo = False
+            
+            # Target / Loser determination
+            target = actor
+            loser = None
+            if not is_zimo:
+                if raw_loser is not None and 0 <= raw_loser < 4 and raw_loser != actor:
+                    target = raw_loser
+                    loser = raw_loser
+                elif raw_target is not None and 0 <= raw_target < 4 and raw_target != actor:
+                    target = raw_target
+                    loser = raw_target
+                elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != actor:
+                    target = neg_scorers[0]
+                    loser = neg_scorers[0]
+                elif neg_scorers:
+                    valid_negs = [s for s in neg_scorers if s != actor]
+                    if valid_negs:
+                        target = valid_negs[0]
+                        loser = valid_negs[0]
 
             if 0 <= actor < 4 and actor in self.stats:
                 self.stats[actor]["agari"] += 1
@@ -538,10 +583,10 @@ class OpponentProfiler:
                     win_score = 5200
                 p.hora_scores_sum += win_score
 
-            if actor != target:
-                if 0 <= target < 4 and target in self.stats:
-                    self.stats[target]["houju"] += 1
-                victim_name = self._ensure_seat_name(target)
+            if loser is not None and loser != actor:
+                if 0 <= loser < 4 and loser in self.stats:
+                    self.stats[loser]["houju"] += 1
+                victim_name = self._ensure_seat_name(loser)
                 if victim_name in self.profiles:
                     p = self.profiles[victim_name]
                     p.deal_in_count += 1
@@ -609,23 +654,33 @@ class OpponentProfiler:
         def _commit_round():
             nonlocal round_committed
             if not round_committed:
+                visited_calls = set()
                 for actor in current_round_calls:
                     if 0 <= actor < len(player_names):
                         name = player_names[actor]
-                        if name in self.profiles:
+                        if name and name in self.profiles and name not in visited_calls:
                             self.profiles[name].rounds_with_call += 1
+                            visited_calls.add(name)
+                visited_riichis = set()
                 for actor in current_round_riichis:
                     if 0 <= actor < len(player_names):
                         name = player_names[actor]
-                        if name in self.profiles:
+                        if name and name in self.profiles and name not in visited_riichis:
                             self.profiles[name].rounds_with_riichi += 1
+                            visited_riichis.add(name)
                 round_committed = True
 
+        current_last_discard_seat: Optional[int] = None
+
         for ev in events:
-            etype = ev.get("type", "")
+            raw_type = ev.get("type") or ev.get("action_name") or ev.get("name") or ""
+            etype = raw_type.split(".")[-1]
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else ev
 
             if etype == "start_game":
                 names = ev.get("names", [])
+                if not names and "accounts" in ev:
+                    names = [a.get("nickname") or a.get("name") for a in ev.get("accounts", []) if isinstance(a, dict)]
                 for i in range(min(4, len(names))):
                     name = str(names[i]).strip()
                     player_names[i] = name
@@ -637,7 +692,7 @@ class OpponentProfiler:
                                 self.profiles[name].seat_name = SEAT_NAMES[i]
                         self.profiles[name].total_games += 1
 
-            elif etype == "start_kyoku":
+            elif etype in ("start_kyoku", "RecordNewRound", "ActionNewRound"):
                 # Ensure previous round was committed
                 _commit_round()
                 current_riichis.clear()
@@ -645,22 +700,46 @@ class OpponentProfiler:
                 current_round_riichis.clear()
                 turn_counter = 0
                 round_committed = False
+                current_last_discard_seat = None
+
+                # Extract names if present and player_names not fully populated
+                cand_names = ev.get("names") or data.get("names") or []
+                if cand_names:
+                    for i in range(min(4, len(cand_names))):
+                        n = str(cand_names[i]).strip()
+                        if n and not player_names[i]:
+                            player_names[i] = n
+                            if n not in self.profiles:
+                                self.profiles[n] = PlayerProfile(name=n, seat_name=SEAT_NAMES[i])
+
+                # Ensure player profiles exist for seated players
                 for i in range(4):
                     if i in self.stats:
                         self.stats[i]["rounds"] += 1
-                for name in player_names:
-                    if name and name in self.profiles:
-                        self.profiles[name].total_rounds += 1
+                    if i < len(player_names) and not player_names[i]:
+                        placeholder = f"Player_Seat{i}"
+                        player_names[i] = placeholder
+                        if placeholder not in self.profiles:
+                            self.profiles[placeholder] = PlayerProfile(name=placeholder, seat_name=SEAT_NAMES[i])
 
-            elif etype in ("chi", "pon", "daiminkan"):
-                actor = ev.get("actor", 0)
+                # Deduplicated per-round increment: each unique player profile gets exactly 1 total_round
+                visited_round_names = set()
+                for i in range(4):
+                    if 0 <= i < len(player_names):
+                        name = player_names[i]
+                        if name and name in self.profiles and name not in visited_round_names:
+                            self.profiles[name].total_rounds += 1
+                            visited_round_names.add(name)
+
+            elif etype in ("chi", "pon", "daiminkan", "RecordChiPengGang", "ActionChiPengGang"):
+                actor = ev.get("actor") if "actor" in ev else data.get("seat", 0)
                 if 0 <= actor < 4 and actor in self.stats:
                     self.stats[actor]["call"] += 1
                     self.stats[actor]["naki"] += 1
 
                 if 0 <= actor < len(player_names):
                     name = player_names[actor]
-                    consumed = ev.get("consumed", [])
+                    consumed = ev.get("consumed", []) or data.get("tiles", [])
                     pai = ev.get("pai", "")
                     meld_tiles = [t for t in (consumed + ([pai] if pai else [])) if t and t != "?"]
 
@@ -689,8 +768,8 @@ class OpponentProfiler:
                         if turn_counter <= 6:
                             p.early_call_count += 1
 
-            elif etype == "reach":
-                actor = ev.get("actor", 0)
+            elif etype in ("reach", "RecordDiscardTile", "ActionDiscardTile") and (etype == "reach" or data.get("is_liqi") or data.get("is_wliqi")):
+                actor = ev.get("actor") if "actor" in ev else data.get("seat", 0)
                 if 0 <= actor < 4 and actor in self.stats:
                     self.stats[actor]["reach"] += 1
 
@@ -701,10 +780,15 @@ class OpponentProfiler:
                     if name in self.profiles:
                         self.profiles[name].riichi_count += 1
 
-            elif etype == "dahai":
-                actor = ev.get("actor", 0)
+                # If this was a discard with is_liqi, record the discard as well
+                if etype != "reach":
+                    current_last_discard_seat = actor
+
+            elif etype in ("dahai", "RecordDiscardTile", "ActionDiscardTile"):
+                actor = ev.get("actor") if "actor" in ev else data.get("seat", 0)
+                current_last_discard_seat = actor
                 if 0 <= actor < len(player_names):
-                    pai = ev.get("pai", "")
+                    pai = ev.get("pai", "") or data.get("tile", "")
                     norm_pai = normalize_tile(pai)
                     name = player_names[actor]
                     turn_counter += 1
@@ -757,43 +841,85 @@ class OpponentProfiler:
                             # Genuine dangerous musuji tile pushed
                             self.profiles[name].aggressiveness_pushes += 1
 
-            elif etype == "hora":
-                actor = ev.get("actor", 0)
-                target = ev.get("target", actor)
-                deltas = ev.get("deltas", [])
+            elif etype in ("hora", "RecordHule", "ActionHule"):
+                # Handle hules list (single or multiple/daburon)
+                raw_hules = data.get("hules") if isinstance(data.get("hules"), list) else ev.get("hules")
+                if not raw_hules:
+                    raw_hules = [data if isinstance(data, dict) else ev]
 
-                if 0 <= actor < 4 and actor in self.stats:
-                    self.stats[actor]["agari"] += 1
+                deltas = data.get("delta_scores") or ev.get("deltas") or []
+                neg_scorers = [i for i, d in enumerate(deltas) if d < 0]
 
-                if 0 <= actor < len(player_names):
-                    winner_name = player_names[actor]
-                    if winner_name in self.profiles:
-                        p = self.profiles[winner_name]
-                        p.hora_count += 1
-                        win_score = 0
-                        # 1. Prioritize authentic score from ev["score"]
-                        ev_sc = ev.get("score")
-                        if ev_sc is not None and 0 < int(ev_sc) <= 48000:
-                            win_score = int(ev_sc)
-                        # 2. Then deltas if within plausible single-hand range
-                        elif deltas and len(deltas) > actor and 0 < deltas[actor] <= 48000:
-                            win_score = deltas[actor]
-                        else:
-                            win_score = 5200
-                        p.hora_scores_sum += win_score
+                for h in raw_hules:
+                    raw_winner = h.get("winner") if "winner" in h else (h.get("actor") if "actor" in h else h.get("seat"))
+                    if raw_winner is None:
+                        raw_winner = ev.get("winner") if "winner" in ev else ev.get("actor", 0)
+                    actor = int(raw_winner) if raw_winner is not None else 0
 
-                # Ron deal-in check (actor != target means Ron)
-                if actor != target:
-                    if 0 <= target < 4 and target in self.stats:
-                        self.stats[target]["houju"] += 1
-                    if 0 <= target < len(player_names):
-                        victim_name = player_names[target]
-                        if victim_name in self.profiles:
-                            self.profiles[victim_name].deal_in_count += 1
+                    raw_zimo = h.get("zimo") if "zimo" in h else ev.get("zimo")
+                    raw_target = h.get("target") if "target" in h else ev.get("target")
+                    raw_loser = h.get("loser") if "loser" in h else (data.get("loser") if "loser" in data else ev.get("loser"))
+
+                    if raw_zimo is not None:
+                        is_zimo = bool(raw_zimo)
+                    elif raw_loser is not None and int(raw_loser) != actor:
+                        is_zimo = False
+                    elif raw_target is not None:
+                        is_zimo = (int(raw_target) == actor)
+                    elif len(neg_scorers) >= 2:
+                        is_zimo = True
+                    else:
+                        is_zimo = False
+
+                    # Target / Loser determination:
+
+                    loser = None
+                    if not is_zimo:
+                        if raw_loser is not None and 0 <= int(raw_loser) < 4 and int(raw_loser) != actor:
+                            loser = int(raw_loser)
+                        elif raw_target is not None and 0 <= int(raw_target) < 4 and int(raw_target) != actor:
+                            loser = int(raw_target)
+                        elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != actor:
+                            loser = neg_scorers[0]
+                        elif current_last_discard_seat is not None and current_last_discard_seat != actor:
+                            loser = current_last_discard_seat
+                        elif neg_scorers:
+                            valid_negs = [s for s in neg_scorers if s != actor]
+                            if valid_negs:
+                                loser = valid_negs[0]
+
+                    if 0 <= actor < 4 and actor in self.stats:
+                        self.stats[actor]["agari"] += 1
+
+                    if 0 <= actor < len(player_names):
+                        winner_name = player_names[actor]
+                        if winner_name in self.profiles:
+                            p = self.profiles[winner_name]
+                            p.hora_count += 1
+                            win_score = 0
+                            # 1. Prioritize authentic score from h["score"] or ev["score"]
+                            ev_sc = h.get("score") or h.get("point_sum") or ev.get("score")
+                            if ev_sc is not None and 0 < int(ev_sc) <= 48000:
+                                win_score = int(ev_sc)
+                            # 2. Then deltas if within plausible single-hand range
+                            elif deltas and len(deltas) > actor and 0 < deltas[actor] <= 48000:
+                                win_score = deltas[actor]
+                            else:
+                                win_score = 5200
+                            p.hora_scores_sum += win_score
+
+                    # Ron deal-in check: strictly increment deal_in_count for loser only
+                    if loser is not None and loser != actor:
+                        if 0 <= loser < 4 and loser in self.stats:
+                            self.stats[loser]["houju"] += 1
+                        if 0 <= loser < len(player_names):
+                            victim_name = player_names[loser]
+                            if victim_name in self.profiles:
+                                self.profiles[victim_name].deal_in_count += 1
 
                 _commit_round()
 
-            elif etype in ("end_kyoku", "ryukyoku"):
+            elif etype in ("end_kyoku", "ryukyoku", "RecordLiuJu", "ActionLiuJu", "RecordNoTile", "ActionNoTile"):
                 _commit_round()
 
         # Final commit in case end_game happened without end_kyoku
