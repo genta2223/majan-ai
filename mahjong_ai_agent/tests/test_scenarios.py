@@ -3246,3 +3246,188 @@ def test_paifu_rpc_cdp_target_selection_and_structured_error_handling(monkeypatc
     assert "CDP Runtime evaluation exception: ReferenceError: NetAgent is not defined" in captured_exc
 
 
+def test_paifu_downloader_http_direct_fetch_priority(monkeypatch, tmp_path):
+    """
+    Verifies that HTTP direct fetching is the highest priority strategy in PaifuDownloader,
+    correctly normalizing JSON responses and decoding binary Protobuf records.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader
+    import json
+    import base64
+    import io
+    import urllib.request
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-http-test-uuid"
+
+    # 1. Test JSON response normalization
+    sample_json = {
+        "uuid": test_uuid,
+        "head": {
+            "accounts": [
+                {"seat": 0, "nickname": "genta2223"},
+                {"seat": 1, "nickname": "プロコフ"},
+                {"seat": 2, "nickname": ""},
+                {"seat": 3, "nickname": ""}
+            ]
+        },
+        "rounds": [{"actions": [{"action_name": "RecordNewRound", "chang": 0, "ju": 0}]}]
+    }
+
+    class MockHTTPResponse:
+        def __init__(self, data: bytes, status: int = 200):
+            self.data = data
+            self.status = status
+            self.headers = {"Content-Type": "application/json"}
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    # Mock urlopen to return sample_json for HTTP direct request
+    def mock_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "127.0.0.1" in url:
+            raise urllib.error.URLError("No local CDP running")
+        return MockHTTPResponse(json.dumps(sample_json).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    # Verify _fetch_from_http parses JSON
+    fetched = downloader._fetch_from_http(test_uuid)
+    assert fetched is not None
+    assert fetched["uuid"] == test_uuid
+    assert len(fetched["accounts"]) == 4
+    assert fetched["accounts"][0]["nickname"] == "genta2223"
+    assert len(fetched["rounds"]) == 1
+
+    # Verify _fetch_from_remote prioritizes HTTP direct fetch over CDP and RPC
+    called_order = []
+    def spy_http(uuid):
+        called_order.append("http")
+        return sample_json
+    def spy_unity(uuid):
+        called_order.append("unity_cdp")
+        return None
+    def spy_rpc(uuid):
+        called_order.append("rpc")
+        return None
+
+    monkeypatch.setattr(downloader, "_fetch_from_http", spy_http)
+    monkeypatch.setattr(downloader, "_fetch_via_unity_cdp", spy_unity)
+    monkeypatch.setattr(downloader, "_fetch_via_rpc", spy_rpc)
+
+    res = downloader._fetch_from_remote(test_uuid)
+    assert res == sample_json
+    assert called_order == ["http"]
+
+
+def test_paifu_downloader_unity_webgl_cdp_interception(monkeypatch, tmp_path):
+    """
+    Verifies that when HTTP direct fetching is unavailable, PaifuDownloader falls back to
+    Unity WebGL CDP Network interception, triggering replay navigation and capturing game packets.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader
+    import json
+    import asyncio
+    import websockets
+    import urllib.request
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-unity-cdp-uuid"
+
+    # Mock CDP targets list
+    targets_data = [
+        {
+            "id": "target-unity",
+            "type": "page",
+            "title": "雀魂 - 4.0.12 Unity WebGL",
+            "url": "https://game.mahjongsoul.com/",
+            "webSocketDebuggerUrl": "ws://dummy/unity_target"
+        }
+    ]
+
+    class MockCDPTargetResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+            self.status = 200
+            self.headers = {}
+        def read(self):
+            return self.data
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    def mock_cdp_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "127.0.0.1" in url and "/json" in url:
+            return MockCDPTargetResponse(json.dumps(targets_data).encode("utf-8"))
+        raise urllib.error.URLError("Not found")
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_cdp_urlopen)
+
+    # Mock WebSocket connection that simulates Unity WebGL CDP Network events
+    class MockUnityCDPWebSocket:
+        def __init__(self, url):
+            self.url = url
+            self._incoming = asyncio.Queue()
+            self._sent_cmds = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        async def send(self, msg_str):
+            msg = json.loads(msg_str)
+            self._sent_cmds.append(msg)
+            method = msg.get("method")
+            cid = msg.get("id")
+
+            if method in ("Network.enable", "Runtime.enable"):
+                await self._incoming.put(json.dumps({"id": cid, "result": {}}))
+            elif method == "Runtime.evaluate":
+                # Acknowledge kick_script
+                await self._incoming.put(json.dumps({"id": cid, "result": {"result": {"type": "string", "value": json.dumps({"success": True})}}}))
+                # Emit Network.responseReceived with paipu url
+                await self._incoming.put(json.dumps({
+                    "method": "Network.responseReceived",
+                    "params": {
+                        "requestId": "req-paifu-123",
+                        "response": {"url": f"https://game.mahjongsoul.com/api/record/{test_uuid}", "status": 200}
+                    }
+                }))
+            elif method == "Network.getResponseBody":
+                # Return JSON game record
+                record_payload = {
+                    "uuid": test_uuid,
+                    "head": {"accounts": [{"seat": 0, "nickname": "genta2223"}]},
+                    "rounds": [{"actions": [{"action_name": "RecordNewRound"}]}]
+                }
+                await self._incoming.put(json.dumps({
+                    "id": cid,
+                    "result": {
+                        "body": json.dumps(record_payload),
+                        "base64Encoded": False
+                    }
+                }))
+
+        async def recv(self):
+            return await self._incoming.get()
+
+    monkeypatch.setattr(websockets, "connect", lambda url, open_timeout=None: MockUnityCDPWebSocket(url))
+
+    # Verify fallback order: HTTP fails -> Unity CDP succeeds
+    monkeypatch.setattr(downloader, "_fetch_from_http", lambda uuid: None)
+
+    res = downloader._fetch_from_remote(test_uuid)
+    assert res is not None
+    assert res.get("uuid") == test_uuid
+    assert len(res.get("rounds", [])) == 1
+    assert res.get("accounts", [])[0]["nickname"] == "genta2223"
+
+

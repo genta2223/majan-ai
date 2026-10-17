@@ -150,6 +150,8 @@ class PaifuDownloader:
 
         return record_data
 
+    download = fetch_paifu
+
     def _is_corrupt_dummy(self, data: Dict[str, Any]) -> bool:
         """Detect if cache file is an obsolete dummy with no Hora events or placeholder names."""
         if not isinstance(data, dict):
@@ -633,41 +635,392 @@ class PaifuDownloader:
             print(f"[PaifuDownloader] CDP connection error: {e}")
             return None
 
-    def _fetch_from_remote(self, uuid: str) -> Optional[Dict[str, Any]]:
+    def _fetch_from_http(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
-        Attempts to fetch record:
-        1. On-demand active RPC directly through the running Majsoul browser session.
-        2. Public web APIs / gateways as fallback.
+        Fetches authentic game record directly via HTTP(S) endpoints or public APIs:
+        1. Official MahjongSoul public/CDN gateway endpoints.
+        2. Browser session fetch() with same-origin credentials via CDP if available.
+        3. Public aggregator / replay endpoints.
         """
-        # 1. Primary: Active RPC call via CDP directly to Majsoul server
-        rpc_record = self._fetch_via_rpc(uuid)
-        if rpc_record:
-            print(f"[PaifuDownloader] Successfully fetched authentic game record via active Majsoul RPC for: {uuid}")
-            return rpc_record
+        # 1. Attempt browser same-origin fetch via CDP (carries session cookies & credentials)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                targets = json.loads(resp.read().decode("utf-8"))
+            
+            game_target = next(
+                (t for t in targets if ("mahjongsoul" in t.get("url", "").lower() or "雀魂" in t.get("title", "")) and t.get("webSocketDebuggerUrl")),
+                None
+            )
+            if game_target:
+                import websockets
+                import asyncio
 
-        # 2. Secondary: Public API endpoints
-        api_endpoints = [
-            f"https://api.mahjongsoul.com/record?uuid={uuid}",
+                async def _browser_fetch():
+                    async with websockets.connect(game_target["webSocketDebuggerUrl"], open_timeout=2.0) as ws:
+                        js_fetch = f"""
+                        (async function() {{
+                            let targetUuid = {json.dumps(uuid)};
+                            let endpoints = [
+                                "/api/record/" + targetUuid,
+                                "/record?uuid=" + targetUuid,
+                                "https://passport.mahjongsoul.com/record?uuid=" + targetUuid
+                            ];
+                            for (let ep of endpoints) {{
+                                try {{
+                                    let r = await fetch(ep, {{ credentials: "include" }});
+                                    if (r.ok) {{
+                                        let text = await r.text();
+                                        return JSON.stringify({{ success: true, url: ep, data: text }});
+                                    }}
+                                }} catch(e) {{}}
+                            }}
+                            return JSON.stringify({{ success: false }});
+                        }})()
+                        """
+                        cmd = {
+                            "id": 10,
+                            "method": "Runtime.evaluate",
+                            "params": {
+                                "expression": js_fetch,
+                                "awaitPromise": True,
+                                "returnByValue": True
+                            }
+                        }
+                        await ws.send(json.dumps(cmd))
+                        res_str = await asyncio.wait_for(ws.recv(), timeout=4.0)
+                        res_obj = json.loads(res_str)
+                        val = res_obj.get("result", {}).get("result", {}).get("value")
+                        if val:
+                            data = json.loads(val) if isinstance(val, str) else val
+                            if data.get("success") and data.get("data"):
+                                raw_text = data["data"]
+                                try:
+                                    parsed = json.loads(raw_text)
+                                    return self._normalize_record_dict(parsed, uuid)
+                                except Exception:
+                                    pass
+                    return None
+
+                try:
+                    res = asyncio.run(_browser_fetch())
+                    if res:
+                        print(f"[PaifuDownloader] Successfully fetched record via browser in-session HTTP for: {uuid}")
+                        return res
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2. Direct HTTP requests to candidate public/CDN endpoints
+        candidate_urls = [
             f"https://game.mahjongsoul.com/api/record/{uuid}",
+            f"https://passport.mahjongsoul.com/record?uuid={uuid}",
+            f"https://api.mahjongsoul.com/record?uuid={uuid}",
+            f"https://nodocchi.moe/api/paifu/{uuid}",
+            f"https://jpgs.mahjongsoul.com/api/clientgate/record?uuid={uuid}",
+            f"https://game.mahjongsoul.com/record?uuid={uuid}",
         ]
 
-        for url in api_endpoints:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://game.mahjongsoul.com/",
+            "Origin": "https://game.mahjongsoul.com",
+            "Accept": "application/json, application/octet-stream, */*",
+        }
+
+        for url in candidate_urls:
             try:
-                req = urllib.request.Request(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MajsoulAI/1.0"}
-                )
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=2.5) as resp:
                     if resp.status == 200:
                         raw = resp.read()
+                        if not raw:
+                            continue
+
+                        # Check if JSON
                         try:
-                            return json.loads(raw.decode("utf-8"))
-                        except json.JSONDecodeError:
-                            decoded = LiqiProtoDecoder.decode_frame(raw)
-                            if decoded:
-                                return {"uuid": uuid, "actions": [decoded]}
+                            parsed = json.loads(raw.decode("utf-8"))
+                            normalized = self._normalize_record_dict(parsed, uuid)
+                            if normalized:
+                                print(f"[PaifuDownloader] Successfully fetched record via HTTP ({url}) for: {uuid}")
+                                return normalized
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Try Protobuf decode on raw binary
+                            actions = decode_game_detail_records(raw)
+                            if actions:
+                                print(f"[PaifuDownloader] Successfully decoded binary protobuf record via HTTP ({url}) for: {uuid}")
+                                return {
+                                    "uuid": uuid,
+                                    "head": {},
+                                    "rounds": [{"actions": actions}],
+                                }
+                            decoded_action = LiqiProtoDecoder.decode_frame(raw)
+                            if decoded_action:
+                                return {
+                                    "uuid": uuid,
+                                    "head": {},
+                                    "rounds": [{"actions": [decoded_action]}],
+                                }
             except Exception:
                 continue
+
+        return None
+
+    def _normalize_record_dict(self, record_data: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
+        """
+        Normalizes various API response formats into standard MahjongSoul game record dict.
+        """
+        if not isinstance(record_data, dict):
+            return None
+
+        # If wrapped under data or result
+        if "result" in record_data and isinstance(record_data["result"], dict):
+            record_data = record_data["result"]
+        elif "data" in record_data and isinstance(record_data["data"], dict):
+            inner = record_data["data"]
+            # Merge top-level metadata if present
+            for k in ("head", "accounts", "uuid"):
+                if k in record_data and k not in inner:
+                    inner[k] = record_data[k]
+            record_data = inner
+
+        payload: Dict[str, Any] = {
+            "uuid": record_data.get("uuid", uuid),
+            "head": record_data.get("head", {}),
+            "rounds": record_data.get("rounds", []),
+        }
+
+        if "accounts" in record_data:
+            payload["accounts"] = record_data["accounts"]
+        elif "head" in record_data and isinstance(record_data["head"], dict) and "accounts" in record_data["head"]:
+            payload["accounts"] = record_data["head"]["accounts"]
+
+        # Decode base64 binary or data_url if rounds not populated
+        if not payload.get("rounds"):
+            data_base64 = record_data.get("data_base64")
+            if data_base64:
+                try:
+                    raw_bytes = base64.b64decode(data_base64)
+                    actions = decode_game_detail_records(raw_bytes)
+                    if actions:
+                        payload["rounds"] = [{"actions": actions}]
+                except Exception:
+                    pass
+
+            data_url = record_data.get("data_url")
+            if data_url and not payload.get("rounds"):
+                try:
+                    req = urllib.request.Request(data_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        if resp.status == 200:
+                            raw_bytes = resp.read()
+                            actions = decode_game_detail_records(raw_bytes)
+                            if actions:
+                                payload["rounds"] = [{"actions": actions}]
+                except Exception:
+                    pass
+
+        if payload.get("rounds") or payload.get("actions") or payload.get("accounts"):
+            return payload
+
+        return None
+
+    def _fetch_via_unity_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
+        """
+        Direct approach for Unity WebGL client:
+        1. Connects to running Unity WebGL browser session via CDP.
+        2. Enables CDP Network monitoring (Network.webSocketFrameReceived & Network.responseReceived).
+        3. Dispatches replay navigation to Unity instance (window.unityInstance.SendMessage or history.pushState).
+        4. Intercepts incoming game packets and decodes authentic paifu record.
+        """
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                targets = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+        # Locate MahjongSoul page target
+        game_target = next(
+            (t for t in targets if ("mahjongsoul" in t.get("url", "").lower() or "雀魂" in t.get("title", "")) and t.get("webSocketDebuggerUrl")),
+            None
+        )
+        if not game_target:
+            return None
+
+        ws_url = game_target["webSocketDebuggerUrl"]
+
+        try:
+            import websockets
+            import asyncio
+
+            async def _intercept_unity():
+                async with websockets.connect(ws_url, open_timeout=2.5) as ws:
+                    captured_record = None
+
+                    # 1. Enable CDP Network and Runtime domains
+                    await ws.send(json.dumps({"id": 1, "method": "Network.enable", "params": {}}))
+                    await ws.send(json.dumps({"id": 2, "method": "Runtime.enable", "params": {}}))
+
+                    # 2. Trigger Unity WebGL to fetch paifu replay
+                    kick_script = f"""
+                    (function() {{
+                        let targetUuid = {json.dumps(uuid)};
+                        let triggers = [];
+
+                        // A. Push paipu URL state to browser history
+                        try {{
+                            let newUrl = "/?paipu=" + targetUuid;
+                            window.history.pushState(null, "", newUrl);
+                            window.dispatchEvent(new PopStateEvent("popstate"));
+                            triggers.push("history.pushState");
+                        }} catch (e) {{}}
+
+                        // B. Send message to Unity instance if available
+                        if (window.unityInstance && typeof window.unityInstance.SendMessage === "function") {{
+                            try {{
+                                window.unityInstance.SendMessage("GameMgr", "OnUrlChange", "/?paipu=" + targetUuid);
+                                triggers.push("unityInstance.OnUrlChange");
+                            }} catch (e) {{}}
+                            try {{
+                                window.unityInstance.SendMessage("GameMgr", "OpenRecord", targetUuid);
+                                triggers.push("unityInstance.OpenRecord");
+                            }} catch (e) {{}}
+                        }}
+
+                        return JSON.stringify({{ success: true, triggers: triggers }});
+                    }})()
+                    """
+                    await ws.send(json.dumps({
+                        "id": 3,
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": kick_script, "returnByValue": True}
+                    }))
+
+                    # 3. Monitor network packets for up to 5 seconds
+                    start_t = asyncio.get_event_loop().time()
+                    while asyncio.get_event_loop().time() - start_t < 5.0:
+                        try:
+                            msg_str = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            msg = json.loads(msg_str)
+                            method = msg.get("method", "")
+                            params = msg.get("params", {})
+
+                            # Intercept WebSocket binary frames (Unity WebGL communicates via WSS)
+                            if method == "Network.webSocketFrameReceived":
+                                resp_data = params.get("response", {})
+                                payload_data = resp_data.get("payloadData", "")
+                                if payload_data:
+                                    try:
+                                        raw_bytes = base64.b64decode(payload_data)
+                                        # Check if contains GameDetailRecords or Liqi actions
+                                        actions = decode_game_detail_records(raw_bytes)
+                                        if actions and len(actions) > 0:
+                                            captured_record = {
+                                                "uuid": uuid,
+                                                "head": {},
+                                                "rounds": [{"actions": actions}]
+                                            }
+                                            break
+                                    except Exception:
+                                        pass
+
+                            # Intercept HTTP response if fetched via HTTP
+                            elif method == "Network.responseReceived":
+                                resp_info = params.get("response", {})
+                                r_url = resp_info.get("url", "")
+                                req_id = params.get("requestId")
+                                if ("record" in r_url or "paipu" in r_url or uuid in r_url) and req_id:
+                                    # Request response body
+                                    body_cmd_id = 999
+                                    await ws.send(json.dumps({
+                                        "id": body_cmd_id,
+                                        "method": "Network.getResponseBody",
+                                        "params": {"requestId": req_id}
+                                    }))
+                                    body_resp_str = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                                    body_resp = json.loads(body_resp_str)
+                                    body_result = body_resp.get("result", {})
+                                    body_text = body_result.get("body", "")
+                                    is_b64 = body_result.get("base64Encoded", False)
+                                    if body_text:
+                                        if is_b64:
+                                            raw_b = base64.b64decode(body_text)
+                                            actions = decode_game_detail_records(raw_b)
+                                            if actions:
+                                                captured_record = {
+                                                    "uuid": uuid,
+                                                    "head": {},
+                                                    "rounds": [{"actions": actions}]
+                                                }
+                                                break
+                                        else:
+                                            try:
+                                                parsed = json.loads(body_text)
+                                                norm = self._normalize_record_dict(parsed, uuid)
+                                                if norm:
+                                                    captured_record = norm
+                                                    break
+                                            except Exception:
+                                                pass
+                        except asyncio.TimeoutError:
+                            continue
+                        except Exception:
+                            break
+
+                    return captured_record
+
+            try:
+                try:
+                    running_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    running_loop = None
+
+                if running_loop and running_loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(lambda: asyncio.run(_intercept_unity()))
+                        rec = future.result(timeout=10.0)
+                else:
+                    rec = asyncio.run(_intercept_unity())
+
+                if rec:
+                    print(f"[PaifuDownloader] Successfully intercepted game record via Unity WebGL CDP network for: {uuid}")
+                    return rec
+            except Exception as e:
+                print(f"[PaifuDownloader] Unity WebGL CDP interception failed: {e}")
+                return None
+        except Exception:
+            return None
+
+        return None
+
+    def _fetch_from_remote(self, uuid: str) -> Optional[Dict[str, Any]]:
+        """
+        Multi-strategy game record fetching:
+        1. HTTP Direct Download (Highest Priority):
+           Directly fetches paifu packet from MahjongSoul official/CDN or browser in-session endpoints.
+        2. Unity WebGL CDP Network Interception:
+           Hooks Unity WebGL client via CDP Network events and triggers replay fetch.
+        3. Legacy RPC Fallback:
+           Executes app.NetAgent RPC for older client environments.
+        """
+        # 1. Primary: Direct HTTP(S) download (Fastest & most robust)
+        http_record = self._fetch_from_http(uuid)
+        if http_record:
+            return http_record
+
+        # 2. Secondary: Unity WebGL CDP Network Interception
+        unity_record = self._fetch_via_unity_cdp(uuid)
+        if unity_record:
+            return unity_record
+
+        # 3. Tertiary: Legacy RPC fallback (app.NetAgent)
+        rpc_record = self._fetch_via_rpc(uuid)
+        if rpc_record:
+            print(f"[PaifuDownloader] Successfully fetched game record via legacy RPC for: {uuid}")
+            return rpc_record
 
         return None
 
