@@ -294,26 +294,40 @@ class MajsoulBridge:
                 self.current_game_uuid = str(uuid)
             return []
 
-        # 2. Player info updates, Auth responses, or mid-game sync
+        # 2. Player info updates, Auth responses, table animations, or mid-game sync
         if clean_name in (
             "ResAuthGame", "NotifyRoomPlayerUpdate", "NotifyPlayerLoadGameReady",
+            "NotifyRoomGameStart", "ActionMJStart",
             "syncGame", "ResSyncGame", "fetchGamePlayerState"
         ):
-            plist = data.get("players") or data.get("player_list") or data.get("seat_list") or []
+            plist = (
+                data.get("players")
+                or data.get("player_list")
+                or data.get("seat_list")
+                or data.get("seats")
+                or []
+            )
             if plist:
                 self.resolve_seat_from_player_list(plist)
             uuid = data.get("game_uuid") or data.get("uuid")
             if uuid:
                 self.current_game_uuid = str(uuid)
 
-            # If mid-game state sync has game details and we are not in round, initialize
+            # ActionMJStart / NotifyRoomGameStart are pre-game table opening animations:
+            # They MUST NOT reset hand tiles or emit empty start_kyoku! Keep state clean until ActionNewRound.
+            if clean_name in ("NotifyRoomGameStart", "ActionMJStart"):
+                print(f"[MajsoulBridge] Pre-game animation '{clean_name}' acknowledged. Ready for authentic ActionNewRound.")
+                return []
+
+            # If mid-game state sync has game details and we are not in round, initialize via rescue
             if clean_name in ("syncGame", "ResSyncGame", "fetchGamePlayerState") and not self._in_round:
                 rescue_start = self._generate_rescue_start_kyoku(data, clean_name)
                 events.append(rescue_start)
                 self._in_round = True
             return events
 
-        if clean_name in ("ActionNewRound", "RecordNewRound", "ActionMJStart", "NotifyRoomGameStart"):
+        # 3. Authentic Round Start: ONLY ActionNewRound and RecordNewRound carry verified 13-tile hands
+        if clean_name in ("ActionNewRound", "RecordNewRound"):
             # New Round (start_kyoku)
             self._last_discard_seat = None
 
@@ -462,11 +476,12 @@ class MajsoulBridge:
             
             # Dynamic Seat resolution:
             # If live packet contains operations or multi-tile self hand, this seat IS self!
-            has_self_indicators = (
-                bool(data.get("operation_list") or data.get("operations"))
-                or (isinstance(data.get("tiles"), (list, tuple)) and len(data.get("tiles")) >= 2)
+            has_explicit_operations = bool("operation_list" in data or "operations" in data)
+            has_multi_tiles = (
+                (isinstance(data.get("tiles"), (list, tuple)) and len(data.get("tiles")) >= 2)
                 or (isinstance(data.get("hand"), (list, tuple)) and len(data.get("hand")) >= 2)
             )
+            has_self_indicators = has_explicit_operations or has_multi_tiles
             if not clean_name.startswith("Record") and has_self_indicators:
                 if self.my_seat != seat and 0 <= safe_coerce_int(seat, -1) <= 3:
                     print(f"[MajsoulBridge AutoSeat] Identified self seat {seat} from deal operations/hand. Switched self seat {self.my_seat} -> {seat}.")

@@ -71,6 +71,7 @@ class MahjongAIAgent:
         # for the current round, vision is locked out until the next start_kyoku.
         self.vision_fallback_enabled: bool = bool(self.config.get("vision_fallback_enabled", True))
         self.packet_hand_trusted: bool = False
+        self._first_turn_acted: bool = False
 
     def set_my_actor_id(self, seat: int) -> None:
         """Dynamically updates self actor ID and state manager."""
@@ -101,6 +102,7 @@ class MahjongAIAgent:
 
         # 0. Automatic Seat Detection from server messages
         if event_type == "start_kyoku":
+            self._first_turn_acted = False
             tehais = event.get("tehais", [])
             has_visible = False
             for s_idx, hand in enumerate(tehais):
@@ -228,14 +230,23 @@ class MahjongAIAgent:
             except Exception:
                 pass
 
-        # Direct 1st turn trigger for dealer on regular round start
-        if event_type == "start_kyoku":
-            is_dealer_self = (self.state_mgr.round_state and self.state_mgr.round_state.oya == self.my_actor_id)
-            if is_dealer_self or self.state_mgr.is_my_turn:
-                self.state_mgr.ensure_dealer_first_tsumo()
-                asyncio.create_task(self._schedule_first_turn_watchdog(delay_sec=0.2))
-                print(f"[Main FirstTurn] Dealer initial turn detected on start_kyoku. Triggering decide_and_act() immediately.")
-                return await self.decide_and_act()
+        # HARD-SAFETY: Ready-Trigger for 1st turn of each round (dealer or child)
+        # As soon as self hand reaches Ready state (0 discards, is_my_turn == True or dealer with 13+ tiles, not yet acted),
+        # forcefully and immediately trigger decide_and_act() to bypass any event waiting deadlocks!
+        if self.state_mgr.round_state and not self.state_mgr.round_state.is_round_over:
+            my_p = self.state_mgr.my_player
+            if my_p and len(my_p.discards) == 0 and not self._first_turn_acted:
+                is_dealer_self = (self.state_mgr.round_state.oya == self.my_actor_id)
+                hand_len = len([t for t in my_p.tehai if is_valid_mahjong_tile(t)])
+                if is_dealer_self and hand_len >= 13:
+                    self._first_turn_acted = True
+                    self.state_mgr.ensure_dealer_first_tsumo()
+                    print(f"[Main ReadyTrigger] Dealer 1st turn Ready state detected (Player {self.my_actor_id}, Hand={len(my_p.tehai)}). Triggering decide_and_act()!")
+                    return await self.decide_and_act()
+                elif self.state_mgr.is_my_turn and hand_len >= 14:
+                    self._first_turn_acted = True
+                    print(f"[Main ReadyTrigger] Child 1st turn Ready state detected (Player {self.my_actor_id}, Hand={len(my_p.tehai)}). Triggering decide_and_act()!")
+                    return await self.decide_and_act()
 
         # Strict guard condition checking if self decision is genuinely required
         from io_adapter.stream_client import is_my_decision_required

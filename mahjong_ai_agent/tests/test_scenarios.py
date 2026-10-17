@@ -4531,10 +4531,8 @@ def test_action_mjstart_does_not_trigger_vision_fallback(monkeypatch):
     bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=True)
     events = bridge.translate_action("ActionMJStart", {})
     assert not called, "Vision fallback must NEVER be triggered for ActionMJStart"
-    assert len(events) == 1
-    assert events[0]["type"] == "start_kyoku"
-    # Self hand should be 13 unknown '?' tiles, NOT 14 'P' tiles!
-    assert events[0]["tehais"][0] == ["?"] * 13
+    # ActionMJStart is a pre-game table animation and must NOT emit empty start_kyoku or reset state
+    assert len(events) == 0
 
 
 def test_state_manager_moqie_tsumogiri_preserves_hand_on_unmatched_tile():
@@ -4612,9 +4610,8 @@ def test_notify_room_game_start_does_not_trigger_vision_fallback(monkeypatch):
     bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=True)
     events = bridge.translate_action("NotifyRoomGameStart", {})
     assert not called, "Vision fallback must NEVER be triggered for NotifyRoomGameStart"
-    assert len(events) == 1
-    assert events[0]["type"] == "start_kyoku"
-    assert events[0]["tehais"][0] == ["?"] * 13
+    # NotifyRoomGameStart is a pre-game table opening animation and must NOT emit empty start_kyoku or reset state
+    assert len(events) == 0
 
 
 def test_oya_initial_tsumo_emission_brings_hand_to_14_tiles():
@@ -5313,11 +5310,9 @@ async def test_first_turn_resilience_under_noisy_async_packets(test_config):
 
     bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=False)
 
-    # 1. ActionMJStart arrives first (table animation) -> Emits placeholder without blocking or vision fallback
+    # 1. ActionMJStart arrives first (table animation) -> Does NOT reset state or emit empty start_kyoku
     mj_start_events = bridge.translate_action("ActionMJStart", {})
-    assert len(mj_start_events) == 1
-    assert mj_start_events[0]["type"] == "start_kyoku"
-    assert mj_start_events[0]["tehais"][0] == ["?"] * 13
+    assert len(mj_start_events) == 0
 
     # 2. Genuine ActionNewRound arrives for Dealer (oya=0) with 13-tile hand
     new_round_data = {
@@ -5657,6 +5652,117 @@ def test_rescue_route_does_not_unconditionally_bind_when_empty():
     sm.update_event(rescue_event)
     # Rescue route with no visible tiles must have empty clean hand awaiting sync, not fake tiles
     assert len(sm.my_player.tehai) == 0
+
+
+@pytest.mark.asyncio
+async def test_first_turn_ready_trigger_dealer_autonomous(test_config):
+    """
+    Verify complete round opening lifecycle for dealer:
+    1. ActionMJStart arrives -> No empty start_kyoku emitted, no state reset.
+    2. ActionNewRound arrives -> Verified 13 tiles assigned, ReadyTrigger kicks 1st turn immediately.
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from main import MahjongAIAgent
+
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=False)
+    agent = MahjongAIAgent(config=test_config, my_actor_id=0, apply_sleep=False)
+    agent.vision_fallback_enabled = False
+
+    # 1. ActionMJStart arrives (opening animation)
+    mjstart_events = bridge.translate_action("ActionMJStart", {})
+    assert len(mjstart_events) == 0  # Must NOT emit empty start_kyoku
+
+    # 2. Genuine ActionNewRound arrives for dealer (oya=0)
+    nr_data = {
+        "chang": 0, "ju": 0, "ben": 0, "liqibang": 0, "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tiles": ["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4s"],
+        "doras": ["1p"]
+    }
+    nr_events = bridge.translate_action("ActionNewRound", nr_data)
+    assert len(nr_events) >= 1
+
+    # Dealer handles start_kyoku -> ReadyTrigger must fire immediately
+    action = await agent.handle_event(nr_events[0])
+    assert action is not None, "Dealer 1st turn decision MUST NOT be None or frozen!"
+    assert agent._first_turn_acted is True
+    assert len(agent.state_mgr.my_player.tehai) == 14
+
+
+@pytest.mark.asyncio
+async def test_first_turn_ready_trigger_child_north_autonomous(test_config):
+    """
+    Verify complete round opening lifecycle for non-dealer (North, seat=3):
+    1. ResAuthGame resolves account_id to seat 3 before round start.
+    2. ActionMJStart acknowledged without state corruption.
+    3. ActionNewRound binds 13 tiles to Player 3.
+    4. ActionDealTile seat=3 carries authentic tile -> Not masked to '?', ReadyTrigger kicks 1st turn!
+    """
+    from io_adapter.majsoul_bridge import MajsoulBridge
+    from main import MahjongAIAgent
+
+    bridge = MajsoulBridge(my_seat=0, vision_fallback_enabled=False)
+    agent = MahjongAIAgent(config=test_config, my_actor_id=0, apply_sleep=False)
+    agent.vision_fallback_enabled = False
+
+    # 1. Auth sets my_account_id
+    bridge.set_my_account_id(12345)
+
+    # 2. ResAuthGame carries seat list where seat 3 matches account_id 12345
+    auth_resp = {
+        "players": [
+            {"account_id": 11111, "seat": 0, "nickname": "East"},
+            {"account_id": 22222, "seat": 1, "nickname": "South"},
+            {"account_id": 33333, "seat": 2, "nickname": "West"},
+            {"account_id": 12345, "seat": 3, "nickname": "MyNorth"}
+        ]
+    }
+    bridge.translate_action("ResAuthGame", auth_resp)
+    assert bridge.my_seat == 3, "Self seat must be pre-resolved to 3 before round start!"
+    agent.set_my_actor_id(3)
+
+    # 3. ActionMJStart arrives
+    mj_events = bridge.translate_action("ActionMJStart", {})
+    assert len(mj_events) == 0
+
+    # 4. ActionNewRound arrives with self hand
+    initial_tiles = ["1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s", "1m", "2m", "3m", "4m"]
+    nr_data = {
+        "chang": 0, "ju": 0, "ben": 0, "liqibang": 0, "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tiles": initial_tiles,
+        "doras": ["9p"]
+    }
+    nr_events = bridge.translate_action("ActionNewRound", nr_data)
+    assert len(nr_events) == 1
+    # Hand must be directly placed in seat 3
+    assert nr_events[0]["tehais"][3] == initial_tiles
+
+    # Agent handles start_kyoku (child waits, does not discard yet)
+    act_start = await agent.handle_event(nr_events[0])
+    assert act_start is None
+    assert len(agent.state_mgr.my_player.tehai) == 13
+
+    # 5. Dealer discards (P0 discards 1z)
+    p0_discard = {"type": "dahai", "actor": 0, "pai": "1z", "tsumogiri": True}
+    act_p0 = await agent.handle_event(p0_discard)
+    assert act_p0 is None
+
+    # 6. Child (North, seat=3) receives 1st turn deal tile (ActionDealTile seat=3, tile='5m')
+    deal_events = bridge.translate_action("ActionDealTile", {
+        "seat": 3,
+        "tile": "5m"
+    })
+    assert len(deal_events) == 1
+    # Crucial check: Tile MUST NOT be masked to '?'!
+    assert deal_events[0]["pai"] == "5m"
+
+    # Agent handles child's 1st tsumo -> ReadyTrigger MUST fire immediately!
+    act_draw = await agent.handle_event(deal_events[0])
+    assert act_draw is not None, "Child 1st turn decision MUST NOT be None or frozen!"
+    assert agent._first_turn_acted is True
+    assert len(agent.state_mgr.my_player.tehai) == 14
+    assert act_draw.tile in agent.state_mgr.my_player.tehai
 
 
 
