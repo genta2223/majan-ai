@@ -104,16 +104,17 @@ def _is_meaningful_actions(actions: List[Dict[str, Any]]) -> bool:
     """Checks whether the decoded action list contains authentic mahjong events."""
     if not actions:
         return False
-    meaningful_count = 0
     for a in actions:
         if not isinstance(a, dict):
             continue
         name = a.get("action_name") or a.get("name") or ""
         if name and name != "UnknownAction" and (
-            name.startswith("Record") or name.startswith("Action") or name in ("hora", "ryukyoku", "chi", "pon", "reach")
+            name.startswith("Record")
+            or name.startswith("Action")
+            or name in ("hora", "ryukyoku", "chi", "pon", "reach", "kan", "dora", "deal", "discard")
         ):
-            meaningful_count += 1
-    return meaningful_count >= 1
+            return True
+    return False
 
 
 class PaifuDownloader:
@@ -887,27 +888,37 @@ class PaifuDownloader:
         return True  # Modern MahjongSoul is Unity WebGL Build 4.0.12+
 
     def _decompress_gzip_slice(self, raw_bytes: bytes) -> Optional[bytes]:
-        """Searches for gzip magic header 0x1f 0x8b and decompresses stream, handling trailing data."""
+        """Searches for gzip magic header 0x1f 0x8b across all offsets and decompresses stream, handling trailing data."""
         if not raw_bytes:
             return None
         import gzip
         import zlib
-        idx = raw_bytes.find(b"\x1f\x8b")
-        if idx == -1:
-            return None
-        target_slice = raw_bytes[idx:]
-        try:
-            return gzip.decompress(target_slice)
-        except Exception:
-            pass
-        try:
-            # 16 + MAX_WBITS enables gzip decoding while ignoring extra trailing bytes
-            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-            decompressed = d.decompress(target_slice)
-            if decompressed:
-                return decompressed
-        except Exception:
-            pass
+        idx = 0
+        while True:
+            idx = raw_bytes.find(b"\x1f\x8b", idx)
+            if idx == -1:
+                break
+            target_slice = raw_bytes[idx:]
+            try:
+                return gzip.decompress(target_slice)
+            except Exception:
+                pass
+            try:
+                # 16 + MAX_WBITS enables gzip decoding while ignoring extra trailing bytes
+                d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                decompressed = d.decompress(target_slice)
+                if decompressed:
+                    return decompressed
+            except Exception:
+                pass
+            try:
+                d = zlib.decompressobj(32 + zlib.MAX_WBITS)
+                decompressed = d.decompress(target_slice)
+                if decompressed:
+                    return decompressed
+            except Exception:
+                pass
+            idx += 1
         return None
 
     def _extract_accounts_from_protobuf(self, fields: Dict[int, List[Any]]) -> Tuple[str, List[Dict[str, Any]]]:
@@ -1002,93 +1013,165 @@ class PaifuDownloader:
         accounts = [seat_to_account[s] for s in sorted(seat_to_account.keys())]
         return extracted_uuid, accounts
 
-    def _try_decode_records(self, raw_bytes: bytes, uuid: str) -> Optional[Dict[str, Any]]:
+    def _try_decode_records(
+        self,
+        raw_bytes: bytes,
+        uuid: str = "",
+        on_diag: Optional[Callable[[str], None]] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Attempts to decode GameDetailRecords actions or ResGameRecord protobuf structure
         across various Liqi packet offsets (offset 3 for Liqi RPC response, offset 0, offset 1, etc).
-        Prioritizes structured ResGameRecord protobuf parsing (field 2 data + multi-format head accounts)
-        so that authentic player nicknames/accounts and all rounds/actions are restored.
+        Outputs 5-step diagnostic logs for large match frames (len >= 1000) and automatically
+        generates fallback UUIDs if missing.
         """
         if not raw_bytes or len(raw_bytes) < 10:
             return None
 
+        is_large = len(raw_bytes) >= 1000
+
+        def diag(msg: str):
+            print(msg)
+            if on_diag:
+                try:
+                    on_diag(msg)
+                except Exception:
+                    pass
+
+        if is_large:
+            diag(f"[PaifuSniffer] 巨大フレーム検知: len={len(raw_bytes)} (解析開始)")
+
         # Determine potential protobuf start offsets based on Liqi header signatures
-        offsets = [0, 3, 1]
+        offsets = [0, 3, 1, 2, 4]
         if len(raw_bytes) >= 3:
             if raw_bytes[0] in (0x02, 0x03):  # Liqi RPC response (type 1B + req_id 2B)
-                offsets = [3, 0, 1]
+                offsets = [3, 0, 1, 2, 4]
             elif raw_bytes[0] == 0x01:  # Liqi notification / action (type 1B + method_len 2B)
                 method_len = int.from_bytes(raw_bytes[1:3], "little")
                 if 0 < method_len < 100 and len(raw_bytes) > 3 + method_len:
-                    offsets = [3 + method_len, 3, 0, 1]
+                    offsets = [3 + method_len, 3, 0, 1, 2]
 
+        parsed_fields = None
+        best_off = 0
+        extracted_uuid = ""
+        accounts: List[Dict[str, Any]] = []
+
+        # ① Step 1: Protobuf wire-format parsing
         for off in offsets:
             if len(raw_bytes) <= off:
                 continue
-            chunk = raw_bytes[off:]
+            f = decode_raw_protobuf(raw_bytes[off:])
+            if f and len(f) > 0:
+                parsed_fields = f
+                best_off = off
+                extracted_uuid, accounts = self._extract_accounts_from_protobuf(f)
+                break
 
-            # 1. First priority: Protobuf wire decode for ResGameRecord
-            try:
-                fields = decode_raw_protobuf(chunk)
-                if fields:
-                    extracted_uuid, accounts = self._extract_accounts_from_protobuf(fields)
+        if is_large:
+            tags = sorted(list(parsed_fields.keys())) if parsed_fields else []
+            diag(f"[PaifuSniffer] ① Protobuf wire-format パース: オフセット={best_off}, 検出タグ一覧={tags} (成功={bool(parsed_fields)})")
 
-                    # Look for data blob (often field 2 or any field with gzip / large content)
-                    candidate_blobs = list(fields.get(2, []))
-                    if not candidate_blobs:
-                        for tag, vals in fields.items():
-                            if tag != 1:  # skip error
-                                for val in vals:
-                                    if isinstance(val, (bytes, bytearray)) and (b"\x1f\x8b" in val or len(val) > 1000):
-                                        candidate_blobs.append(val)
+        # ② Step 2: gzip decompression
+        gzip_offset = raw_bytes.find(b"\x1f\x8b")
+        decomp_bytes = None
+        compressed_len = 0
+        decomp_len = 0
+        decomp_success = False
 
-                    for data_blob in candidate_blobs:
-                        if isinstance(data_blob, (bytes, bytearray)):
-                            d_bytes = bytes(data_blob)
-                            decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
-                            inner_actions = decode_game_detail_records(decomp)
-                            if _is_meaningful_actions(inner_actions):
-                                final_uuid = uuid or extracted_uuid
-                                if not final_uuid:
-                                    import hashlib
-                                    final_uuid = f"paifu_{hashlib.md5(d_bytes[:512]).hexdigest()[:12]}"
-                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord at offset {off} (UUID: {final_uuid}, Accounts: {len(accounts)})!")
-                                payload = {
-                                    "uuid": final_uuid,
-                                    "head": {"accounts": accounts, "uuid": final_uuid} if accounts else {"uuid": final_uuid},
-                                    "rounds": [{"actions": inner_actions}]
-                                }
-                                if accounts:
-                                    payload["accounts"] = accounts
-                                    payload["players"] = accounts
-                                return payload
-            except Exception:
-                pass
+        # Try extracting gzip data from protobuf candidate blobs
+        if parsed_fields:
+            candidate_blobs = list(parsed_fields.get(2, []))
+            if not candidate_blobs:
+                for tag, vals in parsed_fields.items():
+                    if tag != 1:  # skip error tag
+                        for val in vals:
+                            if isinstance(val, (bytes, bytearray)) and (b"\x1f\x8b" in val or len(val) > 500):
+                                candidate_blobs.append(val)
 
-            # 2. Second priority: Gzip stream decompression from chunk (standalone GameDetailRecords)
-            gzip_decomp = self._decompress_gzip_slice(chunk)
-            if gzip_decomp:
-                actions = decode_game_detail_records(gzip_decomp)
-                if _is_meaningful_actions(actions):
-                    import hashlib
-                    final_uuid = uuid or f"paifu_{hashlib.md5(chunk[:512]).hexdigest()[:12]}"
-                    print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from gzip stream at offset {off}!")
-                    return {
-                        "uuid": final_uuid,
-                        "head": {"uuid": final_uuid},
-                        "rounds": [{"actions": actions}]
-                    }
+            for cb in candidate_blobs:
+                if isinstance(cb, (bytes, bytearray)):
+                    d = self._decompress_gzip_slice(bytes(cb))
+                    if d:
+                        decomp_bytes = d
+                        compressed_len = len(cb)
+                        decomp_len = len(d)
+                        decomp_success = True
+                        break
 
-            # 3. Third priority: Direct GameDetailRecords decode on uncompressed chunk
-            actions = decode_game_detail_records(chunk)
-            if _is_meaningful_actions(actions):
-                final_uuid = uuid or f"paifu_{int(time.time())}"
-                print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions directly at offset {off}!")
-                return {
-                    "uuid": final_uuid,
-                    "head": {"uuid": final_uuid},
-                    "rounds": [{"actions": actions}]
-                }
+        # Fallback: decompress directly from raw_bytes gzip_offset
+        if not decomp_success and gzip_offset != -1:
+            d = self._decompress_gzip_slice(raw_bytes[gzip_offset:])
+            if d:
+                decomp_bytes = d
+                compressed_len = len(raw_bytes) - gzip_offset
+                decomp_len = len(d)
+                decomp_success = True
+
+        if is_large:
+            diag(f"[PaifuSniffer] ② gzip 解凍結果: offset={gzip_offset}, 圧縮長={compressed_len}B -> 解凍長={decomp_len}B (成否={decomp_success})")
+
+        # ③ Step 3: Action extraction
+        inner_actions = []
+        if decomp_bytes:
+            inner_actions = decode_game_detail_records(decomp_bytes)
+
+        # Fallback: direct decode on raw_bytes / chunks (e.g. uncompressed GameDetailRecords payload)
+        if not _is_meaningful_actions(inner_actions):
+            for off in [0] + offsets:
+                if len(raw_bytes) > off:
+                    acts = decode_game_detail_records(raw_bytes[off:])
+                    if _is_meaningful_actions(acts):
+                        inner_actions = acts
+                        break
+
+        # Fallback: check all fields in parsed_fields
+        if not _is_meaningful_actions(inner_actions) and parsed_fields:
+            for tag, vals in parsed_fields.items():
+                for val in vals:
+                    if isinstance(val, (bytes, bytearray)):
+                        acts = decode_game_detail_records(bytes(val))
+                        if _is_meaningful_actions(acts):
+                            inner_actions = acts
+                            break
+                if _is_meaningful_actions(inner_actions):
+                    break
+
+        if is_large:
+            act_names = [a.get("action_name", "") for a in inner_actions if a.get("action_name")]
+            sample_acts = act_names[:3] if act_names else []
+            diag(f"[PaifuSniffer] ③ アクション抽出結果: 検出アクション数={len(inner_actions)}, 代表例={sample_acts}")
+
+        # ④ Step 4: Player name extraction
+        if not accounts or len(accounts) < 4:
+            # Try decoding raw_bytes without offset to locate RecordGame accounts
+            full_fields = decode_raw_protobuf(raw_bytes)
+            if full_fields:
+                alt_uuid, alt_accs = self._extract_accounts_from_protobuf(full_fields)
+                if len(alt_accs) > len(accounts):
+                    accounts = alt_accs
+                if not extracted_uuid and alt_uuid:
+                    extracted_uuid = alt_uuid
+
+        if is_large:
+            seat_map = {acc.get("seat"): acc.get("nickname") for acc in accounts if "seat" in acc}
+            diag(f"[PaifuSniffer] ④ プレイヤー名抽出結果: 席順別実名={seat_map} (件数={len(accounts)})")
+
+        # ⑤ Step 5: Final acceptance judgment
+        if _is_meaningful_actions(inner_actions):
+            final_uuid = uuid or extracted_uuid
+            if not final_uuid:
+                import time
+                final_uuid = f"auto_{int(time.time())}_{len(raw_bytes)}"
+
+            payload = {
+                "uuid": final_uuid,
+                "head": {"accounts": accounts, "uuid": final_uuid} if accounts else {"uuid": final_uuid},
+                "rounds": [{"actions": inner_actions}]
+            }
+            if accounts:
+                payload["accounts"] = accounts
+                payload["players"] = accounts
+            return payload
 
         return None
 
@@ -1439,20 +1522,38 @@ class PaifuSniffer:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.is_running = False
         self.captured_records: List[Dict[str, Any]] = []
+        self.captured_paifus: List[Dict[str, Any]] = self.captured_records
         self.captured_uuids: Set[str] = set()
         self._ws = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.downloader = PaifuDownloader(cache_dir=self.cache_dir, cdp_port=self.cdp_port)
 
-    def process_frame(self, raw_bytes: bytes) -> Optional[Dict[str, Any]]:
+    def process_frame(
+        self,
+        raw_bytes: bytes,
+        on_diag: Optional[Callable[[str], None]] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Processes a single WebSocket binary frame.
         Decodes ResGameRecord, saves to cache, and records unique UUID.
+        Outputs 5-step diagnostic logs for large match frames (len >= 1000).
         Returns the decoded record if newly captured, or None if skipped/invalid/duplicate.
         """
-        rec = self.downloader._try_decode_records(raw_bytes, "")
+        is_large = len(raw_bytes) >= 1000
+
+        def diag(msg: str):
+            print(msg)
+            if on_diag:
+                try:
+                    on_diag(msg)
+                except Exception:
+                    pass
+
+        rec = self.downloader._try_decode_records(raw_bytes, "", on_diag=on_diag)
         if not rec:
+            if is_large:
+                diag("[PaifuSniffer] ⑤ 最終合否判定: 不合格 (除外理由: 有効な麻雀対局アクション[Record*/Action*]の抽出または解凍に失敗しました)")
             return None
 
         # Double check actions validity (must have meaningful mahjong events)
@@ -1461,16 +1562,24 @@ class PaifuSniffer:
         if not actions and rounds:
             actions = rounds[0].get("actions", [])
         if not _is_meaningful_actions(actions):
+            if is_large:
+                diag("[PaifuSniffer] ⑤ 最終合否判定: 不合格 (除外理由: 抽出されたアクションに対局イベントが含まれていません)")
             return None
 
-        uuid = rec.get("uuid") or f"sniffed_{int(time.time())}_{len(self.captured_records)+1}"
+        uuid = rec.get("uuid") or f"auto_{int(time.time())}_{len(raw_bytes)}"
         rec["uuid"] = uuid
 
         if uuid in self.captured_uuids:
+            if is_large:
+                diag(f"[PaifuSniffer] ⑤ 最終合否判定: 不合格 (除外理由: 重複UUID {uuid} は既にキャプチャ済みです)")
             return None
 
         self.captured_uuids.add(uuid)
         self.captured_records.append(rec)
+        count = len(self.captured_records)
+
+        if is_large:
+            diag(f"[PaifuSniffer] ⑤ 最終合否判定: 牌譜採用 ({count}/{self.max_games}件) [UUID: {uuid}]")
 
         # Cache JSON
         cache_file = os.path.join(self.cache_dir, f"{sanitize_filename(uuid)}.json")
@@ -1626,7 +1735,7 @@ class PaifuSniffer:
                         frame_len = len(raw_bytes)
                         print(f"[PaifuSniffer] Received Frame: len={frame_len}, opcode={opcode}")
 
-                        rec = self.process_frame(raw_bytes)
+                        rec = self.process_frame(raw_bytes, on_diag=on_status)
                         if rec:
                             count = len(self.captured_records)
                             uuid = rec.get("uuid", "unknown")
@@ -1689,19 +1798,60 @@ def decode_game_detail_records(raw_bytes: bytes) -> List[Dict[str, Any]]:
 
     actions: List[Dict[str, Any]] = []
     fields = decode_raw_protobuf(data)
-    record_blobs = fields.get(1, [])
-    for blob in record_blobs:
-        if isinstance(blob, (bytes, bytearray)):
-            w_fields = decode_raw_protobuf(bytes(blob))
-            raw_name = w_fields.get(1, [b""])[0]
-            name = raw_name.decode("utf-8", errors="replace") if isinstance(raw_name, (bytes, bytearray)) else str(raw_name)
-            payload = w_fields.get(2, [b""])[0]
-            if isinstance(payload, (bytes, bytearray)):
-                parsed_data = LiqiProtoDecoder.parse_action_payload(name, bytes(payload))
-                if parsed_data:
+
+    # 1. Search for repeated records in all tags of fields (prioritize tag 1)
+    tags_to_check = [1] + [t for t in sorted(fields.keys()) if t != 1]
+    for tag in tags_to_check:
+        record_blobs = fields.get(tag, [])
+        for blob in record_blobs:
+            if isinstance(blob, (bytes, bytearray)):
+                w_fields = decode_raw_protobuf(bytes(blob))
+                name = ""
+                payload = b""
+                # Find action name (starts with Record or Action)
+                for w_tag, w_vals in w_fields.items():
+                    for wv in w_vals:
+                        if isinstance(wv, (bytes, bytearray)):
+                            try:
+                                s = wv.decode("utf-8", errors="ignore").strip()
+                                if s.startswith("Record") or s.startswith("Action"):
+                                    name = s
+                                    break
+                            except Exception:
+                                pass
+                    if name:
+                        break
+
+                if name:
+                    # Pick payload from remaining fields
+                    for w_tag, w_vals in w_fields.items():
+                        for wv in w_vals:
+                            if isinstance(wv, (bytes, bytearray)) and bytes(wv) != name.encode("utf-8"):
+                                payload = bytes(wv)
+                                break
+                        if payload:
+                            break
+
+                    parsed_data = {}
+                    if payload:
+                        try:
+                            parsed_data = LiqiProtoDecoder.parse_action_payload(name, payload) or {}
+                        except Exception:
+                            parsed_data = {}
                     actions.append({"action_name": name, "data": parsed_data})
-                else:
-                    actions.append({"action_name": name, "data": {}})
+
+    # 2. If no actions from protobuf wire, scan raw decompressed bytes for action names
+    if not actions and data:
+        import re
+        action_re = re.compile(rb'(Record[A-Za-z0-9_]+|Action[A-Za-z0-9_]+)')
+        for m in action_re.finditer(data):
+            try:
+                act_name = m.group(1).decode("utf-8", errors="ignore")
+                if act_name not in ("RecordGame", "RecordAccount", "RecordGameLive"):
+                    actions.append({"action_name": act_name, "data": {}})
+            except Exception:
+                pass
+
     return actions
 
 

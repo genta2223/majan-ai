@@ -4089,3 +4089,111 @@ async def test_paifu_sniffer_child_session_auto_attach_and_frame_logging(tmp_pat
     assert "[PaifuSniffer] Received Frame: len=" in captured_stdout
     assert "opcode=2" in captured_stdout
 
+
+def test_paifu_sniffer_large_frame_38625_diagnostic_logging_and_acceptance(tmp_path, capsys):
+    """
+    Verifies that a large binary WebSocket frame of exactly len=38625 (matching real-game logs)
+    triggers the 5-step diagnostic logs in console and GUI callback:
+      ① Protobuf wire-format parse (tags)
+      ② gzip decompression (offset, compressed/decompressed length, success)
+      ③ Action extraction (action count, sample actions)
+      ④ Player name extraction (seat to nicknames)
+      ⑤ Final acceptance judgment (adopted N/3 with UUID)
+    and successfully accumulates into captured_paifus/captured_records with authentic players.
+    """
+    from tools.paifu_to_mjai import PaifuSniffer
+    import gzip
+
+    sniffer = PaifuSniffer(cache_dir=str(tmp_path), max_games=3)
+
+    def encode_varint(n: int) -> bytes:
+        res = bytearray()
+        while n >= 0x80:
+            res.append((n & 0x7F) | 0x80)
+            n >>= 7
+        res.append(n)
+        return bytes(res)
+
+    # 1. Accounts with authentic nicknames
+    players = ["genta2223", "ブロコフ", "龍斗たっちゃん", "横丁の隠居"]
+    acc_blobs = []
+    for seat, name in enumerate(players):
+        nb = name.encode("utf-8")
+        payload = (
+            b"\x08" + encode_varint(10001 + seat) +
+            b"\x10" + bytes([seat]) +
+            b"\x1a" + bytes([len(nb)]) + nb
+        )
+        acc_blobs.append(b"\x1a" + bytes([len(payload)]) + payload)
+
+    head_payload = b"".join(acc_blobs)
+
+    # 2. Rich authentic round actions
+    actions_raw = []
+    for r in range(4):
+        a1 = b"\x0a\x0eRecordNewRound\x12\x04\x08" + bytes([r]) + b"\x10\x00"
+        a2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x00\x10\x12"
+        a3 = b"\x0a\x12RecordDiscardTile\x12\x04\x08\x00\x10\x12"
+        a4 = b"\x0a\x0aRecordHule\x12\x06\x08\x01\x10\xc8\x01\x18\x00"
+        actions_raw.extend([
+            b"\x0a" + bytes([len(a1)]) + a1,
+            b"\x0a" + bytes([len(a2)]) + a2,
+            b"\x0a" + bytes([len(a3)]) + a3,
+            b"\x0a" + bytes([len(a4)]) + a4,
+        ])
+    gzipped_records = gzip.compress(b"".join(actions_raw))
+
+    # 3. Assemble ResGameRecord (field 2 data, field 3 head)
+    res_record = (
+        b"\x12" + encode_varint(len(gzipped_records)) + gzipped_records +
+        b"\x1a" + encode_varint(len(head_payload)) + head_payload
+    )
+
+    # Liqi header (0x03, 0x05, 0x00) + payload
+    frame_base = b"\x03\x05\x00" + res_record
+
+    # Pad frame to exactly 38625 bytes to simulate real-game packet
+    TARGET_LEN = 38625
+    assert len(frame_base) < TARGET_LEN
+    padding = b"\x00" * (TARGET_LEN - len(frame_base))
+    large_frame = frame_base + padding
+    assert len(large_frame) == TARGET_LEN
+
+    diag_messages = []
+    def on_diag(msg):
+        diag_messages.append(msg)
+
+    # Execute frame processing
+    rec = sniffer.process_frame(large_frame, on_diag=on_diag)
+
+    # Verification:
+    # A. Frame was accepted (not skipped)
+    assert rec is not None, "Frame len=38625 must be accepted and not skipped!"
+    assert len(sniffer.captured_records) == 1
+    assert len(sniffer.captured_paifus) == 1
+    assert sniffer.captured_paifus is sniffer.captured_records
+
+    # B. UUID was assigned (either extracted or fallback auto_)
+    assert rec["uuid"].startswith("auto_") or "38625" in rec["uuid"]
+
+    # C. Actions extracted
+    actions = rec["rounds"][0]["actions"]
+    assert len(actions) >= 16
+    assert actions[0]["action_name"] == "RecordNewRound"
+
+    # D. Authentic accounts preserved
+    assert len(rec["accounts"]) == 4
+    assert [a["nickname"] for a in rec["accounts"]] == players
+
+    # E. 5-step diagnostic logs emitted
+    captured_stdout = capsys.readouterr().out
+    combined_log = captured_stdout + "\n" + "\n".join(diag_messages)
+
+    assert "巨大フレーム検知: len=38625" in combined_log
+    assert "① Protobuf wire-format パース:" in combined_log
+    assert "② gzip 解凍結果:" in combined_log
+    assert "③ アクション抽出結果: 検出アクション数=" in combined_log
+    assert "④ プレイヤー名抽出結果: 席順別実名=" in combined_log
+    assert "⑤ 最終合否判定: 牌譜採用 (1/3件)" in combined_log
+
+

@@ -558,6 +558,7 @@ class MahjongHUDApp:
         def _on_status(status_msg):
             def _ui_status():
                 self.lbl_exploit_summary.config(text=status_msg, fg=self.c_yellow)
+                self._log(status_msg)
             self.root.after(0, _ui_status)
 
         def _on_finished(records):
