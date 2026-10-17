@@ -489,9 +489,9 @@ class LiqiProtoDecoder:
             t = tiles_of(2)
             if t:
                 m["tile"] = t[0]
-            m["is_liqi"] = bool(first_int(3))
-            m["moqie"] = bool(first_int(5))
+            m["is_liqi"] = bool(first_int(3) or first_int(9))
             m["is_wliqi"] = bool(first_int(9))
+            m["moqie"] = bool(first_int(5))
             d = tiles_of(8)
             if d:
                 m["doras"] = d
@@ -523,6 +523,64 @@ class LiqiProtoDecoder:
             ops = ops_of(4)
             if ops:
                 m["operation_list"] = ops
+            return m
+
+        if name in ("ActionHule", "RecordHule"):
+            # hules = 1 or 2, delta_scores = 2 or 3, scores = 3 or 4
+            hules_list: List[Dict[str, Any]] = []
+            raw_hules = f.get(1, []) or f.get(2, [])
+            for h_blob in raw_hules:
+                if isinstance(h_blob, (bytes, bytearray)):
+                    hf = decode_raw_protobuf(bytes(h_blob))
+                    h_dict: Dict[str, Any] = {}
+                    # seat = tag 4 (or 1)
+                    h_dict["seat"] = coerce_int((hf.get(4) or hf.get(1) or [0])[0], 0)
+                    h_dict["zimo"] = bool(coerce_int((hf.get(5) or [0])[0], 0))
+                    # target = tag 9 (or 10 or 6)
+                    h_dict["target"] = coerce_int((hf.get(9) or hf.get(10) or hf.get(6) or [h_dict["seat"]])[0], h_dict["seat"])
+                    # hu_tile = tag 3
+                    t_cand = [s(v).strip() for v in (hf.get(3) or []) if is_tile(v)]
+                    if t_cand:
+                        h_dict["hu_tile"] = t_cand[0]
+                    # point_sum = tag 7
+                    h_dict["point_sum"] = coerce_int((hf.get(7) or [5200])[0], 5200)
+                    hules_list.append(h_dict)
+                elif isinstance(h_blob, dict):
+                    hules_list.append(h_blob)
+
+            # Fallback for flat int fields (e.g. mock/test frame: tag 1 = seat, tag 3 = target/zimo)
+            if not hules_list:
+                seat_val = None
+                if 1 in f and isinstance(f[1][0], int) and 0 <= f[1][0] <= 3:
+                    seat_val = f[1][0]
+                elif 4 in f and isinstance(f[4][0], int) and 0 <= f[4][0] <= 3:
+                    seat_val = f[4][0]
+
+                if seat_val is not None:
+                    target_val = seat_val
+                    if 3 in f and isinstance(f[3][0], int) and 0 <= f[3][0] <= 3:
+                        target_val = f[3][0]
+                    elif 6 in f and isinstance(f[6][0], int) and 0 <= f[6][0] <= 3:
+                        target_val = f[6][0]
+                    is_zimo = (seat_val == target_val)
+                    h_dict = {"seat": seat_val, "target": target_val, "zimo": is_zimo}
+                    t_str = tiles_of(3) or tiles_of(2)
+                    if t_str:
+                        h_dict["hu_tile"] = t_str[0]
+                    hules_list.append(h_dict)
+                    m["seat"] = seat_val
+                    m["target"] = target_val
+
+            m["hules"] = hules_list
+            del_sc = ints_of(2) or ints_of(3)
+            if del_sc:
+                m["delta_scores"] = del_sc
+            return m
+
+        if name in ("ActionLiuJu", "RecordLiuJu", "ActionNoTile", "RecordNoTile"):
+            del_sc = ints_of(1) or ints_of(2) or ints_of(3)
+            if del_sc:
+                m["delta_scores"] = del_sc
             return m
 
         if name in ("ActionNewRound", "RecordNewRound"):
@@ -773,7 +831,11 @@ class LiqiProtoDecoder:
                 if act_name in ("ActionNewRound", "ActionDealTile"):
                     print(f"[LiqiDecoder EMPTY GUARD] {act_name} no sub_bytes found! payload_hex={payload_bytes[:64].hex()} fields_keys={list(fields.keys())}")
         else:
-            result.update(LiqiProtoDecoder._map_common_fields(fields, action_name=method_name, raw_bytes=payload_bytes))
+            schema_mapped = LiqiProtoDecoder._map_by_schema(method_name, fields)
+            if schema_mapped is not None:
+                result.update(schema_mapped)
+            else:
+                result.update(LiqiProtoDecoder._map_common_fields(fields, action_name=method_name, raw_bytes=payload_bytes))
 
         return result
 
@@ -875,7 +937,31 @@ class LiqiProtoDecoder:
 
             return mapped
 
-        # Case 2: Generic / DealTile / DiscardTile
+        # Case 2: ActionChiPengGang / RecordChiPengGang
+        if "ChiPengGang" in clean_name:
+            if 1 in fields and fields[1]:
+                mapped["seat"] = coerce_int(fields[1][0], 0)
+            else:
+                mapped["seat"] = 0
+            if 2 in fields and fields[2]:
+                mapped["type"] = coerce_int(fields[2][0], 0)
+            if 3 in fields and fields[3]:
+                mapped["tiles"] = [to_str(t) for t in fields[3] if is_valid_tile_code(t)]
+            if 4 in fields and fields[4]:
+                mapped["froms"] = coerce_int_list(fields[4])
+
+            if 6 in fields:
+                all_ops: List[Dict[str, Any]] = []
+                for v in fields[6]:
+                    if isinstance(v, (bytes, dict)):
+                        parsed = LiqiProtoDecoder._try_parse_operations(v)
+                        if parsed:
+                            all_ops.extend(parsed)
+                if all_ops:
+                    mapped["operation_list"] = all_ops
+            return mapped
+
+        # Case 3: Generic / DealTile / DiscardTile
         for tag, vals in fields.items():
             if not vals:
                 continue
@@ -885,9 +971,13 @@ class LiqiProtoDecoder:
                     if tag == 1 and 0 <= raw_v <= 3:
                         mapped.setdefault("seat", raw_v)
                     elif tag == 3 and "Discard" in clean_name:
-                        mapped.setdefault("moqie", bool(raw_v))
-                    elif tag in (4, 5) and isinstance(raw_v, bool):
-                        mapped.setdefault("is_liqi", bool(raw_v))
+                        mapped["is_liqi"] = bool(raw_v)
+                    elif tag == 5 and "Discard" in clean_name:
+                        mapped["moqie"] = bool(raw_v)
+                    elif tag == 9 and "Discard" in clean_name:
+                        mapped["is_wliqi"] = bool(raw_v)
+                        if bool(raw_v):
+                            mapped["is_liqi"] = True
                 elif is_valid_tile_code(v_str):
                     if tag == 2 or "tile" not in mapped:
                         mapped["tile"] = v_str

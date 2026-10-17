@@ -4197,3 +4197,143 @@ def test_paifu_sniffer_large_frame_38625_diagnostic_logging_and_acceptance(tmp_p
     assert "⑤ 最終合否判定: 牌譜採用 (1/3件)" in combined_log
 
 
+def test_paifu_stats_profiler_hora_houju_riichi_and_calls():
+    """
+    Verifies that:
+    1. RecordHule correctly attributes hora (agari) to winner and deal-in (houju) to loser on Ron,
+       and only agari without deal-in on Tsumo.
+    2. RecordDiscardTile with is_liqi=True generates reach event and increments reach count.
+    3. RecordChiPengGang correctly attributes call to actor (seat who called), distinguishing
+       yakuhai calls (honors) from tanyao calls (simples 2-8).
+    4. OpponentProfiler accurately accumulates both self.stats[seat] and PlayerProfile metrics.
+    """
+    from tools.paifu_to_mjai import convert_record_to_mjai
+    from core.opponent_profiler import OpponentProfiler
+
+    players = ["genta2223", "ブロコフ", "龍斗たっちゃん", "横丁の隠居"]
+
+    record = {
+        "uuid": "test-stats-profiler-verification",
+        "accounts": [
+            {"seat": 0, "nickname": "genta2223"},
+            {"seat": 1, "nickname": "ブロコフ"},
+            {"seat": 2, "nickname": "龍斗たっちゃん"},
+            {"seat": 3, "nickname": "横丁の隠居"},
+        ],
+        "rounds": [
+            # Round 1:
+            # - Seat 2 (龍斗たっちゃん) calls Pon on 5z (White Dragon: Yakuhai) from Seat 0
+            # - Seat 0 (genta2223) declares Riichi
+            # - Seat 1 (ブロコフ) discards 5m and deals in to Seat 0 (genta2223 Ron)
+            {
+                "round_info": {"chang": 0, "ju": 0, "ben": 0, "liqibang": 0},
+                "actions": [
+                    {"action_name": "RecordNewRound", "data": {"chang": 0, "ju": 0, "ben": 0, "liqibang": 0, "scores": [25000, 25000, 25000, 25000], "doras": ["1p"]}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 0, "tile": "5z", "moqie": False}},
+                    {"action_name": "RecordChiPengGang", "data": {"seat": 2, "type": 1, "tiles": ["5z", "5z", "5z"], "froms": [2, 2, 0]}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 2, "tile": "9p", "moqie": False}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 0, "tile": "1m", "moqie": False, "is_liqi": True}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 1, "tile": "5m", "moqie": False}},
+                    {"action_name": "RecordHule", "data": {"hules": [{"seat": 0, "target": 1, "hu_tile": "5m", "zimo": False}], "delta_scores": [8000, -8000, 0, 0]}},
+                ]
+            },
+            # Round 2:
+            # - Seat 3 (横丁の隠居) calls Chi on 3p-4p-5p (All-simples: Tanyao) from Seat 2
+            # - Seat 2 (龍斗たっちゃん) wins by Tsumo on 2s
+            {
+                "round_info": {"chang": 0, "ju": 1, "ben": 0, "liqibang": 0},
+                "actions": [
+                    {"action_name": "RecordNewRound", "data": {"chang": 0, "ju": 1, "ben": 0, "liqibang": 0, "scores": [33000, 17000, 25000, 25000], "doras": ["5s"]}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 2, "tile": "3p", "moqie": False}},
+                    {"action_name": "RecordChiPengGang", "data": {"seat": 3, "type": 0, "tiles": ["3p", "4p", "5p"], "froms": [3, 3, 2]}},
+                    {"action_name": "RecordDiscardTile", "data": {"seat": 3, "tile": "9m", "moqie": False}},
+                    {"action_name": "RecordDealTile", "data": {"seat": 2, "tile": "2s"}},
+                    {"action_name": "RecordHule", "data": {"hules": [{"seat": 2, "target": 2, "hu_tile": "2s", "zimo": True}], "delta_scores": [-1000, -1000, 3000, -1000]}},
+                ]
+            }
+        ]
+    }
+
+    # Convert to standard MJAI events
+    events = convert_record_to_mjai(record, my_seat=0)
+    assert len(events) >= 10
+
+    # Ensure hora events have correct actor and target
+    hora_events = [e for e in events if e.get("type") == "hora"]
+    assert len(hora_events) == 2
+    # Ron in Round 1: actor=0 (genta2223), target=1 (ブロコフ)
+    assert hora_events[0]["actor"] == 0
+    assert hora_events[0]["target"] == 1
+    # Tsumo in Round 2: actor=2 (龍斗たっちゃん), target=2 (self)
+    assert hora_events[1]["actor"] == 2
+    assert hora_events[1]["target"] == 2
+
+    # Ensure reach event was generated for Seat 0
+    reach_events = [e for e in events if e.get("type") == "reach"]
+    assert len(reach_events) == 1
+    assert reach_events[0]["actor"] == 0
+
+    # Ensure calls have correct actor
+    pon_events = [e for e in events if e.get("type") == "pon"]
+    assert len(pon_events) == 1
+    assert pon_events[0]["actor"] == 2  # 龍斗たっちゃん
+    assert pon_events[0]["target"] == 0
+
+    chi_events = [e for e in events if e.get("type") == "chi"]
+    assert len(chi_events) == 1
+    assert chi_events[0]["actor"] == 3  # 横丁の隠居
+    assert chi_events[0]["target"] == 2
+
+    # Feed into OpponentProfiler
+    profiler = OpponentProfiler()
+    profiler.analyze_game_events(events)
+
+    # 1. Verify profiler.stats dict directly
+    assert profiler.stats[0]["agari"] == 1
+    assert profiler.stats[0]["reach"] == 1
+    assert profiler.stats[0]["houju"] == 0
+
+    assert profiler.stats[1]["agari"] == 0
+    assert profiler.stats[1]["houju"] == 1
+    assert profiler.stats[1]["reach"] == 0
+
+    assert profiler.stats[2]["agari"] == 1
+    assert profiler.stats[2]["call"] == 1
+    assert profiler.stats[2]["yakuhai"] == 1
+    assert profiler.stats[2]["tanyao"] == 0
+    assert profiler.stats[2]["houju"] == 0
+
+    assert profiler.stats[3]["call"] == 1
+    assert profiler.stats[3]["tanyao"] == 1
+    assert profiler.stats[3]["yakuhai"] == 0
+
+    # 2. Verify individual PlayerProfile stats
+    p0 = profiler.get_profile("genta2223")
+    assert p0.hora_count == 1
+    assert p0.riichi_count == 1
+    assert p0.deal_in_count == 0
+    assert p0.hora_rate == 0.5  # 1 win in 2 rounds
+    assert p0.riichi_rate == 0.5
+
+    p1 = profiler.get_profile("ブロコフ")
+    assert p1.hora_count == 0
+    assert p1.deal_in_count == 1
+    assert p1.deal_in_rate == 0.5
+
+    p2 = profiler.get_profile("龍斗たっちゃん")
+    assert p2.call_count == 1
+    assert p2.yakuhai_call_count == 1
+    assert p2.tanyao_call_count == 0
+    assert p2.open_rate == 0.5
+    assert p2.hora_count == 1
+    assert p2.hora_rate == 0.5
+    assert p2.deal_in_count == 0
+
+    p3 = profiler.get_profile("横丁の隠居")
+    assert p3.call_count == 1
+    assert p3.tanyao_call_count == 1
+    assert p3.yakuhai_call_count == 0
+    assert p3.open_rate == 0.5
+
+
+

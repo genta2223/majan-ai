@@ -115,6 +115,7 @@ class MajsoulBridge:
     def __init__(self, my_seat: int = 0, vision_fallback_enabled: bool = True):
         self.my_seat = my_seat
         self._current_doras: List[str] = []
+        self._last_discard_seat: Optional[int] = None
         # Vision is a last-resort fallback only. It must never override packet-decoded tiles.
         self.vision_fallback_enabled = vision_fallback_enabled
 
@@ -127,6 +128,7 @@ class MajsoulBridge:
 
         if clean_name in ("ActionNewRound", "RecordNewRound", "ActionMJStart", "NotifyRoomGameStart"):
             # New Round (start_kyoku)
+            self._last_discard_seat = None
             raw_chang = safe_coerce_int(data.get("chang", 0), 0)
             chang_idx = raw_chang if 0 <= raw_chang < len(WIND_CHARS) else 0
             bakaze = WIND_CHARS[chang_idx]
@@ -274,10 +276,11 @@ class MajsoulBridge:
             events.append(tsumo_event)
 
         elif clean_name in ("ActionDiscardTile", "RecordDiscardTile", "NotifyDiscardTile"):
-            seat = data.get("seat", 0)
+            seat = safe_coerce_int(data.get("seat", 0), 0)
+            self._last_discard_seat = seat
             tile = liqi_tile_to_mjai(data.get("tile", ""))
-            moqie = data.get("moqie", False)
-            is_liqi = data.get("is_liqi", False) or data.get("is_wliqi", False)
+            moqie = bool(data.get("moqie", False))
+            is_liqi = bool(data.get("is_liqi", False) or data.get("is_wliqi", False))
 
             # Extract operations (calls available on this discard)
             raw_ops = data.get("operation_list") or data.get("operations") or data.get("operation") or []
@@ -316,16 +319,40 @@ class MajsoulBridge:
                         events.append({"type": "dora", "dora_marker": mjai_d})
 
         elif clean_name in ("ActionChiPengGang", "RecordChiPengGang"):
-            seat = data.get("seat", 0)
-            meld_type = data.get("type", 0)  # 0=Chi, 1=Pon, 2=Daiminkan
+            # Strictly identify actor (seat who called) vs target (seat who discarded)
+            seat = safe_coerce_int(data.get("seat", 0), 0)
+            meld_type = safe_coerce_int(data.get("type", 0), 0)  # 0=Chi, 1=Pon, 2=Daiminkan
             raw_tiles = data.get("tiles", [])
             froms = data.get("froms", [])
-            mjai_tiles = [liqi_tile_to_mjai(t) for t in raw_tiles]
+            mjai_tiles = [liqi_tile_to_mjai(t) for t in raw_tiles if t]
 
-            target = froms[-1] if froms else None
-            # Target tile is the called tile (usually last or first)
-            called_tile = mjai_tiles[-1] if mjai_tiles else ""
-            consumed = mjai_tiles[:-1] if mjai_tiles else []
+            # Determine who discarded the called tile (target != seat)
+            target = None
+            if froms:
+                for f_seat in froms:
+                    f_int = safe_coerce_int(f_seat, -1)
+                    if f_int != seat and 0 <= f_int < 4:
+                        target = f_int
+                        break
+            if target is None:
+                if self._last_discard_seat is not None and self._last_discard_seat != seat:
+                    target = self._last_discard_seat
+                else:
+                    target = (seat - 1) % 4
+
+            # Segregate called_tile vs consumed
+            called_tile = ""
+            consumed: List[str] = []
+            if len(froms) == len(mjai_tiles) and len(mjai_tiles) > 0:
+                for f_seat, t in zip(froms, mjai_tiles):
+                    f_int = safe_coerce_int(f_seat, -1)
+                    if f_int != seat and not called_tile:
+                        called_tile = t
+                    else:
+                        consumed.append(t)
+            if not called_tile and mjai_tiles:
+                called_tile = mjai_tiles[-1]
+                consumed = mjai_tiles[:-1]
 
             if meld_type == 0:
                 events.append({
@@ -353,10 +380,10 @@ class MajsoulBridge:
                 })
 
         elif clean_name in ("ActionAnGangAddGang", "RecordAnGangAddGang"):
-            seat = data.get("seat", 0)
-            gang_type = data.get("type", 3)  # 2=AddGang(Kankan), 3=AnGang
+            seat = safe_coerce_int(data.get("seat", 0), 0)
+            gang_type = safe_coerce_int(data.get("type", 3), 3)  # 2=AddGang(Kankan), 3=AnGang
             raw_tiles = data.get("tiles", [])
-            mjai_tiles = [liqi_tile_to_mjai(t) for t in raw_tiles]
+            mjai_tiles = [liqi_tile_to_mjai(t) for t in raw_tiles if t]
 
             if gang_type == 2:
                 events.append({
@@ -379,8 +406,18 @@ class MajsoulBridge:
             for h in hules:
                 seat = safe_coerce_int(h.get("seat", 0), 0)
                 hu_tile = liqi_tile_to_mjai(h.get("hu_tile", ""))
-                is_zimo = h.get("zimo", False) or (h.get("target") == seat)
-                target = seat if is_zimo else safe_coerce_int(h.get("target", seat), seat)
+                is_zimo = bool(h.get("zimo", False))
+                raw_target = h.get("target")
+
+                if is_zimo:
+                    target = seat
+                elif raw_target is not None and safe_coerce_int(raw_target, -1) != seat and 0 <= safe_coerce_int(raw_target, -1) < 4:
+                    target = safe_coerce_int(raw_target, seat)
+                elif self._last_discard_seat is not None and self._last_discard_seat != seat:
+                    target = self._last_discard_seat
+                else:
+                    target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None else seat)
+
                 events.append({
                     "type": "hora",
                     "actor": seat,

@@ -163,6 +163,18 @@ class OpponentProfiler:
 
     def __init__(self, profiles_path: Optional[str] = None):
         self.profiles: Dict[str, PlayerProfile] = {}
+        self.stats: Dict[int, Dict[str, int]] = {
+            i: {
+                "agari": 0,
+                "houju": 0,
+                "reach": 0,
+                "call": 0,
+                "rounds": 0,
+                "tanyao": 0,
+                "yakuhai": 0,
+            }
+            for i in range(4)
+        }
         self.profiles_path = profiles_path
         if profiles_path and os.path.exists(profiles_path):
             self.load_profiles(profiles_path)
@@ -222,40 +234,54 @@ class OpponentProfiler:
                 current_round_riichis.clear()
                 turn_counter = 0
                 round_committed = False
+                for i in range(4):
+                    if i in self.stats:
+                        self.stats[i]["rounds"] += 1
                 for name in player_names:
                     if name and name in self.profiles:
                         self.profiles[name].total_rounds += 1
 
             elif etype in ("chi", "pon", "daiminkan"):
                 actor = ev.get("actor", 0)
+                if 0 <= actor < 4 and actor in self.stats:
+                    self.stats[actor]["call"] += 1
+
                 if 0 <= actor < len(player_names):
                     name = player_names[actor]
                     consumed = ev.get("consumed", [])
                     pai = ev.get("pai", "")
-                    meld_tiles = consumed + ([pai] if pai else [])
+                    meld_tiles = [t for t in (consumed + ([pai] if pai else [])) if t and t != "?"]
 
                     if name in self.profiles:
                         p = self.profiles[name]
                         p.call_count += 1
                         current_round_calls.add(actor)
 
-                        # Classify meld type
-                        has_honor = any(normalize_tile(t) in HONORS for t in meld_tiles)
-                        if has_honor:
-                            p.yakuhai_call_count += 1
-                        else:
-                            is_all_simples = all(
-                                len(normalize_tile(t)) == 2 and normalize_tile(t)[0] in "2345678"
-                                for t in meld_tiles
-                            )
-                            if is_all_simples:
-                                p.tanyao_call_count += 1
+                        # Classify meld type: strictly requires non-empty meld_tiles to avoid all([]) == True bug
+                        if meld_tiles:
+                            has_honor = any(normalize_tile(t) in HONORS for t in meld_tiles)
+                            if has_honor:
+                                p.yakuhai_call_count += 1
+                                if 0 <= actor < 4 and actor in self.stats:
+                                    self.stats[actor]["yakuhai"] += 1
+                            else:
+                                is_all_simples = all(
+                                    len(normalize_tile(t)) == 2 and normalize_tile(t)[0] in "2345678"
+                                    for t in meld_tiles
+                                )
+                                if is_all_simples:
+                                    p.tanyao_call_count += 1
+                                    if 0 <= actor < 4 and actor in self.stats:
+                                        self.stats[actor]["tanyao"] += 1
 
                         if turn_counter <= 6:
                             p.early_call_count += 1
 
             elif etype == "reach":
                 actor = ev.get("actor", 0)
+                if 0 <= actor < 4 and actor in self.stats:
+                    self.stats[actor]["reach"] += 1
+
                 if 0 <= actor < len(player_names):
                     name = player_names[actor]
                     current_round_riichis.add(actor)
@@ -295,6 +321,9 @@ class OpponentProfiler:
                 target = ev.get("target", actor)
                 deltas = ev.get("deltas", [])
 
+                if 0 <= actor < 4 and actor in self.stats:
+                    self.stats[actor]["agari"] += 1
+
                 if 0 <= actor < len(player_names):
                     winner_name = player_names[actor]
                     if winner_name in self.profiles:
@@ -310,10 +339,13 @@ class OpponentProfiler:
                         p.hora_scores_sum += win_score
 
                 # Ron deal-in check (actor != target means Ron)
-                if actor != target and 0 <= target < len(player_names):
-                    victim_name = player_names[target]
-                    if victim_name in self.profiles:
-                        self.profiles[victim_name].deal_in_count += 1
+                if actor != target:
+                    if 0 <= target < 4 and target in self.stats:
+                        self.stats[target]["houju"] += 1
+                    if 0 <= target < len(player_names):
+                        victim_name = player_names[target]
+                        if victim_name in self.profiles:
+                            self.profiles[victim_name].deal_in_count += 1
 
                 _commit_round()
 

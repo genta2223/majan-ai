@@ -957,56 +957,116 @@ class PaifuDownloader:
                         # Try parsing as nested sub-message
                         sub = decode_raw_protobuf(b)
                         if sub:
+                            # Majsoul Account proto structure:
+                            # tag 1: account_id (uint32)
+                            # tag 2: seat (uint32, 0..3) - in proto3, seat 0 may be omitted
+                            # tag 3: nickname (string)
                             nick = None
                             seat = None
                             acc_id = None
-                            for stag, svals in sub.items():
-                                for sv in svals:
-                                    if isinstance(sv, int):
-                                        if 0 <= sv <= 3 and seat is None:
-                                            seat = sv
-                                        elif sv > 100 and acc_id is None:
-                                            acc_id = sv
-                                    elif isinstance(sv, (bytes, bytearray)):
-                                        try:
-                                            text = sv.decode("utf-8").strip()
-                                            # Validate as nickname: reasonable length, not action name, no hyphens (UUIDs)
-                                            is_tile = bool(re.match(r'^[0-9][mpsz]$', text))
-                                            is_cpu = text.startswith("CPU") or "CPUプレイヤー" in text
-                                            if (
-                                                1 <= len(text) <= 30
-                                                and text.isprintable()
-                                                and "-" not in text
-                                                and not text.startswith("Record")
-                                                and not text.startswith("Action")
-                                                and not is_tile
-                                                and not is_cpu
-                                            ):
-                                                nick = text
-                                        except Exception:
-                                            pass
 
-                            if nick and seat is not None:
-                                if seat not in seat_to_account:
+                            nick_tag = None
+
+                            # 1. Extract nickname strictly from tag 3 first (official protobuf)
+                            raw_nick_cand = sub.get(3, [])
+                            for nv in raw_nick_cand:
+                                try:
+                                    text = nv.decode("utf-8").strip() if isinstance(nv, (bytes, bytearray)) else str(nv).strip()
+                                    is_tile = bool(re.match(r'^[0-9][mpsz]$', text))
+                                    is_cpu = text.startswith("CPU") or "CPUプレイヤー" in text
+                                    if (
+                                        1 <= len(text) <= 30
+                                        and text.isprintable()
+                                        and "-" not in text
+                                        and not text.startswith("Record")
+                                        and not text.startswith("Action")
+                                        and not is_tile
+                                        and not is_cpu
+                                    ):
+                                        nick = text
+                                        nick_tag = 3
+                                        break
+                                except Exception:
+                                    pass
+
+                            # 2. Extract account_id from tag 1
+                            for av in sub.get(1, []):
+                                if isinstance(av, int) and av > 0:
+                                    acc_id = av
+                                    break
+
+                            # 3. Fallback scan for nickname across other tags (e.g. tag 2 in mock/test messages)
+                            if not nick:
+                                for stag in (2, 4, 5):
+                                    if stag in sub:
+                                        for sv in sub[stag]:
+                                            if isinstance(sv, (bytes, bytearray, str)):
+                                                try:
+                                                    text = sv.decode("utf-8").strip() if isinstance(sv, (bytes, bytearray)) else str(sv).strip()
+                                                    is_tile = bool(re.match(r'^[0-9][mpsz]$', text))
+                                                    is_cpu = text.startswith("CPU") or "CPUプレイヤー" in text
+                                                    if (
+                                                        1 <= len(text) <= 30
+                                                        and text.isprintable()
+                                                        and "-" not in text
+                                                        and not text.startswith("Record")
+                                                        and not text.startswith("Action")
+                                                        and not is_tile
+                                                        and not is_cpu
+                                                    ):
+                                                        nick = text
+                                                        nick_tag = stag
+                                                        break
+                                                except Exception:
+                                                    pass
+                                        if nick:
+                                            break
+
+                            if nick:
+                                # Determine seat based on which tag held nickname:
+                                if nick_tag == 3:
+                                    # Official Majsoul: tag 2 is seat, tag 1 is acc_id
+                                    if 2 in sub and isinstance(sub[2][0], int) and 0 <= sub[2][0] <= 3:
+                                        seat = sub[2][0]
+                                    elif 2 not in sub and (acc_id or 1 in sub):
+                                        if 0 not in seat_to_account:
+                                            seat = 0
+                                elif nick_tag == 2:
+                                    # Alternate/Mock layout: tag 1 is seat, tag 2 is nickname
+                                    if 1 in sub and isinstance(sub[1][0], int) and 0 <= sub[1][0] <= 3:
+                                        seat = sub[1][0]
+                                    elif 1 not in sub:
+                                        if 0 not in seat_to_account:
+                                            seat = 0
+                                else:
+                                    for stag in (2, 1):
+                                        if stag in sub and isinstance(sub[stag][0], int) and 0 <= sub[stag][0] <= 3:
+                                            seat = sub[stag][0]
+                                            break
+
+                                if seat is not None and seat not in seat_to_account:
                                     seat_to_account[seat] = {
                                         "seat": seat,
                                         "nickname": nick,
                                         "account_id": acc_id or (10001 + seat)
                                     }
-                            elif nick and seat is None:
-                                unseated_nicks.append(nick)
+                                else:
+                                    unseated_nicks.append((nick, acc_id))
+
                             _walk(sub, depth + 1)
 
         _walk(fields, 0)
 
-        # Assign any unseated authentic nicknames to empty seats 0..3
-        for unseated in unseated_nicks:
+        # Assign any unseated authentic nicknames to empty seats 0..3 in natural order
+        for unseated_item in unseated_nicks:
+            unseated = unseated_item[0] if isinstance(unseated_item, tuple) else unseated_item
+            acc_id = unseated_item[1] if isinstance(unseated_item, tuple) and len(unseated_item) > 1 else None
             for s in range(4):
                 if s not in seat_to_account:
                     seat_to_account[s] = {
                         "seat": s,
                         "nickname": unseated,
-                        "account_id": 10001 + s
+                        "account_id": acc_id or (10001 + s)
                     }
                     break
 
@@ -1982,11 +2042,14 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
                     if nickname and not is_cpu_player_name(str(nickname)):
                         player_names[seat] = str(nickname).strip()
                 elif nickname and not is_cpu_player_name(str(nickname)):
-                    # Unseated authentic nickname: assign to next available empty seat
-                    for s in range(4):
-                        if not player_names[s]:
-                            player_names[s] = str(nickname).strip()
-                            break
+                    # Unseated authentic nickname: prioritize list index if valid and available
+                    if 0 <= idx < 4 and not player_names[idx]:
+                        player_names[idx] = str(nickname).strip()
+                    else:
+                        for s in range(4):
+                            if not player_names[s]:
+                                player_names[s] = str(nickname).strip()
+                                break
 
     # 3. Check record['players'] if still missing
     if any(not n for n in player_names):
