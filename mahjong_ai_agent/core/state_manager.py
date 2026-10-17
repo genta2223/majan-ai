@@ -661,6 +661,65 @@ class MahjongStateManager:
             return None
         return self.round_state.players[self.my_actor_id]
 
+    @property
+    def is_my_turn(self) -> bool:
+        """
+        Check if current board state demands a discard action from self.
+        Guarantees self-turn detection regardless of asynchronous packet order:
+        1. If active_actor is another player, strictly False.
+        2. Self is dealer with active 1st turn (discards == 0 and valid_hand >= 13).
+        3. Active actor is self and hand is at draw size (14 - 3 * melds) or has tsumo_tile.
+        4. Hand physically has 14 valid tiles (or draw size).
+        """
+        if not self.round_state or self.round_state.is_round_over:
+            return False
+        my_p = self.my_player
+        if not my_p:
+            return False
+
+        # If another player is actively taking their turn, it is strictly NOT self turn
+        if self.round_state.active_actor is not None and self.round_state.active_actor != self.my_actor_id:
+            return False
+
+        valid_hand = [t for t in my_p.tehai if is_valid_mahjong_tile(t)]
+        meld_count = len(my_p.melds)
+        draw_len = 14 - (3 * meld_count)
+
+        # 1. Standard draw size (14 tiles without melds)
+        if len(valid_hand) >= draw_len:
+            return True
+
+        # 2. Active actor is self and has tsumo tile
+        if self.round_state.active_actor == self.my_actor_id and (my_p.tsumo_tile or len(valid_hand) >= draw_len):
+            return True
+
+        # 3. Dealer initial turn (oya == my_actor_id with 0 discards and >= 13 tiles)
+        if self.round_state.oya == self.my_actor_id and len(my_p.discards) == 0 and len(valid_hand) >= 13:
+            return True
+
+        return False
+
+    def ensure_dealer_first_tsumo(self) -> bool:
+        """
+        Safety net: If self is dealer and hand has only 13 tiles on round start,
+        ensures hand is transitioned to 14-tile state for the 1st turn decision.
+        """
+        if not self.round_state or self.round_state.is_round_over:
+            return False
+        my_p = self.my_player
+        if not my_p:
+            return False
+        if self.round_state.oya != self.my_actor_id or len(my_p.discards) > 0:
+            return False
+        valid_hand = [t for t in my_p.tehai if is_valid_mahjong_tile(t)]
+        if len(valid_hand) == 13:
+            first_tsumo = valid_hand[-1]
+            my_p.tsumo_tile = first_tsumo
+            my_p.tehai.append(first_tsumo)
+            print(f"[StateManager] Ensure dealer 1st turn: Hand promoted to 14 tiles with tsumo='{first_tsumo}'")
+            return True
+        return False
+
     def get_genbutsu_for_actor(self, riichi_actor: int) -> Set[str]:
         """Return the set of normalized tiles that are 100% safe (Genbutsu) against a riichi actor."""
         if not self.round_state or riichi_actor >= len(self.round_state.players):

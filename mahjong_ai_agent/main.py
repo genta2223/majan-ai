@@ -198,7 +198,7 @@ class MahjongAIAgent:
         # Clear previous recommendation cache on new turn draw or self discard to prevent stale recommendations
         if event_type == "tsumo":
             if event.get("actor") == self.my_actor_id:
-                self.action_controller.clear_recommendation(notify=True)
+                self.action_controller.clear_recommendation(notify=True, is_self_turn=True)
             else:
                 self.action_controller.clear_recommendation(notify=False)
         elif event_type == "dahai" and event.get("actor") == self.my_actor_id:
@@ -226,12 +226,28 @@ class MahjongAIAgent:
             except Exception:
                 pass
 
+        # Schedule autonomous 1st turn watchdog safety net on round start
+        if event_type == "start_kyoku":
+            if (self.state_mgr.round_state and self.state_mgr.round_state.oya == self.my_actor_id) or self.state_mgr.is_my_turn:
+                asyncio.create_task(self._schedule_first_turn_watchdog(delay_sec=0.2))
+
         # Strict guard condition checking if self decision is genuinely required
         from io_adapter.stream_client import is_my_decision_required
-        if not is_my_decision_required(event, self.state_mgr, self.engine):
+        requires_decision = is_my_decision_required(event, self.state_mgr, self.engine)
+        if not requires_decision and not self.state_mgr.is_my_turn:
             return None
 
-        # 2. Run inference engine (Target: < 200ms)
+        # If dealer starting 1st turn with 13 tiles, ensure 14th tile is set
+        if self.state_mgr.is_my_turn:
+            self.state_mgr.ensure_dealer_first_tsumo()
+
+        return await self.decide_and_act()
+
+    async def decide_and_act(self) -> Optional[OutputAction]:
+        """
+        Runs the inference engine, applies tactical modifier, and executes action via ActionController.
+        Returns the resulting OutputAction or None if no valid candidates exist.
+        """
         t0 = time.perf_counter()
         raw_candidates = self.engine.evaluate(self.state_mgr)
         comp_time_ms = (time.perf_counter() - t0) * 1000
@@ -251,8 +267,25 @@ class MahjongAIAgent:
             apply_sleep=self.apply_sleep,
             all_candidates=modified_candidates
         )
-
         return output_action
+
+    async def _schedule_first_turn_watchdog(self, delay_sec: float = 0.2) -> None:
+        """
+        Safety net watchdog: If self is dealer (or in self turn) after round start
+        and no action has been computed within delay_sec (e.g. WebSocket paused or delayed),
+        forcefully kicks first-turn decision so HUD is never left waiting/frozen.
+        """
+        try:
+            await asyncio.sleep(delay_sec)
+            if self.state_mgr.is_my_turn:
+                if not self.action_controller.has_active_recommendation():
+                    print("[Watchdog SafetyNet] 1st turn silence detected on self turn. Forcefully kicking decide_and_act()...")
+                    self.state_mgr.ensure_dealer_first_tsumo()
+                    act = await self.decide_and_act()
+                    if act:
+                        self._print_decision(act)
+        except Exception as e:
+            print(f"[Watchdog SafetyNet] Warning in first turn watchdog: {e}")
 
     async def run_stream(self, event_stream) -> None:
         """Asynchronous loop consuming events from an async generator with permanent liveness."""

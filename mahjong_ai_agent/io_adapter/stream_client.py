@@ -33,12 +33,14 @@ def is_my_decision_required(
         return (actor == state_mgr.my_actor_id)
 
     if event_type == "start_kyoku":
-        # If self is dealer and hand already has 14 tiles, self initial discard is required
+        # If self is dealer and hand has >= 13 tiles, self initial discard decision is required
         oya = event.get("oya", 0)
         if oya == state_mgr.my_actor_id:
             my_hand = state_mgr.my_player.tehai if state_mgr.my_player else []
-            if len(my_hand) >= 14:
+            if len(my_hand) >= 13:
                 return True
+        if state_mgr.is_my_turn:
+            return True
         return False
 
     if event_type == "dahai":

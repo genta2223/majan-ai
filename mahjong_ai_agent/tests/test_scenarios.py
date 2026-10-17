@@ -814,7 +814,10 @@ def test_gui_chrome_discovery_and_app_initialization():
         assert os.path.isfile(chrome_path)
 
     # Verify Tkinter HUD app initializes properly
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        pytest.skip(f"Tkinter environment not available: {e}")
     try:
         app = gui.MahjongHUDApp(root)
         assert app.is_topmost.get() is True
@@ -5258,8 +5261,11 @@ def test_gui_exclusive_button_control_guards():
     import tkinter as tk
     from gui import MahjongHUDApp
 
-    root = tk.Tk()
-    root.withdraw()
+    try:
+        root = tk.Tk()
+        root.withdraw()
+    except Exception as e:
+        pytest.skip(f"Tkinter environment not available: {e}")
     try:
         app = MahjongHUDApp(root)
 
@@ -5360,6 +5366,62 @@ async def test_first_turn_resilience_under_noisy_async_packets(test_config):
     first_turn_rec = captured_recs[-1]
     assert "top_candidates" in first_turn_rec
     assert len(first_turn_rec["top_candidates"]) >= 2
+
+
+@pytest.mark.asyncio
+async def test_dealer_first_turn_autonomous_trigger_and_safety_net(test_config):
+    """
+    Test Requirement: Verify that on match start (ActionNewRound/start_kyoku):
+    1. If self is dealer and hand arrives with 13 tiles without explicit tsumo packet,
+       the agent autonomously promotes the hand and triggers 1st turn decision.
+    2. The decision output is generated without requiring external user discard or extra packets.
+    3. Recommendations are populated to HUD callback and not left in 'waiting' state.
+    """
+    from main import MahjongAIAgent
+
+    agent = MahjongAIAgent(config=test_config, my_actor_id=0, apply_sleep=False, output_mode="text_only")
+
+    captured_recs = []
+    agent.action_controller.on_recommendation_callback = lambda rec: captured_recs.append(rec)
+
+    # Dealer round start with 13-tile hand (standard start_kyoku)
+    start_event = {
+        "type": "start_kyoku",
+        "action_name": "ActionNewRound",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 0,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [
+            ["1m", "3m", "5m", "7m", "9m", "1p", "3p", "5p", "7p", "9p", "1s", "3s", "5s"],
+            ["?"] * 13,
+            ["?"] * 13,
+            ["?"] * 13
+        ],
+        "dora_marker": "1p"
+    }
+
+    # Handle the start_kyoku event directly
+    action = await agent.handle_event(start_event)
+
+    # MUST return an OutputAction immediately for dealer's 1st turn!
+    assert action is not None
+    assert action.action_type in ("dahai", "reach")
+    assert action.tile is not None
+
+    # State manager must reflect 14-tile state and active dealer turn
+    assert agent.state_mgr.is_my_turn is True
+    assert len(agent.state_mgr.my_player.tehai) == 14
+
+    # Callback must receive valid recommendation with candidates
+    assert len(captured_recs) >= 1
+    latest_rec = captured_recs[-1]
+    assert latest_rec.get("action_type") in ("dahai", "reach")
+    assert latest_rec.get("status") != "waiting"
+    assert len(latest_rec.get("top_candidates", [])) >= 1
+
 
 
 

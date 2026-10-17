@@ -188,16 +188,21 @@ class ActionController:
         # Optional GUI / HUD recommendation callback hook
         self.on_recommendation_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 
-    def clear_recommendation(self, notify: bool = True) -> None:
+    def has_active_recommendation(self) -> bool:
+        """Check if an AI recommendation is currently active and computed."""
+        return self._last_recommendation is not None
+
+    def clear_recommendation(self, notify: bool = True, is_self_turn: bool = False) -> None:
         """Clear cached previous recommendations to prevent stale UI state when turn ends or new draw arrives."""
         self._last_recommendation = None
         self.top_candidates = []
         if notify and self.on_recommendation_callback:
             try:
+                rec_text = "🤔 思考中 (自手番)..." if is_self_turn else "相手番 (待機中...)"
                 self.on_recommendation_callback({
-                    "action_type": "cleared",
-                    "status": "waiting",
-                    "recommendation_text": "相手番 (待機中...)",
+                    "action_type": "thinking" if is_self_turn else "cleared",
+                    "status": "thinking" if is_self_turn else "waiting",
+                    "recommendation_text": rec_text,
                     "top_candidates": []
                 })
             except Exception as e:
