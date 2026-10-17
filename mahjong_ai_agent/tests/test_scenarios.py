@@ -3606,5 +3606,80 @@ def test_paifu_downloader_skips_legacy_rpc_on_unity(monkeypatch, tmp_path, capsy
     assert "Unity WebGL environment detected: Skipping obsolete LayaAir app.NetAgent RPC probe." in captured
 
 
+def test_paifu_downloader_large_liqi_frame_res_game_record(tmp_path):
+    """
+    Verifies that a large 70KB-110KB Liqi WebSocket response frame (type 0x03, req_id 2 bytes)
+    containing ResGameRecord with field 2 (gzipped GameDetailRecords) and field 4 (head accounts)
+    is decoded directly and extracts both authentic player names and action events.
+    """
+    from tools.paifu_to_mjai import PaifuDownloader
+    import gzip
+    import base64
+
+    downloader = PaifuDownloader(cache_dir=str(tmp_path))
+    test_uuid = "261017-large-liqi-frame-uuid"
+
+    # 1. Construct GameDetailRecords payload (records field 1) with multiple actions
+    action_1 = b"\x0a\x0eRecordNewRound\x12\x02\x08\x00"
+    action_2 = b"\x0a\x0eActionDealTile\x12\x04\x08\x01\x10\x12"
+    action_3 = b"\x0a\x0aRecordHule\x12\x06\x08\x00\x10\xc8\x01\x18\x01"
+    
+    # Construct authentic records payload
+    records_payload = (
+        b"\x0a" + bytes([len(action_1)]) + action_1 +
+        b"\x0a" + bytes([len(action_2)]) + action_2 +
+        b"\x0a" + bytes([len(action_3)]) + action_3
+    )
+    gzipped_records = gzip.compress(records_payload)
+
+    # 2. Construct RecordGame (field 4: head) with accounts (field 3)
+    # Account 0: seat=0, nickname="genta2223"
+    acc0_inner = b"\x08\x00\x12\x09genta2223"
+    acc0_blob = b"\x1a" + bytes([len(acc0_inner)]) + acc0_inner
+    # Account 1: seat=1, nickname="プロコフ"
+    nick_utf8 = "プロコフ".encode("utf-8")
+    acc1_inner = b"\x08\x01\x12" + bytes([len(nick_utf8)]) + nick_utf8
+    acc1_blob = b"\x1a" + bytes([len(acc1_inner)]) + acc1_inner
+    head_payload = acc0_blob + acc1_blob
+
+    # 3. Construct ResGameRecord:
+    # Field 2: bytes data (length-delimited tag (2<<3)|2 = 0x12)
+    def encode_varint(n: int) -> bytes:
+        res = bytearray()
+        while n >= 0x80:
+            res.append((n & 0x7F) | 0x80)
+            n >>= 7
+        res.append(n)
+        return bytes(res)
+
+    res_game_record = (
+        b"\x12" + encode_varint(len(gzipped_records)) + gzipped_records +
+        b"\x22" + encode_varint(len(head_payload)) + head_payload
+    )
+
+    # 4. Construct Liqi RPC frame (type 0x03, req_id 0x0005)
+    liqi_header = b"\x03\x05\x00"
+    large_frame = liqi_header + res_game_record
+
+    # Pad large_frame to ~75KB to simulate realistic 75KB-110KB match packet
+    padding_comment = bytes([(i * 37) % 256 for i in range(75000)])
+    large_frame += padding_comment
+    assert len(large_frame) >= 75000
+
+    # Execute decoding
+    result = downloader._try_decode_records(large_frame, test_uuid)
+    assert result is not None, "Failed to decode large Liqi ResGameRecord frame!"
+    assert result["uuid"] == test_uuid
+    assert len(result["rounds"][0]["actions"]) >= 3
+    assert result["rounds"][0]["actions"][0]["action_name"] == "RecordNewRound"
+    
+    # Check that accounts were extracted from head
+    assert "accounts" in result
+    assert len(result["accounts"]) == 2
+    assert result["accounts"][0]["nickname"] == "genta2223"
+    assert result["accounts"][1]["nickname"] == "プロコフ"
+
+
+
 
 

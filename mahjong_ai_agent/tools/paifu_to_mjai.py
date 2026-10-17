@@ -893,95 +893,212 @@ class PaifuDownloader:
         return None
 
     def _try_decode_records(self, raw_bytes: bytes, uuid: str) -> Optional[Dict[str, Any]]:
-        """Attempts to decode GameDetailRecords actions or ResGameRecord protobuf structure."""
-        if not raw_bytes:
+        """
+        Attempts to decode GameDetailRecords actions or ResGameRecord protobuf structure
+        across various Liqi packet offsets (offset 3 for Liqi RPC response, offset 0, offset 1, etc).
+        Prioritizes structured ResGameRecord protobuf parsing (field 2 data + field 4/1 head)
+        so that authentic player nicknames/accounts and all rounds/actions are restored.
+        """
+        if not raw_bytes or len(raw_bytes) < 10:
             return None
-        
-        # 1. Direct decode_game_detail_records
-        actions = decode_game_detail_records(raw_bytes)
-        if actions and len(actions) > 0:
-            return {
-                "uuid": uuid,
-                "head": {},
-                "rounds": [{"actions": actions}]
-            }
 
-        # 2. Check ResGameRecord protobuf fields (field 2 = data, field 4 = head)
-        head_data: Dict[str, Any] = {}
-        accounts: List[Dict[str, Any]] = []
-        try:
-            fields = decode_raw_protobuf(raw_bytes)
-            # Field 4: head (RecordGame)
-            if 4 in fields and fields[4]:
-                h_blob = fields[4][0]
-                if isinstance(h_blob, (bytes, bytearray)):
-                    h_fields = decode_raw_protobuf(bytes(h_blob))
-                    # Field 3 in RecordGame: repeated accounts
-                    if 3 in h_fields:
-                        for acc_blob in h_fields[3]:
-                            if isinstance(acc_blob, (bytes, bytearray)):
-                                acc_fields = decode_raw_protobuf(bytes(acc_blob))
-                                seat = acc_fields.get(1, [0])[0]
-                                nick_raw = acc_fields.get(2, [b""])[0]
-                                nick = nick_raw.decode("utf-8", errors="replace") if isinstance(nick_raw, (bytes, bytearray)) else str(nick_raw)
-                                accounts.append({"seat": int(seat) if isinstance(seat, int) else 0, "nickname": nick})
-            # Field 2: data (bytes)
-            if 2 in fields and fields[2]:
-                data_blob = fields[2][0]
-                if isinstance(data_blob, (bytes, bytearray)):
-                    d_bytes = bytes(data_blob)
-                    decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
-                    inner_actions = decode_game_detail_records(decomp)
-                    if inner_actions and len(inner_actions) > 0:
-                        payload = {
-                            "uuid": uuid,
-                            "head": {"accounts": accounts} if accounts else head_data,
-                            "rounds": [{"actions": inner_actions}]
-                        }
-                        if accounts:
-                            payload["accounts"] = accounts
-                        return payload
-        except Exception:
-            pass
+        # Determine potential protobuf start offsets based on Liqi header signatures
+        offsets = [0, 3, 1]
+        if len(raw_bytes) >= 3:
+            if raw_bytes[0] in (0x02, 0x03):  # Liqi RPC response (type 1B + req_id 2B)
+                offsets = [3, 0, 1]
+            elif raw_bytes[0] == 0x01:  # Liqi notification / action (type 1B + method_len 2B)
+                method_len = int.from_bytes(raw_bytes[1:3], "little")
+                if 0 < method_len < 100 and len(raw_bytes) > 3 + method_len:
+                    offsets = [3 + method_len, 3, 0, 1]
+
+        for off in offsets:
+            if len(raw_bytes) <= off:
+                continue
+            chunk = raw_bytes[off:]
+
+            # 1. First priority: Protobuf wire decode for ResGameRecord (field 2 = data, field 4/1 = head)
+            try:
+                fields = decode_raw_protobuf(chunk)
+                if fields and (2 in fields or 4 in fields or 1 in fields):
+                    head_data: Dict[str, Any] = {}
+                    accounts: List[Dict[str, Any]] = []
+
+                    # Field 4 / Field 1: head (RecordGame)
+                    h_blobs = fields.get(4, []) or (fields.get(1, []) if 2 in fields else [])
+                    for h_blob in h_blobs:
+                        if isinstance(h_blob, (bytes, bytearray)):
+                            try:
+                                h_fields = decode_raw_protobuf(bytes(h_blob))
+                                # Field 3 in RecordGame: repeated accounts
+                                if 3 in h_fields:
+                                    for acc_blob in h_fields[3]:
+                                        if isinstance(acc_blob, (bytes, bytearray)):
+                                            acc_fields = decode_raw_protobuf(bytes(acc_blob))
+                                            seat = acc_fields.get(1, [0])[0]
+                                            nick_raw = acc_fields.get(2, [b""])[0]
+                                            nick = nick_raw.decode("utf-8", errors="replace") if isinstance(nick_raw, (bytes, bytearray)) else str(nick_raw)
+                                            accounts.append({"seat": int(seat) if isinstance(seat, int) else 0, "nickname": nick})
+                            except Exception:
+                                pass
+
+                    # Field 2: data (GameDetailRecords bytes, often gzip compressed)
+                    if 2 in fields and fields[2]:
+                        data_blob = fields[2][0]
+                        if isinstance(data_blob, (bytes, bytearray)):
+                            d_bytes = bytes(data_blob)
+                            decomp = self._decompress_gzip_slice(d_bytes) or d_bytes
+                            inner_actions = decode_game_detail_records(decomp)
+                            if inner_actions and len(inner_actions) > 0:
+                                print(f"[PaifuDownloader] Successfully extracted {len(inner_actions)} actions from ResGameRecord.data at offset {off}!")
+                                payload = {
+                                    "uuid": uuid,
+                                    "head": {"accounts": accounts} if accounts else head_data,
+                                    "rounds": [{"actions": inner_actions}]
+                                }
+                                if accounts:
+                                    payload["accounts"] = accounts
+                                return payload
+
+                    # If accounts were found from head, but data was in another field or stream:
+                    if accounts:
+                        gzip_decomp = self._decompress_gzip_slice(chunk)
+                        if gzip_decomp:
+                            actions = decode_game_detail_records(gzip_decomp)
+                            if actions and len(actions) > 0:
+                                return {
+                                    "uuid": uuid,
+                                    "head": {"accounts": accounts},
+                                    "accounts": accounts,
+                                    "rounds": [{"actions": actions}]
+                                }
+            except Exception:
+                pass
+
+            # 2. Second priority: Gzip stream decompression from chunk (standalone GameDetailRecords)
+            gzip_decomp = self._decompress_gzip_slice(chunk)
+            if gzip_decomp:
+                actions = decode_game_detail_records(gzip_decomp)
+                if actions and len(actions) > 0:
+                    print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions from gzip stream at offset {off}!")
+                    return {
+                        "uuid": uuid,
+                        "head": {},
+                        "rounds": [{"actions": actions}]
+                    }
+
+            # 3. Third priority: Direct GameDetailRecords decode on uncompressed chunk
+            actions = decode_game_detail_records(chunk)
+            if actions and len(actions) > 0:
+                print(f"[PaifuDownloader] Successfully extracted {len(actions)} actions directly at offset {off}!")
+                return {
+                    "uuid": uuid,
+                    "head": {},
+                    "rounds": [{"actions": actions}]
+                }
 
         return None
 
     def _fetch_via_unity_cdp(self, uuid: str) -> Optional[Dict[str, Any]]:
         """
         Direct approach for Unity WebGL client:
-        1. Opens an isolated temporary tab (Target.createTarget / json/new) with the replay URL
-           to PREVENT destroying or reloading the active main game session.
+        1. Opens an isolated temporary guest tab via CDP (Target.createBrowserContext or json/new)
+           to PREVENT destroying the main game session or triggering 'logged in from another location'.
         2. Enables Page and Network domains on the isolated tab.
         3. Monitors incoming WebSocket game packets (wss://) with a generous 40s timeout for Unity initialization.
-        4. Intercepts binary frames containing gzip magic (0x1f 0x8b) or authentic actions and decodes them.
-        5. Automatically closes the temporary tab (Target.closeTarget / json/close) upon completion or timeout.
+        4. Intercepts large frames (70KB-110KB) or frames with gzip magic, decoding authentic Liqi ResGameRecord packets.
+        5. Automatically closes the temporary tab and disposes the browser context immediately upon completion or timeout.
         """
         replay_url = f"https://game.mahjongsoul.com/?paipu={uuid}"
         temp_target_id = None
+        browser_context_id = None
         target_ws_url = None
+        browser_ws = None
 
-        # 1. Attempt to create an isolated temporary tab via CDP HTTP endpoint
-        try:
-            encoded_url = urllib.parse.quote(replay_url, safe="")
-            new_tab_url = f"http://127.0.0.1:{self.cdp_port}/json/new?{encoded_url}"
-            req = urllib.request.Request(new_tab_url, method="PUT")
+        def _safe_run_async(coro):
             try:
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
-                    new_tab = json.loads(resp.read().decode("utf-8"))
-                    temp_target_id = new_tab.get("id")
-                    target_ws_url = new_tab.get("webSocketDebuggerUrl")
-            except Exception:
-                # Fallback to GET method if PUT not accepted
-                req_get = urllib.request.Request(new_tab_url)
-                with urllib.request.urlopen(req_get, timeout=3.0) as resp:
-                    new_tab = json.loads(resp.read().decode("utf-8"))
-                    temp_target_id = new_tab.get("id")
-                    target_ws_url = new_tab.get("webSocketDebuggerUrl")
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    return executor.submit(lambda: asyncio.run(coro)).result()
+            else:
+                return asyncio.run(coro)
 
-            if target_ws_url:
-                print(f"[PaifuDownloader] Created isolated temporary tab for replay capture (Tab ID: {temp_target_id}).")
-        except Exception as te:
-            print(f"[PaifuDownloader] Could not open new isolated tab via /json/new ({te}). Falling back to existing tab...")
+        # 1. Attempt to create an Incognito BrowserContext via browser websocket (prevents kicking main game session)
+        try:
+            req_ver = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json/version")
+            with urllib.request.urlopen(req_ver, timeout=1.5) as resp_v:
+                ver_info = json.loads(resp_v.read().decode("utf-8"))
+            browser_ws = ver_info.get("webSocketDebuggerUrl")
+
+            if browser_ws:
+                import websockets
+                import asyncio
+
+                async def _create_incognito_tab():
+                    async with websockets.connect(browser_ws, open_timeout=2.0) as bws:
+                        # Create isolated incognito context (no cookies / credentials shared)
+                        await bws.send(json.dumps({"id": 1, "method": "Target.createBrowserContext", "params": {}}))
+                        resp_str = await asyncio.wait_for(bws.recv(), timeout=2.0)
+                        bctx_resp = json.loads(resp_str)
+                        ctx_id = bctx_resp.get("result", {}).get("browserContextId")
+                        if not ctx_id:
+                            return None, None
+
+                        # Create target in this incognito context
+                        await bws.send(json.dumps({
+                            "id": 2,
+                            "method": "Target.createTarget",
+                            "params": {"url": replay_url, "browserContextId": ctx_id}
+                        }))
+                        resp_t_str = await asyncio.wait_for(bws.recv(), timeout=2.5)
+                        t_resp = json.loads(resp_t_str)
+                        tid = t_resp.get("result", {}).get("targetId")
+                        return ctx_id, tid
+
+                try:
+                    browser_context_id, temp_target_id = _safe_run_async(_create_incognito_tab())
+                    if temp_target_id:
+                        # Find webSocketDebuggerUrl for the new target
+                        req_targets = urllib.request.Request(f"http://127.0.0.1:{self.cdp_port}/json")
+                        with urllib.request.urlopen(req_targets, timeout=1.5) as resp_t:
+                            all_t = json.loads(resp_t.read().decode("utf-8"))
+                        for t in all_t:
+                            if t.get("id") == temp_target_id and t.get("webSocketDebuggerUrl"):
+                                target_ws_url = t["webSocketDebuggerUrl"]
+                                break
+                        if target_ws_url:
+                            print(f"[PaifuDownloader] Created incognito isolated tab (Context: {browser_context_id}, Tab ID: {temp_target_id}) - Main session protected!")
+                except Exception as b_err:
+                    print(f"[PaifuDownloader] Incognito context creation failed ({b_err}). Falling back to /json/new...")
+        except Exception:
+            pass
+
+        # Fallback to /json/new if Incognito BrowserContext not supported
+        if not target_ws_url:
+            try:
+                encoded_url = urllib.parse.quote(replay_url, safe="")
+                new_tab_url = f"http://127.0.0.1:{self.cdp_port}/json/new?{encoded_url}"
+                req = urllib.request.Request(new_tab_url, method="PUT")
+                try:
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        new_tab = json.loads(resp.read().decode("utf-8"))
+                        temp_target_id = new_tab.get("id")
+                        target_ws_url = new_tab.get("webSocketDebuggerUrl")
+                except Exception:
+                    req_get = urllib.request.Request(new_tab_url)
+                    with urllib.request.urlopen(req_get, timeout=3.0) as resp:
+                        new_tab = json.loads(resp.read().decode("utf-8"))
+                        temp_target_id = new_tab.get("id")
+                        target_ws_url = new_tab.get("webSocketDebuggerUrl")
+
+                if target_ws_url:
+                    print(f"[PaifuDownloader] Created temporary tab for replay capture (Tab ID: {temp_target_id}).")
+            except Exception as te:
+                print(f"[PaifuDownloader] Could not open new tab via /json/new ({te}). Falling back to existing tab...")
 
         # Fallback to existing tab if isolated tab creation failed
         if not target_ws_url:
@@ -1003,13 +1120,32 @@ class PaifuDownloader:
                 return None
 
         def _close_temp_tab():
+            nonlocal temp_target_id, browser_context_id
             if temp_target_id:
+                tid = temp_target_id
+                temp_target_id = None
                 try:
-                    close_url = f"http://127.0.0.1:{self.cdp_port}/json/close/{temp_target_id}"
+                    close_url = f"http://127.0.0.1:{self.cdp_port}/json/close/{tid}"
                     req_close = urllib.request.Request(close_url)
                     with urllib.request.urlopen(req_close, timeout=2.0) as resp:
                         pass
-                    print(f"[PaifuDownloader] Successfully closed temporary replay tab ({temp_target_id}).")
+                    print(f"[PaifuDownloader] Successfully closed temporary replay tab ({tid}).")
+                except Exception:
+                    pass
+            if browser_context_id and browser_ws:
+                bctx = browser_context_id
+                browser_context_id = None
+                try:
+                    async def _dispose():
+                        async with websockets.connect(browser_ws, open_timeout=2.0) as bws:
+                            await bws.send(json.dumps({
+                                "id": 99,
+                                "method": "Target.disposeBrowserContext",
+                                "params": {"browserContextId": bctx}
+                            }))
+                            await asyncio.wait_for(bws.recv(), timeout=2.0)
+                    _safe_run_async(_dispose())
+                    print(f"[PaifuDownloader] Successfully disposed incognito browser context ({bctx}).")
                 except Exception:
                     pass
 
@@ -1060,25 +1196,21 @@ class PaifuDownloader:
                                     except Exception:
                                         raw_bytes = payload_data.encode("latin1", errors="ignore")
 
+                                    frame_len = len(raw_bytes)
                                     gzip_idx = raw_bytes.find(b"\x1f\x8b")
                                     has_gzip = (gzip_idx != -1)
-                                    print(f"[PaifuDownloader] WS Frame #{total_ws_frames}: len={len(raw_bytes)}, gzip={'YES (offset ' + str(gzip_idx) + ')' if has_gzip else 'no'}")
+                                    print(f"[PaifuDownloader] WS Frame #{total_ws_frames}: len={frame_len}, gzip={'YES (offset ' + str(gzip_idx) + ')' if has_gzip else 'no'}")
 
-                                    # A. If gzip magic present, attempt decompression and record decoding
-                                    if has_gzip:
-                                        decompressed = self._decompress_gzip_slice(raw_bytes)
-                                        if decompressed:
-                                            rec = self._try_decode_records(decompressed, uuid)
-                                            if rec and (rec.get("rounds") or rec.get("actions")):
-                                                print(f"[PaifuDownloader] Intercepted authentic paifu packet in gzip WS frame #{total_ws_frames}!")
-                                                captured_record = rec
-                                                break
+                                    # High-priority detection: large payload (> 10KB) or gzip magic
+                                    if frame_len > 10000 or has_gzip:
+                                        print(f"[PaifuDownloader] Candidate paifu payload detected in frame #{total_ws_frames} ({frame_len} bytes)! Decoding...")
 
-                                    # B. Attempt record decoding directly on raw_bytes
                                     rec = self._try_decode_records(raw_bytes, uuid)
                                     if rec and (rec.get("rounds") or rec.get("actions")):
-                                        print(f"[PaifuDownloader] Intercepted authentic paifu packet directly in WS frame #{total_ws_frames}!")
+                                        print(f"[PaifuDownloader] SUCCESS: Intercepted authentic paifu in WS frame #{total_ws_frames} ({frame_len} bytes)!")
                                         captured_record = rec
+                                        # Immediately close temporary tab to prevent kicking main screen
+                                        _close_temp_tab()
                                         break
 
                             # Intercept HTTP response if fetched via HTTP
