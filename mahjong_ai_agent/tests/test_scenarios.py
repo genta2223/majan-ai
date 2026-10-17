@@ -4422,4 +4422,97 @@ def test_paifu_binary_v2_records_numeric_names_and_seat_stats():
     assert profiler.get_profile("ブロコフ").deal_in_rate == 1.0
 
 
+@pytest.mark.asyncio
+async def test_profiler_avg_hora_score_normalization():
+    """Verify that OpponentProfiler computes authentic average winning scores without round-end balance inflation."""
+    events = [
+        {"type": "start_game", "names": ["genta2223", "ブロコフ", "龍斗たっちゃん", "横丁の隠居"]},
+        # Round 1: genta wins 8000 pts Ron (score=8000, balance delta=[8000, -8000, 0, 0])
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "kyotaku": 0, "oya": 0, "scores": [25000, 25000, 25000, 25000], "tehais": [[], [], [], []]},
+        {"type": "hora", "actor": 0, "target": 1, "pai": "5m", "score": 8000, "deltas": [8000, -8000, 0, 0]},
+        {"type": "end_kyoku"},
+        # Round 2: genta wins 2600 pts Tsumo (score=2600, deltas=[2600, -800, -1000, -800])
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 2, "honba": 0, "kyotaku": 0, "oya": 1, "scores": [33000, 17000, 25000, 25000], "tehais": [[], [], [], []]},
+        {"type": "hora", "actor": 0, "target": 0, "pai": "2s", "score": 2600, "deltas": [2600, -800, -1000, -800]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"}
+    ]
+
+    from core.opponent_profiler import OpponentProfiler
+
+    profiler = OpponentProfiler()
+    profiler.analyze_game_events(events)
+
+    prof = profiler.get_profile("genta2223")
+    assert prof is not None
+    assert prof.hora_count == 2
+    # Average score should be (8000 + 2600) / 2 = 5300.0, NOT 25000+!
+    assert prof.avg_hora_score == 5300.0
+    assert 5000 <= prof.avg_hora_score <= 8000
+
+
+@pytest.mark.asyncio
+async def test_hud_recommendation_top_candidates_and_display():
+    """Verify that ActionController formats 1st/2nd candidate predictions and win probabilities correctly."""
+    from core.state_manager import MahjongStateManager
+    from core.engine import ActionCandidate
+    from io_adapter.action_controller import ActionController
+
+    received_callbacks = []
+
+    controller = ActionController(config={"output_mode": "text_only"})
+    controller.on_recommendation_callback = lambda data: received_callbacks.append(data)
+
+    state_mgr = MahjongStateManager(my_actor_id=0)
+    state_mgr.reset_round(
+        bakaze="E",
+        kyoku=1,
+        honba=0,
+        kyotaku=0,
+        oya=0,
+        scores=[25000, 25000, 25000, 25000],
+        tehais=[["1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "1p", "2p", "3p", "4s", "7s"], [], [], []],
+        dora_marker="1p"
+    )
+
+    cand1 = ActionCandidate(
+        action_type="dahai",
+        tile="4m",
+        raw_q_value=185.0,
+        modified_q_value=185.0,
+        danger_score=0.1,
+        shanten_after=0,
+        metadata={"ukeire": 6}
+    )
+    cand2 = ActionCandidate(
+        action_type="dahai",
+        tile="7s",
+        raw_q_value=172.0,
+        modified_q_value=172.0,
+        danger_score=0.2,
+        shanten_after=0,
+        metadata={"ukeire": 4}
+    )
+
+    action = await controller.execute_action(
+        candidate=cand1,
+        state_mgr=state_mgr,
+        comp_time_ms=12.5,
+        all_candidates=[cand1, cand2],
+        apply_sleep=False
+    )
+
+    assert len(received_callbacks) == 1
+    cb = received_callbacks[0]
+    top_cands = cb.get("top_candidates", [])
+    assert len(top_cands) >= 2
+    # Verify 1st candidate
+    assert top_cands[0]["tile"] == "4m"
+    assert top_cands[0]["win_prob"] > 0
+    # Verify 2nd candidate
+    assert top_cands[1]["tile"] == "7s"
+    assert top_cands[1]["diff_q"] == -13.0
+
+
+
 

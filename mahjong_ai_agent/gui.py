@@ -308,29 +308,37 @@ class MahjongHUDApp:
         self.lbl_rec_main = tk.Label(
             rec_card,
             text="対局開始を待機しています...",
-            font=("Meiryo", 14, "bold"),
+            font=("Meiryo", 11, "bold"),
             fg=self.c_text,
             bg=self.c_card,
-            pady=6,
+            pady=2,
+            anchor=tk.W,
             wraplength=410,
+            justify=tk.LEFT,
         )
         self.lbl_rec_main.pack(fill=tk.X)
 
         self.lbl_rec_sub = tk.Label(
             rec_card,
-            text="期待値: -- | 向聴数: --",
-            font=("Meiryo", 9),
+            text="",
+            font=("Meiryo", 10),
             fg=self.c_text_dim,
             bg=self.c_card,
+            pady=2,
+            anchor=tk.W,
+            wraplength=410,
+            justify=tk.LEFT,
         )
         self.lbl_rec_sub.pack(fill=tk.X)
 
         self.lbl_rec_detail = tk.Label(
             rec_card,
             text="",
-            font=("Consolas", 8),
-            fg=self.c_text_dim,
+            font=("Meiryo", 9, "bold"),
+            fg=self.c_yellow,
             bg=self.c_card,
+            pady=2,
+            anchor=tk.W,
             wraplength=410,
             justify=tk.LEFT,
         )
@@ -796,31 +804,47 @@ class MahjongHUDApp:
                 if action_type in ("dahai", "reach"):
                     jp_name = format_tile_jp(target_tile, include_unicode=True) if target_tile else "？"
                     reach_suffix = " [立直]" if action_type == "reach" else ""
-                    self.lbl_rec_main.config(
-                        text=f"推奨打牌: {jp_name}{reach_suffix}",
-                        fg=self.c_accent,
-                    )
                     shanten_str = f"{shanten}シャンテン" if shanten is not None and shanten > 0 else ("テンパイ" if shanten == 0 else "--")
-                    self.lbl_rec_sub.config(
-                        text=f"期待値: {score:+.2f} | 向聴数: {shanten_str}",
-                        fg=self.c_text,
-                    )
 
-                    # Candidates list
-                    cand_texts = []
-                    for i, c in enumerate(top_candidates[:3], start=1):
-                        c_tile = c.get("tile", "")
-                        cand_tile = format_tile_jp(c_tile, include_unicode=False) if c_tile else "？"
-                        c_act = c.get("action_type", "")
-                        c_reach = "[立直]" if c_act == "reach" else ""
-                        cand_ev = c.get("modified_q") or c.get("expected_value", 0.0)
-                        cand_texts.append(f"{i}位:{cand_tile}{c_reach}({cand_ev:+.1f})")
-                    self.lbl_rec_detail.config(
-                        text=" | ".join(cand_texts) if cand_texts else ""
-                    )
+                    # Primary (1st rank) recommendation
+                    c1 = top_candidates[0] if top_candidates else {}
+                    c1_win = c1.get("win_prob")
+                    if c1_win is None:
+                        # Fallback win_prob estimation
+                        c1_win = 40 if shanten == 0 else (25 if shanten == 1 else 15)
+                    tile_label = f"{target_tile} ({jp_name})" if jp_name and jp_name != target_tile else target_tile
+                    c1_text = f"🥇 推奨 1位: 【 {tile_label} 】 (期待値: {score:+.1f}pt / 和了率 {c1_win}%){reach_suffix}"
+                    self.lbl_rec_main.config(text=c1_text, fg=self.c_accent)
+
+                    # 2nd rank candidate
+                    c2_text = ""
+                    decision_note = ""
+                    if len(top_candidates) >= 2:
+                        c2 = top_candidates[1]
+                        c2_tile = c2.get("tile", "")
+                        c2_q = c2.get("modified_q") if c2.get("modified_q") is not None else c2.get("expected_value", 0.0)
+                        diff_q = c2_q - score
+                        c2_reach = " [立直]" if c2.get("action_type") == "reach" else ""
+                        c2_text = f"🥈 候補 2位: 【 {c2_tile} 】 (期待値: {c2_q:+.1f}pt / 差 {diff_q:+.1f}pt){c2_reach}"
+
+                        # Judgment: small gap vs solid choice
+                        gap = abs(diff_q)
+                        if gap <= 15.0:
+                            decision_note = "💡 補足: 【微差】受け・打点変化の余地あり"
+                            self.lbl_rec_detail.config(fg=self.c_yellow)
+                        else:
+                            decision_note = "💡 判定: 【鉄板】セオリー通りの一手"
+                            self.lbl_rec_detail.config(fg=self.c_green)
+                    else:
+                        c2_text = f"🥈 候補 2位: -- (単独候補)"
+                        decision_note = f"💡 状況: 向聴数 {shanten_str}"
+                        self.lbl_rec_detail.config(fg=self.c_text_dim)
+
+                    self.lbl_rec_sub.config(text=c2_text, fg=self.c_text)
+                    self.lbl_rec_detail.config(text=decision_note)
 
                     self._log(
-                        f"[AI RECOMMEND] 推奨打牌: {jp_name}{reach_suffix} | 期待値: {score:+.2f} | {shanten_str}"
+                        f"[AI RECOMMEND] 1位: {target_tile} ({score:+.1f}pt) | 2位: {top_candidates[1].get('tile') if len(top_candidates)>=2 else '--'} | {decision_note}"
                     )
 
                 elif action_type in ("chi", "pon", "kan", "hora"):
@@ -832,21 +856,24 @@ class MahjongHUDApp:
                     }
                     action_name = action_names.get(action_type, action_type.upper())
                     target_str = (
-                        f" ({format_tile_jp(str(target), include_unicode=True)})"
-                        if target
+                        f" 【 {target_tile} 】"
+                        if target_tile
                         else ""
                     )
                     self.lbl_rec_main.config(
-                        text=f"副露判断: {action_name}推奨{target_str}",
+                        text=f"🥇 推奨 1位: 副露判断 【 {action_name} 】{target_str} (期待値: {score:+.1f}pt)",
                         fg=self.c_yellow,
                     )
                     self.lbl_rec_sub.config(
-                        text=f"期待値: {score:+.2f}",
-                        fg=self.c_text,
+                        text="🥈 候補 2位: スルー (パス)",
+                        fg=self.c_text_dim,
                     )
-                    self.lbl_rec_detail.config(text="")
+                    self.lbl_rec_detail.config(
+                        text="💡 補足: 局進行・打点速度を考慮した鳴き判断",
+                        fg=self.c_accent,
+                    )
                     self._log(
-                        f"[AI RECOMMEND] 副露判断: {action_name}推奨{target_str} | 期待値: {score:+.2f}"
+                        f"[AI RECOMMEND] 副露判断: {action_name}推奨{target_str} | 期待値: {score:+.1f}"
                     )
 
                 elif action_type in ("pass", "none"):

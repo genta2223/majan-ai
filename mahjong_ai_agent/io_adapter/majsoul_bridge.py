@@ -418,11 +418,19 @@ class MajsoulBridge:
                 else:
                     target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None else seat)
 
+                score_val = safe_coerce_int(h.get("score") or h.get("point_sum"), 0)
+                if not (0 < score_val <= 48000):
+                    if 0 <= seat < len(deltas) and 0 < deltas[seat] <= 48000:
+                        score_val = deltas[seat]
+                    else:
+                        score_val = 5200
+
                 events.append({
                     "type": "hora",
                     "actor": seat,
                     "target": target,
                     "pai": hu_tile,
+                    "score": score_val,
                     "deltas": deltas,
                 })
             events.append({"type": "end_kyoku"})

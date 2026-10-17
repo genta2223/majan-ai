@@ -475,7 +475,22 @@ class ActionController:
         # Prepare top candidates summary
         top_list: List[Dict[str, Any]] = []
         if all_candidates:
+            best_q = all_candidates[0].modified_q_value
             for c in all_candidates[:3]:
+                # Estimate win probability from shanten and ukeire
+                c_shanten = c.shanten_after
+                c_ukeire = c.metadata.get("ukeire", 0) if isinstance(c.metadata, dict) else 0
+                if c_shanten == -1:
+                    win_prob = 100
+                elif c_shanten == 0:
+                    win_prob = min(85, max(30, int(35 + c_ukeire * 3.5)))
+                elif c_shanten == 1:
+                    win_prob = min(60, max(15, int(15 + c_ukeire * 2.0)))
+                elif c_shanten == 2:
+                    win_prob = min(40, max(8, int(8 + c_ukeire * 1.2)))
+                else:
+                    win_prob = max(3, int(15 - c_shanten * 3))
+
                 top_list.append({
                     "action_type": c.action_type,
                     "tile": c.tile,
@@ -484,6 +499,8 @@ class ActionController:
                     "raw_q": c.raw_q_value,
                     "danger": c.danger_score,
                     "shanten": c.shanten_after,
+                    "win_prob": win_prob,
+                    "diff_q": round(c.modified_q_value - best_q, 1),
                 })
 
         # Mouse interaction sequence planning (if coordinates exist and not in text_only mode)

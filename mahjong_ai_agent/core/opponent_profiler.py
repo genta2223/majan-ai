@@ -52,8 +52,10 @@ class PlayerProfile(BaseModel):
 
     @property
     def display_name(self) -> str:
-        """Returns name formatted with seat info if present, e.g. 'genta2223 (東家)'."""
-        if self.seat_name and f"({self.seat_name})" not in self.name:
+        """Returns name formatted with seat info if present and single-game, e.g. 'genta2223 (東家)' or 'genta2223'."""
+        if self.total_games > 1 or not self.seat_name:
+            return self.name
+        if f"({self.seat_name})" not in self.name:
             return f"{self.name} ({self.seat_name})"
         return self.name
 
@@ -310,13 +312,42 @@ class OpponentProfiler:
                         current_riichis[actor].append(norm_pai)
 
                     other_riichis = [r_actor for r_actor in current_riichis.keys() if r_actor != actor]
-                    if other_riichis and name in self.profiles:
+                    # Only evaluate push/fold if:
+                    # 1. Other players have declared Riichi
+                    # 2. Actor is NOT in Riichi oneself (when in Riichi, tsumogiri is forced and not a choice to fold)
+                    if other_riichis and actor not in current_riichis and name in self.profiles:
                         self.profiles[name].aggressiveness_total_turns += 1
-                        is_safe = all(norm_pai in current_riichis[r] for r in other_riichis)
-                        if not is_safe:
-                            self.profiles[name].aggressiveness_pushes += 1
-                        else:
+
+                        # Determine if discarded tile is safe (genbutsu to all other riichis)
+                        is_genbutsu = all(norm_pai in current_riichis[r] for r in other_riichis)
+
+                        # Check if tile is suji (one-chance / suji) against other riichis
+                        def _is_suji(t: str, enemy_discards: List[str]) -> bool:
+                            if t in HONORS or len(t) != 2 or not t[0].isdigit():
+                                return False
+                            val, suit = int(t[0]), t[1]
+                            if val in (1, 9):
+                                return f"{4 if val == 1 else 6}{suit}" in enemy_discards
+                            elif val in (2, 8):
+                                return f"5{suit}" in enemy_discards
+                            elif val in (3, 7):
+                                return f"{6 if val == 3 else 4}{suit}" in enemy_discards
+                            elif val == 4:
+                                return f"1{suit}" in enemy_discards and f"7{suit}" in enemy_discards
+                            elif val == 5:
+                                return f"2{suit}" in enemy_discards and f"8{suit}" in enemy_discards
+                            elif val == 6:
+                                return f"3{suit}" in enemy_discards and f"9{suit}" in enemy_discards
+                            return False
+
+                        is_suji_safe = all(_is_suji(norm_pai, current_riichis[r]) for r in other_riichis)
+
+                        # A tile is considered a safe/fold choice if it is genbutsu or suji against enemies
+                        if is_genbutsu or is_suji_safe:
                             self.profiles[name].fold_turns += 1
+                        else:
+                            # Genuine dangerous musuji tile pushed
+                            self.profiles[name].aggressiveness_pushes += 1
 
             elif etype == "hora":
                 actor = ev.get("actor", 0)
@@ -332,10 +363,13 @@ class OpponentProfiler:
                         p = self.profiles[winner_name]
                         p.hora_count += 1
                         win_score = 0
-                        if deltas and len(deltas) > actor and deltas[actor] > 0:
+                        # 1. Prioritize authentic score from ev["score"]
+                        ev_sc = ev.get("score")
+                        if ev_sc is not None and 0 < int(ev_sc) <= 48000:
+                            win_score = int(ev_sc)
+                        # 2. Then deltas if within plausible single-hand range
+                        elif deltas and len(deltas) > actor and 0 < deltas[actor] <= 48000:
                             win_score = deltas[actor]
-                        elif "score" in ev:
-                            win_score = ev["score"]
                         else:
                             win_score = 5200
                         p.hora_scores_sum += win_score

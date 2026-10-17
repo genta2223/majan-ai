@@ -542,8 +542,21 @@ class LiqiProtoDecoder:
                     t_cand = [s(v).strip() for v in (hf.get(3) or []) if is_tile(v)]
                     if t_cand:
                         h_dict["hu_tile"] = t_cand[0]
-                    # point_sum = tag 7
-                    h_dict["point_sum"] = coerce_int((hf.get(7) or [5200])[0], 5200)
+                    # Score calculation: dadian (tag 19) / point_sum (tag 18 or 7) / point_rong (tag 14) / zimo (tags 15, 16)
+                    dadian = coerce_int((hf.get(19) or hf.get(18) or hf.get(14) or [0])[0], 0)
+                    if not dadian:
+                        z_qin = coerce_int((hf.get(15) or [0])[0], 0)
+                        z_xian = coerce_int((hf.get(16) or [0])[0], 0)
+                        if z_qin or z_xian:
+                            dadian = z_qin * 3 if z_qin and not z_xian else (z_qin + z_xian * 2)
+                    if not dadian:
+                        dadian = coerce_int((hf.get(7) or [0])[0], 0)
+                    if 0 < dadian <= 48000:
+                        h_dict["score"] = dadian
+                        h_dict["point_sum"] = dadian
+                    else:
+                        h_dict["point_sum"] = 5200
+                        h_dict["score"] = 5200
                     hules_list.append(h_dict)
                 elif isinstance(h_blob, dict):
                     hules_list.append(h_blob)
