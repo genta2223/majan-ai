@@ -4716,6 +4716,89 @@ def test_state_manager_hand_size_safety_guard_prevents_shrinking_below_13():
         assert len(state_mgr.my_player.tehai) == 13, f"Hand collapsed to {len(state_mgr.my_player.tehai)} tiles after discarding {d}!"
 
 
+@pytest.mark.asyncio
+async def test_user_ignores_recommendation_and_fresh_recalculation_on_next_tsumo():
+    """
+    Verify that when user ignores AI's 1st recommendation (e.g. recommended 6p, but discarded 1z),
+    the previous recommendation cache is purged upon dahai and tsumo, and a fresh recommendation
+    is calculated strictly from the actual 14 tiles on the next turn.
+    """
+    from main import MahjongAIAgent
+
+    agent = MahjongAIAgent(
+        my_actor_id=0,
+        apply_sleep=False,
+        output_mode="text_only"
+    )
+
+    received_callbacks = []
+    agent.action_controller.on_recommendation_callback = lambda payload: received_callbacks.append(payload)
+
+    # 1. Round starts: South player (oya=1), dealt 13 tiles with isolated 6p and honors 1z, 2z, 3z
+    # Hand: 1m 2m 3m 4m 5m 6p 7s 8s 9s 1z 2z 3z 4z
+    start_ev = {
+        "type": "start_kyoku",
+        "bakaze": "E",
+        "kyoku": 1,
+        "honba": 0,
+        "kyotaku": 0,
+        "oya": 1,
+        "scores": [25000, 25000, 25000, 25000],
+        "tehais": [
+            ["1m", "2m", "3m", "4m", "5m", "6p", "7s", "8s", "9s", "1z", "2z", "3z", "4z"],
+            ["?"] * 13, ["?"] * 13, ["?"] * 13
+        ],
+        "dora_marker": "1p"
+    }
+    await agent.handle_event(start_ev)
+
+    # 2. Turn 1: Dealer (P1) discards 9m
+    await agent.handle_event({"type": "dahai", "actor": 1, "pai": "9m", "tsumogiri": True})
+
+    # 3. Turn 1: Self draws 9p (isolated)
+    action1 = await agent.handle_event({"type": "tsumo", "actor": 0, "pai": "9p"})
+    assert action1 is not None
+    assert action1.action_type in ("dahai", "reach")
+    rec1_tile = action1.tile
+    assert rec1_tile is not None
+    # ActionController must cache this decision
+    assert agent.action_controller._last_recommendation is not None
+    assert agent.action_controller._last_recommendation.tile == rec1_tile
+
+    # 4. User IGNORES AI's recommendation (rec1_tile) and discards a different tile '1z'
+    alt_discard = "1z" if rec1_tile != "1z" else "2z"
+    await agent.handle_event({"type": "dahai", "actor": 0, "pai": alt_discard, "tsumogiri": False})
+
+    # Cache MUST be completely purged upon self dahai!
+    assert agent.action_controller._last_recommendation is None, "Recommendation cache must be None after self dahai"
+    assert agent.action_controller.top_candidates == [], "Top candidates must be cleared after self dahai"
+    assert received_callbacks[-1].get("action_type") == "cleared", "Callback must receive 'cleared' signal on dahai"
+
+    # 5. Opponents discard tiles
+    await agent.handle_event({"type": "dahai", "actor": 1, "pai": "1s", "tsumogiri": True})
+    await agent.handle_event({"type": "dahai", "actor": 2, "pai": "2s", "tsumogiri": True})
+    await agent.handle_event({"type": "dahai", "actor": 3, "pai": "3s", "tsumogiri": True})
+
+    # 6. Turn 2: Self draws 5p (which forms a strong block with 6p in hand!)
+    action2 = await agent.handle_event({"type": "tsumo", "actor": 0, "pai": "5p"})
+    assert action2 is not None
+    assert action2.action_type in ("dahai", "reach")
+    rec2_tile = action2.tile
+
+    # ActionController cache must be fresh and match the new calculation
+    assert agent.action_controller._last_recommendation is not None
+    assert agent.action_controller._last_recommendation.tile == rec2_tile
+
+    # Hand currently has [5p, 6p] sequence. 6p must NOT be discarded anymore!
+    assert rec2_tile != "6p", f"Tile 6p formed sequence with newly drawn 5p and must not be recommended: got {rec2_tile}"
+    # The actual hand has 14 tiles; alt_discard was removed and 5p was added.
+    current_hand = agent.state_mgr.my_player.tehai
+    assert alt_discard not in current_hand, f"Discarded tile {alt_discard} should no longer be in hand"
+    assert "5p" in current_hand, "Newly drawn 5p must be in hand"
+    assert "6p" in current_hand, "Preserved 6p must remain in hand"
+
+
+
 
 
 

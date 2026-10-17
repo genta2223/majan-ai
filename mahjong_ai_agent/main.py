@@ -155,6 +155,17 @@ class MahjongAIAgent:
         # 1. Update board state
         self.state_mgr.update_event(event)
 
+        # Clear previous recommendation cache on new turn draw or self discard to prevent stale recommendations
+        if event_type == "tsumo":
+            if event.get("actor") == self.my_actor_id:
+                # Self turn begins: immediately clear previous recommendations so fresh decision is calculated
+                self.action_controller.clear_recommendation(notify=True)
+            else:
+                self.action_controller.clear_recommendation(notify=False)
+        elif event_type == "dahai" and event.get("actor") == self.my_actor_id:
+            # Self turn completed: immediately purge recommendations and notify HUD of opponent wait state
+            self.action_controller.clear_recommendation(notify=True)
+
         if self.status_callback and event_type in ("start_kyoku", "tsumo", "dahai", "chi", "pon", "kan", "hora", "ryukyoku"):
             try:
                 round_st = self.state_mgr.round_state

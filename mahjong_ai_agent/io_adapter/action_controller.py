@@ -181,8 +181,27 @@ class ActionController:
         # Virtual cursor tracker (starts in safe rest area)
         self.virtual_cursor: ScreenPoint = self._get_random_rest_point()
 
+        # Cache of previous recommendation to manage freshness
+        self._last_recommendation: Optional[OutputAction] = None
+        self.top_candidates: List[Dict[str, Any]] = []
+
         # Optional GUI / HUD recommendation callback hook
         self.on_recommendation_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+
+    def clear_recommendation(self, notify: bool = True) -> None:
+        """Clear cached previous recommendations to prevent stale UI state when turn ends or new draw arrives."""
+        self._last_recommendation = None
+        self.top_candidates = []
+        if notify and self.on_recommendation_callback:
+            try:
+                self.on_recommendation_callback({
+                    "action_type": "cleared",
+                    "status": "waiting",
+                    "recommendation_text": "相手番 (待機中...)",
+                    "top_candidates": []
+                })
+            except Exception as e:
+                print(f"[ActionController] Clear callback error: {e}")
 
     def _get_random_rest_point(self) -> ScreenPoint:
         """Returns a random safe point in the neutral rest zone away from hand tiles."""
@@ -601,6 +620,9 @@ class ActionController:
                 "tile_display": tile_uni,
             }
         )
+
+        self._last_recommendation = output
+        self.top_candidates = top_list
 
         # Notify callback if registered (for GUI HUD)
         if self.on_recommendation_callback:

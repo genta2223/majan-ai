@@ -801,6 +801,12 @@ class MahjongHUDApp:
                 target_tile = str(target) if target and str(target) != "None" else ""
                 trace_log("GUI_REC_UPDATE", f"Action: {action_type} Target: {target_tile} Score: {score}")
 
+                if action_type == "cleared":
+                    self.lbl_rec_main.config(text="⏳ 相手番 (待機中...)", fg=self.c_text_dim)
+                    self.lbl_rec_sub.config(text="🥈 候補 2位: --", fg=self.c_text_dim)
+                    self.lbl_rec_detail.config(text="💡 状況: 他家の手番を監視中", fg=self.c_text_dim)
+                    return
+
                 if action_type in ("dahai", "reach"):
                     jp_name = format_tile_jp(target_tile, include_unicode=True) if target_tile else "？"
                     reach_suffix = " [立直]" if action_type == "reach" else ""
