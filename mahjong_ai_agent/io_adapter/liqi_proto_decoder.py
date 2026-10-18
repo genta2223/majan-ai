@@ -665,38 +665,36 @@ class LiqiProtoDecoder:
                     is_yiman = bool(coerce_int((hf.get(10) or [0])[0], 0))
                     h_dict["yiman"] = is_yiman
 
-                    # Authentic pure base score calculation (excluding honba/kyotaku)
-                    dadian = coerce_int((hf.get(19) or [0])[0], 0)
-                    if 0 < dadian <= 48000:
-                        score_val = dadian
-                    elif fu > 0 and total_fan > 0:
+                    # Authentic pure base score calculation (strictly single-round score without honba/kyotaku or cumulative sum)
+                    score_val = 0
+                    if fu > 0 and total_fan > 0:
                         score_val = calculate_pure_hora_score(fu, total_fan, is_dealer)
                     elif is_yiman:
                         score_val = 48000 if is_dealer else 32000
-                    else:
-                        # Fallback: pure point_rong (tag 14) or tsumo points
-                        if not is_zimo and hf.get(14):
-                            score_val = coerce_int(hf[14][0], 0)
+                    elif not is_zimo and hf.get(14):
+                        # Tag 14 is point_rong (single-round Ron payout)
+                        score_val = coerce_int(hf[14][0], 0)
+                    elif is_zimo:
+                        # Tags 15 & 16 are point_zimo_qin and point_zimo_xian (single-round Tsumo payouts)
+                        z_qin = coerce_int((hf.get(15) or [0])[0], 0)
+                        z_xian = coerce_int((hf.get(16) or [0])[0], 0)
+                        if is_dealer and z_xian:
+                            score_val = z_xian * 3
+                        elif not is_dealer and (z_qin or z_xian):
+                            score_val = z_qin + z_xian * 2
+
+                    if not (0 < score_val <= 48000):
+                        # Tag 19 is dadian (settlement score)
+                        dadian = coerce_int((hf.get(19) or [0])[0], 0)
+                        if 0 < dadian <= 48000:
+                            score_val = dadian
                         else:
-                            z_qin = coerce_int((hf.get(15) or [0])[0], 0)
-                            z_xian = coerce_int((hf.get(16) or [0])[0], 0)
-                            if is_dealer and z_xian:
-                                score_val = z_xian * 3
-                            elif not is_dealer and (z_qin or z_xian):
-                                score_val = z_qin + z_xian * 2
-                            else:
-                                score_val = 0
+                            score_val = 5200
 
-                        if not (0 < score_val <= 48000):
-                            raw_pt = coerce_int((hf.get(18) or [0])[0], 0)
-                            if 0 < raw_pt <= 48000:
-                                score_val = raw_pt
-                            else:
-                                score_val = 5200
-
+                    # Note: Tag 18 is point_sum which represents cumulative match score across rounds.
+                    # It must NEVER be used as the single-round win score!
                     h_dict["dadian"] = score_val
                     h_dict["score"] = score_val
-                    h_dict["point_sum"] = score_val
                     hules_list.append(h_dict)
                 elif isinstance(h_blob, dict):
                     hules_list.append(h_blob)

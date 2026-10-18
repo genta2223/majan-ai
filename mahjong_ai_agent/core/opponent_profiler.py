@@ -618,11 +618,23 @@ class OpponentProfiler:
                 p.hora_count += 1
                 p.live_hora_count += 1
                 win_score = 0
-                ev_sc = event.get("dadian") or event.get("score")
-                if ev_sc is not None and 0 < int(ev_sc) <= 48000:
-                    win_score = int(ev_sc)
+                fu_val = int(event.get("fu", 0) or 0)
+                fan_val = int(event.get("fan", 0) or event.get("fans", 0) or 0)
+                is_dealer_val = bool(event.get("is_dealer", False)) or (actor == (self.current_kyoku - 1) % 4)
+
+                if fu_val > 0 and fan_val > 0:
+                    win_score = calculate_pure_hora_score(fu_val, fan_val, is_dealer_val)
                 else:
-                    win_score = 5200
+                    ev_sc = event.get("dadian") or event.get("score")
+                    if ev_sc is not None and 0 < int(ev_sc) <= 48000:
+                        win_score = int(ev_sc)
+                    else:
+                        win_score = 5200
+
+                max_cap = 48000 if is_dealer_val else 32000
+                if win_score > max_cap:
+                    win_score = max_cap
+
                 p.hora_scores_sum += win_score
 
             if loser is not None and loser != actor:
@@ -713,6 +725,7 @@ class OpponentProfiler:
                 round_committed = True
 
         current_last_discard_seat: Optional[int] = None
+        current_oya: int = 0
 
         for ev in events:
             raw_type = ev.get("type") or ev.get("action_name") or ev.get("name") or ""
@@ -742,6 +755,16 @@ class OpponentProfiler:
                 turn_counter = 0
                 round_committed = False
                 current_last_discard_seat = None
+
+                # Track true oya (dealer seat)
+                if "oya" in ev:
+                    current_oya = int(ev["oya"])
+                elif "oya" in data:
+                    current_oya = int(data["oya"])
+                elif "ju" in data:
+                    current_oya = int(data["ju"]) % 4
+                elif "kyoku" in ev:
+                    current_oya = (int(ev["kyoku"]) - 1) % 4
 
                 # Extract names if present and player_names not fully populated
                 cand_names = ev.get("names") or data.get("names") or []
@@ -949,20 +972,31 @@ class OpponentProfiler:
                             dadian_val = int(h.get("dadian", 0) or 0)
                             fu_val = int(h.get("fu", 0) or 0)
                             fan_val = int(h.get("fan", 0) or h.get("fans", 0) or 0)
-                            is_dealer_val = bool(h.get("is_dealer", False)) or (actor == (self.current_round % 4 if hasattr(self, "current_round") else 0))
+                            # Determine if winner is authentic dealer (親)
+                            if "is_dealer" in h:
+                                is_dealer_val = bool(h["is_dealer"])
+                            elif "is_dealer" in ev:
+                                is_dealer_val = bool(ev["is_dealer"])
+                            elif "qinjia" in h:
+                                is_dealer_val = bool(h["qinjia"])
+                            else:
+                                is_dealer_val = (actor == current_oya)
 
-                            if 0 < dadian_val <= 48000:
-                                win_score = dadian_val
-                            elif fu_val > 0 and fan_val > 0:
+                            if fu_val > 0 and fan_val > 0:
                                 win_score = calculate_pure_hora_score(fu_val, fan_val, is_dealer_val)
+                            elif 0 < dadian_val <= 48000:
+                                win_score = dadian_val
                             else:
                                 ev_sc = h.get("score") or ev.get("score")
                                 if ev_sc is not None and 0 < int(ev_sc) <= 48000:
                                     win_score = int(ev_sc)
-                                elif h.get("point_sum") is not None and 0 < int(h["point_sum"]) <= 48000:
-                                    win_score = int(h["point_sum"])
                                 else:
                                     win_score = 5200
+
+                            # Guard: strictly cap single-round win score to max legal limit (Dealer: 48,000, Non-dealer: 32,000)
+                            max_cap = 48000 if is_dealer_val else 32000
+                            if win_score > max_cap:
+                                win_score = max_cap
 
                             p.hora_scores_sum += win_score
 

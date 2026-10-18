@@ -707,16 +707,14 @@ class MajsoulBridge:
                 is_dealer_val = bool(h.get("is_dealer", False))
                 dadian_val = safe_coerce_int(h.get("dadian"), 0)
 
-                if 0 < dadian_val <= 48000:
-                    score_val = dadian_val
-                elif fu_val > 0 and fan_val > 0:
+                if fu_val > 0 and fan_val > 0:
                     score_val = calculate_pure_hora_score(fu_val, fan_val, is_dealer_val)
+                elif 0 < dadian_val <= 48000:
+                    score_val = dadian_val
                 else:
                     score_val = safe_coerce_int(h.get("score"), 0)
                     if not (0 < score_val <= 48000):
-                        score_val = safe_coerce_int(h.get("point_sum"), 0)
-                        if not (0 < score_val <= 48000):
-                            score_val = 5200
+                        score_val = 5200
 
                 hora_ev = {
                     "type": "hora",

@@ -6134,8 +6134,8 @@ def test_deal_in_distribution_and_pure_hora_score_calculation():
     events = [
         {"type": "start_game", "names": names, "uuid": "match_deal_in_dist_01"},
         
-        # Round 0 (東1局): genta2223 (P0) wins 3900 pts (30 fu 3 han), deal-in from 横丁の隠居 (P1)
-        # Note: kyotaku = 1000, honba = 300 included in deltas (+5200, -4200), but pure score is 3900!
+        # Round 0 (東1局): genta2223 (P0, Dealer/東家) wins 5800 pts (30 fu 3 han dealer)
+        # Note: kyotaku = 1000, honba = 300 included in deltas (+7100, -6100), but pure score is 5800!
         {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 1, "kyotaku": 1, "scores": [25000, 25000, 25000, 25000]},
         {"type": "dahai", "actor": 1, "pai": "5m"},
         {
@@ -6146,11 +6146,11 @@ def test_deal_in_distribution_and_pure_hora_score_calculation():
             "loser": 1,
             "zimo": False,
             "pai": "5m",
-            "score": 3900,
-            "dadian": 3900,
+            "score": 5800,
+            "dadian": 5800,
             "fu": 30,
             "fan": 3,
-            "deltas": [5200, -4200, 0, 0],
+            "deltas": [7100, -6100, 0, 0],
         },
         {"type": "end_kyoku"},
 
@@ -6253,11 +6253,11 @@ def test_deal_in_distribution_and_pure_hora_score_calculation():
     assert p3.deal_in_count == 1, f"Expected 1 deal-in for nishimaニシマ, got {p3.deal_in_count}"
 
     # 2. Verification of pure base scores (平均打点):
-    # genta2223 won 2 hands: Round 0 (3,900) + Round 4 (8,000) = 11,900 total pts
-    # Average score MUST be 11900 / 2 = 5,950 pts! (Never inflated by kyotaku/honba 13,842+)
+    # genta2223 won 2 hands: Round 0 dealer (5,800) + Round 4 non-dealer (8,000) = 13,800 total pts
+    # Average score MUST be 13800 / 2 = 6,900.0 pts! (Never inflated by kyotaku/honba 13,842+)
     assert p0.hora_count == 2, f"Expected 2 wins for genta2223, got {p0.hora_count}"
-    assert p0.hora_scores_sum == 11900, f"Expected 11900 sum for genta2223, got {p0.hora_scores_sum}"
-    assert p0.avg_hora_score == 5950.0, f"Expected 5950.0 avg score for genta2223, got {p0.avg_hora_score}"
+    assert p0.hora_scores_sum == 13800, f"Expected 13800 sum for genta2223, got {p0.hora_scores_sum}"
+    assert p0.avg_hora_score == 6900.0, f"Expected 6900.0 avg score for genta2223, got {p0.avg_hora_score}"
 
     # nishimaニシマ won 1 hand: Round 2 (12,000 pts Parent Mangan)
     assert p3.hora_count == 1
@@ -6332,5 +6332,123 @@ def test_liqi_proto_decoder_negative_old_scores_does_not_bias_deal_in():
     assert h["loser"] == 2, f"Expected loser=2 (financial deal-in from delta_scores), got {h['loser']}"
     assert h["target"] == 2
     assert h["dadian"] == 8000
+
+
+def test_multiple_hora_pure_score_averaging_without_point_sum_inflation():
+    """
+    Verifies that when a single player (e.g. genta2223) wins multiple hands (e.g. 7 times across matches),
+    each hand's pure base score (e.g. 3900, 8000, 12000) is aggregated individually,
+    and cumulative match totals (tag 18 point_sum) or final balances NEVER inflate the average
+    to abnormal values like 13,842 pts (96,894 sum).
+    """
+    from core.opponent_profiler import OpponentProfiler
+
+    profiler = OpponentProfiler(profiles_path=None)
+    names = ["genta2223", "横丁の隠居", "ブロコフ", "龍斗たっちゃん"]
+
+    # Simulate 4 wins for genta2223:
+    # Win 1: 3,900 (30 fu 3 han, non-dealer) - cumulative point_sum was 3,900
+    # Win 2: 8,000 (Mangan, non-dealer)      - cumulative point_sum was 11,900
+    # Win 3: 5,200 (40 fu 3 han, non-dealer) - cumulative point_sum was 17,100
+    # Win 4: 12,000 (Mangan, dealer)         - cumulative point_sum was 29,100
+    #
+    # If cumulative point_sum were incorrectly added:
+    # Sum = 3900 + 11900 + 17100 + 29100 = 64,000 pts (avg 16,000 pts - BUG!)
+    #
+    # Correct calculation:
+    # Sum = 3900 + 8000 + 5200 + 12000 = 29,100 pts (avg 7,275.0 pts - CORRECT!)
+
+    events = [
+        {"type": "start_game", "names": names, "uuid": "match_multi_win_01"},
+        
+        # Round 0: Win 1 (3,900 pts)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "kyotaku": 0, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "dahai", "actor": 1, "pai": "1m"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 1,
+            "winner": 0,
+            "loser": 1,
+            "zimo": False,
+            "fu": 30,
+            "fan": 3,
+            "is_dealer": False,
+            "score": 3900,
+            "point_sum": 3900,
+            "deltas": [3900, -3900, 0, 0],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 1: Win 2 (8,000 pts Mangan)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 2, "honba": 0, "kyotaku": 0, "scores": [28900, 21100, 25000, 25000]},
+        {"type": "dahai", "actor": 2, "pai": "9m"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 2,
+            "winner": 0,
+            "loser": 2,
+            "zimo": False,
+            "fu": 40,
+            "fan": 4,
+            "is_dealer": False,
+            "score": 8000,
+            "point_sum": 11900,  # Cumulative! Must NOT be used!
+            "deltas": [8000, 0, -8000, 0],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 2: Win 3 (5,200 pts)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 3, "honba": 0, "kyotaku": 0, "scores": [36900, 21100, 17000, 25000]},
+        {"type": "dahai", "actor": 3, "pai": "5p"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 3,
+            "winner": 0,
+            "loser": 3,
+            "zimo": False,
+            "fu": 40,
+            "fan": 3,
+            "is_dealer": False,
+            "score": 5200,
+            "point_sum": 17100,  # Cumulative! Must NOT be used!
+            "deltas": [5200, 0, 0, -5200],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 3: Win 4 (12,000 pts Parent Mangan)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 4, "honba": 0, "kyotaku": 0, "scores": [42100, 21100, 17000, 19800]},
+        {"type": "dahai", "actor": 1, "pai": "3s"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 1,
+            "winner": 0,
+            "loser": 1,
+            "zimo": False,
+            "fu": 40,
+            "fan": 4,
+            "is_dealer": True,
+            "score": 12000,
+            "point_sum": 29100,  # Cumulative! Must NOT be used!
+            "deltas": [12000, -12000, 0, 0],
+        },
+        {"type": "end_kyoku"},
+
+        {"type": "end_game"}
+    ]
+
+    profiler.analyze_game_events(events)
+
+    p0 = profiler.get_profile("genta2223")
+    assert p0 is not None
+    assert p0.hora_count == 4
+    # Expected sum is strictly 3900 + 8000 + 5200 + 12000 = 29,100
+    assert p0.hora_scores_sum == 29100, f"Expected 29100 pure score sum, got {p0.hora_scores_sum}"
+    # Expected avg is strictly 29100 / 4 = 7275.0 pts (reasonable 5000-7500 pts range)
+    assert p0.avg_hora_score == 7275.0, f"Expected 7275.0 avg score, got {p0.avg_hora_score}"
+
 
 
