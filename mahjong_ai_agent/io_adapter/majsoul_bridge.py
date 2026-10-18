@@ -704,11 +704,10 @@ class MajsoulBridge:
                         target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None and self._last_discard_seat != seat else seat)
                     loser = target if (target != seat and not is_zimo) else None
 
-                score_val = safe_coerce_int(h.get("score") or h.get("point_sum"), 0)
+                score_val = safe_coerce_int(h.get("dadian") or h.get("score"), 0)
                 if not (0 < score_val <= 48000):
-                    if 0 <= seat < len(deltas) and 0 < deltas[seat] <= 48000:
-                        score_val = deltas[seat]
-                    else:
+                    score_val = safe_coerce_int(h.get("point_sum"), 0)
+                    if not (0 < score_val <= 48000):
                         score_val = 5200
 
                 events.append({

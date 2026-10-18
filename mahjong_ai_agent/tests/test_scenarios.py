@@ -2957,11 +2957,11 @@ def test_authentic_paifu_player_names_and_independent_stats():
 
     assert p0 is not None and p1 is not None and p2 is not None and p3 is not None
 
-    # Check seating and display name formatting
+    # Check seating and display name formatting (clean account names for human players)
     assert p0.seat_name == "東家"
-    assert p0.display_name == "genta2223 (東家)"
+    assert p0.display_name == "genta2223"
     assert p1.seat_name == "南家"
-    assert p1.display_name == "プロコフ (南家)"
+    assert p1.display_name == "プロコフ"
     assert p2.seat_name == "西家"
     assert "CPUプレイヤー" in p2.display_name and "西家" in p2.display_name
     assert p3.seat_name == "北家"
@@ -5934,18 +5934,184 @@ def test_paifu_profiler_single_round_and_multi_round_strict_percentages():
     assert p3_raw.hora_rate == 0.0
 
 
+@pytest.mark.asyncio
+async def test_multi_match_tonpuu_hanchan_profiler_consistency():
+    """
+    Verification Test for Multi-Match (Tonpuu + Hanchan) Profiler Aggregation:
+    1. Player name normalization (clean account keys, strips seating tags like '(南家)').
+    2. Accurate match count & round count aggregation across mixed modes:
+       - 'ブロコフ': 2 matches (Tonpuu 5 rounds + Hanchan 11 rounds = 16 rounds total).
+       - 'nishimaニシマ': 1 match (Hanchan 11 rounds only, not doubled).
+    3. Accurate deal-in tracking on RecordHule:
+       - Dealt into Ron detected even with seating changes, deal_in_count > 0.
+    4. Authentic average winning score (符・翻による純粋獲得素点):
+       - Eliminates delta_scores / kyotaku / final balance inflation (avoids 15,000+ pts).
+    5. Deduplication immunity: Re-importing duplicate match does not inflate stats.
+    """
+    from core.opponent_profiler import OpponentProfiler
 
+    # Game 1: Tonpuu match (East-only, exactly 5 rounds)
+    # Player seats:
+    # 0: ブロコフ (東家) -> should normalize to "ブロコフ"
+    # 1: genta2223
+    # 2: 龍斗たっちゃん
+    # 3: CPUプレイヤー (北家)
+    game1_uuid = "261018-tonpuu-game-1111-2222-333333333333"
+    game1_events = [
+        {
+            "type": "start_game",
+            "names": ["ブロコフ (東家)", "genta2223", "龍斗たっちゃん", "CPUプレイヤー (北家)"],
+            "id": game1_uuid,
+            "uuid": game1_uuid,
+            "match_mode": "tonpuu"
+        },
+        # Round 1 (E1): Normal round
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 0, "oya": 0, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "dahai", "actor": 0, "pai": "1z"},
+        {"type": "end_kyoku"},
+        # Round 2 (E2): ブロコフ wins 2,000 pts Ron (dadian=2000)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 2, "honba": 0, "oya": 1, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "dahai", "actor": 1, "pai": "5m"},
+        {"type": "hora", "actor": 0, "winner": 0, "target": 1, "loser": 1, "dadian": 2000, "score": 2000, "zimo": False, "deltas": [2000, -2000, 0, 0]},
+        {"type": "end_kyoku"},
+        # Round 3 (E3): genta2223 Riichi
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 3, "honba": 0, "oya": 2, "scores": [27000, 23000, 25000, 25000]},
+        {"type": "reach", "actor": 1},
+        {"type": "end_kyoku"},
+        # Round 4 (E4): genta2223 wins Ron from ブロコフ (ブロコフ deal-in +1!)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 4, "honba": 0, "oya": 3, "scores": [27000, 23000, 25000, 25000]},
+        {"type": "dahai", "actor": 0, "pai": "4p"},
+        {"type": "hora", "actor": 1, "winner": 1, "target": 0, "loser": 0, "dadian": 3900, "score": 3900, "zimo": False, "deltas": [-3900, 3900, 0, 0]},
+        {"type": "end_kyoku"},
+        # Round 5 (E4-1): Ryukyoku
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 4, "honba": 1, "oya": 3, "scores": [23100, 26900, 25000, 25000]},
+        {"type": "ryukyoku", "deltas": [1500, -1500, 0, 0]},
+        {"type": "end_kyoku"},
+        {"type": "end_game"}
+    ]
 
+    # Game 2: Hanchan match (East-South, exactly 11 rounds)
+    # Player seats:
+    # 0: genta2223
+    # 1: ブロコフ (南家) -> seat changed to South, but MUST merge into "ブロコフ"!
+    # 2: nishimaニシマ -> only plays in this match
+    # 3: 龍斗たっちゃん
+    game2_uuid = "261018-hanchan-game-4444-5555-666666666666"
+    game2_events = [
+        {
+            "type": "start_game",
+            "names": ["genta2223", "ブロコフ (南家)", "nishimaニシマ", "龍斗たっちゃん"],
+            "id": game2_uuid,
+            "uuid": game2_uuid,
+            "match_mode": "hanchan"
+        }
+    ]
 
+    # Add 11 authentic rounds to Game 2
+    for r_idx in range(1, 12):
+        bakaze = "E" if r_idx <= 4 else "S"
+        kyoku = ((r_idx - 1) % 4) + 1
+        game2_events.append({
+            "type": "start_kyoku",
+            "bakaze": bakaze,
+            "kyoku": kyoku,
+            "honba": 0,
+            "oya": (r_idx - 1) % 4,
+            "scores": [25000, 25000, 25000, 25000]
+        })
+        if r_idx == 3:
+            # ブロコフ wins 8,000 pts Mangan Ron
+            game2_events.append({
+                "type": "hora",
+                "actor": 1,
+                "winner": 1,
+                "target": 3,
+                "loser": 3,
+                "dadian": 8000,
+                "score": 8000,
+                "zimo": False,
+                "deltas": [0, 8000, 0, -8000]
+            })
+        elif r_idx == 7:
+            # nishimaニシマ wins Haneman 12,000 pts Ron from ブロコフ (ブロコフ deal-in +1!)
+            game2_events.append({
+                "type": "hora",
+                "actor": 2,
+                "winner": 2,
+                "target": 1,
+                "loser": 1,
+                "dadian": 12000,
+                "score": 12000,
+                "zimo": False,
+                "deltas": [0, -12000, 12000, 0]
+            })
+        elif r_idx == 10:
+            # genta2223 Tsumo
+            game2_events.append({
+                "type": "hora",
+                "actor": 0,
+                "winner": 0,
+                "target": 0,
+                "zimo": True,
+                "dadian": 3900,
+                "score": 3900,
+                "deltas": [4000, -1000, -2000, -1000]
+            })
+        else:
+            game2_events.append({"type": "dahai", "actor": 0, "pai": "1z"})
 
+        game2_events.append({"type": "end_kyoku"})
 
+    game2_events.append({"type": "end_game"})
 
+    profiler = OpponentProfiler()
 
+    # Step 1: Analyze Game 1 (Tonpuu)
+    profiler.analyze_game_events(game1_events)
 
+    # Step 2: Analyze Game 2 (Hanchan)
+    profiler.analyze_game_events(game2_events)
 
+    # Step 3: Verify Deduplication Guard by attempting to re-analyze Game 2
+    profiler.analyze_game_events(game2_events)
 
+    # Assertions on Key Profiles
+    # 1. Player Key Normalization: No seating tags in dictionary keys!
+    assert "ブロコフ (東家)" not in profiler.profiles
+    assert "ブロコフ (南家)" not in profiler.profiles
+    assert "ブロコフ" in profiler.profiles
+    assert "nishimaニシマ" in profiler.profiles
 
+    brokov = profiler.get_profile("ブロコフ")
+    nishima = profiler.get_profile("nishimaニシマ")
 
+    assert brokov is not None
+    assert nishima is not None
 
+    # 2. Match Count & Round Count Aggregation:
+    # ブロコフ participated in 2 games (5 rounds Tonpuu + 11 rounds Hanchan = 16 rounds)
+    assert brokov.total_games == 2, f"Expected 2 matches for ブロコフ, got {brokov.total_games}"
+    assert brokov.total_rounds == 16, f"Expected 16 rounds for ブロコフ, got {brokov.total_rounds}"
 
+    # nishimaニシマ participated in 1 game (11 rounds Hanchan only, not doubled by deduplication)
+    assert nishima.total_games == 1, f"Expected 1 match for nishimaニシマ, got {nishima.total_games}"
+    assert nishima.total_rounds == 11, f"Expected 11 rounds for nishimaニシマ, got {nishima.total_rounds}"
+
+    # 3. Deal-in (放銃) Tracking:
+    # ブロコフ dealt in twice (Round 4 of Game 1 + Round 7 of Game 2)
+    assert brokov.deal_in_count == 2, f"Expected 2 deal-ins for ブロコフ, got {brokov.deal_in_count}"
+    assert round(brokov.deal_in_rate, 3) == round(2 / 16, 3)
+    assert nishima.deal_in_count == 0
+
+    # 4. Winning Hands & Pure Base Score (平均打点) Calculation:
+    # ブロコフ won 2 hands: 2000 pts (Game 1) + 8000 pts (Game 2)
+    # Average hora score MUST be exactly (2000 + 8000) / 2 = 5000.0 pts!
+    # (NOT inflated to 15,000+ pts by delta_scores or final balances)
+    assert brokov.hora_count == 2, f"Expected 2 wins for ブロコフ, got {brokov.hora_count}"
+    assert brokov.hora_scores_sum == 10000
+    assert brokov.avg_hora_score == 5000.0, f"Expected 5000.0 avg score, got {brokov.avg_hora_score}"
+
+    # 5. Display Name formatting:
+    assert brokov.display_name == "ブロコフ"
+    assert nishima.display_name == "nishimaニシマ"
 

@@ -6,7 +6,24 @@ import os
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
 
+import re
 from core.state_manager import normalize_tile, HONORS
+
+
+def clean_player_name(raw_name: str) -> str:
+    """
+    Normalizes player account nicknames by stripping seating annotations
+    (e.g. ' (東家)', ' (南家)', ' (西家)', ' (北家)', '(南家)') and leading/trailing whitespace.
+    Returns authentic account name alone (e.g. 'ブロコフ').
+    Leaves CPU slots (e.g. 'CPUプレイヤー (西家)') distinct per seat to avoid collision.
+    """
+    if not raw_name:
+        return ""
+    name = str(raw_name).strip()
+    if name.startswith("CPU") or "CPUプレイヤー" in name or name.startswith("Player_Seat"):
+        return name
+    name = re.sub(r'\s*[\(（][東西南北]家[\)）]$', '', name).strip()
+    return name
 
 
 class PlayerProfile(BaseModel):
@@ -76,12 +93,8 @@ class PlayerProfile(BaseModel):
 
     @property
     def display_name(self) -> str:
-        """Returns name formatted with seat info if present and single-game, e.g. 'genta2223 (東家)' or 'genta2223'."""
-        if self.total_games > 1 or not self.seat_name:
-            return self.name
-        if f"({self.seat_name})" not in self.name:
-            return f"{self.name} ({self.seat_name})"
-        return self.name
+        """Returns authentic clean account nickname without permanent seating tag."""
+        return clean_player_name(self.name)
 
     def reset_live_stats(self) -> None:
         """Resets the in-match live session statistics."""
@@ -299,7 +312,8 @@ class OpponentProfiler:
         self._live_round_committed: bool = True
 
     def get_profile(self, name: str) -> Optional[PlayerProfile]:
-        return self.profiles.get(name)
+        clean_name = clean_player_name(name)
+        return self.profiles.get(clean_name)
 
     def set_match_mode(self, mode: str) -> None:
         """Sets match mode ('tonpuu' or 'hanchan')."""
@@ -315,22 +329,22 @@ class OpponentProfiler:
                 prof.reset_live_stats()
 
     def set_player_name(self, seat: int, name: str) -> None:
-        """Registers player name for a specific seat, initializing profile if needed."""
+        """Registers clean player name for a specific seat, maintaining historical profile."""
         if 0 <= seat < 4 and name:
             SEAT_NAMES = ["東家", "南家", "西家", "北家"]
+            clean_name = clean_player_name(name)
             old_name = self.player_names[seat]
-            self.player_names[seat] = name
-            if name not in self.profiles:
+            self.player_names[seat] = clean_name
+            if clean_name not in self.profiles:
                 if old_name and old_name.startswith("Player_Seat") and old_name in self.profiles:
                     p = self.profiles.pop(old_name)
-                    p.name = name
+                    p.name = clean_name
                     p.seat_name = SEAT_NAMES[seat]
-                    self.profiles[name] = p
+                    self.profiles[clean_name] = p
                 else:
-                    self.profiles[name] = PlayerProfile(name=name, seat_name=SEAT_NAMES[seat])
+                    self.profiles[clean_name] = PlayerProfile(name=clean_name, seat_name=SEAT_NAMES[seat])
             else:
-                if not self.profiles[name].seat_name:
-                    self.profiles[name].seat_name = SEAT_NAMES[seat]
+                self.profiles[clean_name].seat_name = SEAT_NAMES[seat]
 
     def _ensure_seat_name(self, seat: int) -> str:
         """Ensures a valid name exists for the given seat, assigning placeholder if absent."""
@@ -346,7 +360,8 @@ class OpponentProfiler:
 
     def is_game_uuid_recorded(self, name: str, game_uuid: str) -> bool:
         """Checks if game_uuid is already recorded for the given player."""
-        prof = self.get_profile(name)
+        clean_name = clean_player_name(name)
+        prof = self.get_profile(clean_name)
         return bool(prof and game_uuid and game_uuid in prof.recorded_game_uuids)
 
     def record_game_uuid_for_all(self, game_uuid: str) -> None:
@@ -354,8 +369,9 @@ class OpponentProfiler:
         if not game_uuid:
             return
         for name in self.player_names:
-            if name and name in self.profiles:
-                p = self.profiles[name]
+            clean_name = clean_player_name(name)
+            if clean_name and clean_name in self.profiles:
+                p = self.profiles[clean_name]
                 if game_uuid not in p.recorded_game_uuids:
                     p.recorded_game_uuids.append(game_uuid)
 
@@ -568,17 +584,15 @@ class OpponentProfiler:
             if 0 <= actor < 4 and actor in self.stats:
                 self.stats[actor]["agari"] += 1
 
-            winner_name = self._ensure_seat_name(actor)
+            winner_name = clean_player_name(self._ensure_seat_name(actor))
             if winner_name in self.profiles:
                 p = self.profiles[winner_name]
                 p.hora_count += 1
                 p.live_hora_count += 1
                 win_score = 0
-                ev_sc = event.get("score")
+                ev_sc = event.get("dadian") or event.get("score")
                 if ev_sc is not None and 0 < int(ev_sc) <= 48000:
                     win_score = int(ev_sc)
-                elif deltas and len(deltas) > actor and 0 < deltas[actor] <= 48000:
-                    win_score = deltas[actor]
                 else:
                     win_score = 5200
                 p.hora_scores_sum += win_score
@@ -586,7 +600,7 @@ class OpponentProfiler:
             if loser is not None and loser != actor:
                 if 0 <= loser < 4 and loser in self.stats:
                     self.stats[loser]["houju"] += 1
-                victim_name = self._ensure_seat_name(loser)
+                victim_name = clean_player_name(self._ensure_seat_name(loser))
                 if victim_name in self.profiles:
                     p = self.profiles[victim_name]
                     p.deal_in_count += 1
@@ -633,12 +647,12 @@ class OpponentProfiler:
         turn_counter: int = 0
         round_committed: bool = True
 
-        # Extract game_uuid from start_game or argument
+        # Extract game_uuid from start_game or argument (including MJAI 'id')
         target_uuid = game_uuid
         if not target_uuid:
             for ev in events:
                 if ev.get("type") == "start_game":
-                    target_uuid = ev.get("game_uuid") or ev.get("uuid")
+                    target_uuid = ev.get("game_uuid") or ev.get("uuid") or ev.get("id")
                     break
 
         # Deduplication Guard: Check if game_uuid was already processed
@@ -646,7 +660,7 @@ class OpponentProfiler:
             for ev in events:
                 if ev.get("type") == "start_game":
                     for n in ev.get("names", []):
-                        str_n = str(n).strip()
+                        str_n = clean_player_name(n)
                         if str_n and self.is_game_uuid_recorded(str_n, target_uuid):
                             print(f"[Profiler] Game UUID '{target_uuid}' already recorded for player '{str_n}'. Skipping duplicate analysis.")
                             return
@@ -682,14 +696,13 @@ class OpponentProfiler:
                 if not names and "accounts" in ev:
                     names = [a.get("nickname") or a.get("name") for a in ev.get("accounts", []) if isinstance(a, dict)]
                 for i in range(min(4, len(names))):
-                    name = str(names[i]).strip()
+                    name = clean_player_name(names[i])
                     player_names[i] = name
                     if name:
                         if name not in self.profiles:
                             self.profiles[name] = PlayerProfile(name=name, seat_name=SEAT_NAMES[i])
                         else:
-                            if not self.profiles[name].seat_name:
-                                self.profiles[name].seat_name = SEAT_NAMES[i]
+                            self.profiles[name].seat_name = SEAT_NAMES[i]
                         self.profiles[name].total_games += 1
 
             elif etype in ("start_kyoku", "RecordNewRound", "ActionNewRound"):
@@ -706,11 +719,13 @@ class OpponentProfiler:
                 cand_names = ev.get("names") or data.get("names") or []
                 if cand_names:
                     for i in range(min(4, len(cand_names))):
-                        n = str(cand_names[i]).strip()
+                        n = clean_player_name(cand_names[i])
                         if n and not player_names[i]:
                             player_names[i] = n
                             if n not in self.profiles:
                                 self.profiles[n] = PlayerProfile(name=n, seat_name=SEAT_NAMES[i])
+                            else:
+                                self.profiles[n].seat_name = SEAT_NAMES[i]
 
                 # Ensure player profiles exist for seated players
                 for i in range(4):
@@ -892,18 +907,17 @@ class OpponentProfiler:
                         self.stats[actor]["agari"] += 1
 
                     if 0 <= actor < len(player_names):
-                        winner_name = player_names[actor]
+                        winner_name = clean_player_name(player_names[actor])
                         if winner_name in self.profiles:
                             p = self.profiles[winner_name]
                             p.hora_count += 1
                             win_score = 0
-                            # 1. Prioritize authentic score from h["score"] or ev["score"]
-                            ev_sc = h.get("score") or h.get("point_sum") or ev.get("score")
+                            # 1. Prioritize authentic base win score (dadian or score)
+                            ev_sc = h.get("dadian") or h.get("score") or ev.get("score")
                             if ev_sc is not None and 0 < int(ev_sc) <= 48000:
                                 win_score = int(ev_sc)
-                            # 2. Then deltas if within plausible single-hand range
-                            elif deltas and len(deltas) > actor and 0 < deltas[actor] <= 48000:
-                                win_score = deltas[actor]
+                            elif h.get("point_sum") is not None and 0 < int(h["point_sum"]) <= 48000:
+                                win_score = int(h["point_sum"])
                             else:
                                 win_score = 5200
                             p.hora_scores_sum += win_score
@@ -913,7 +927,7 @@ class OpponentProfiler:
                         if 0 <= loser < 4 and loser in self.stats:
                             self.stats[loser]["houju"] += 1
                         if 0 <= loser < len(player_names):
-                            victim_name = player_names[loser]
+                            victim_name = clean_player_name(player_names[loser])
                             if victim_name in self.profiles:
                                 self.profiles[victim_name].deal_in_count += 1
 
@@ -927,8 +941,9 @@ class OpponentProfiler:
 
         if target_uuid:
             for n in player_names:
-                if n and n in self.profiles:
-                    p = self.profiles[n]
+                clean_n = clean_player_name(n)
+                if clean_n and clean_n in self.profiles:
+                    p = self.profiles[clean_n]
                     if target_uuid not in p.recorded_game_uuids:
                         p.recorded_game_uuids.append(target_uuid)
 

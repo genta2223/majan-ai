@@ -2121,6 +2121,8 @@ def extract_player_names_from_record(record: Dict[str, Any]) -> List[str]:
     for i in range(4):
         if not player_names[i] or is_cpu_player_name(player_names[i]):
             player_names[i] = f"CPUプレイヤー ({SEAT_DEFAULTS[i]})"
+        else:
+            player_names[i] = re.sub(r'\s*[\(（][東西南北]家[\)）]$', '', player_names[i]).strip()
 
     return player_names
 
@@ -2135,11 +2137,14 @@ def convert_record_to_mjai(record: Dict[str, Any], my_seat: int = 0) -> List[Dic
 
     # 1. Start game event with authentic player account nicknames
     player_names = extract_player_names_from_record(record)
+    game_id = record.get("uuid", "unknown_match")
 
     mjai_events.append({
         "type": "start_game",
         "names": player_names,
-        "id": record.get("uuid", "unknown_match")
+        "id": game_id,
+        "uuid": game_id,
+        "game_uuid": game_id
     })
 
     # 2. Iterate rounds and actions

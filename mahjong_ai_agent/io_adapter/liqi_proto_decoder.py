@@ -452,9 +452,9 @@ class LiqiProtoDecoder:
             out: List[int] = []
             for v in f.get(tag) or []:
                 if isinstance(v, int):
-                    out.append(v)
+                    out.append(_to_signed64(v))
                 elif isinstance(v, (bytes, bytearray)):
-                    out.extend(decode_packed_varints(bytes(v)))
+                    out.extend(_to_signed64(x) for x in decode_packed_varints(bytes(v)))
             return out
 
         def ops_of(tag: int) -> List[Dict[str, Any]]:
@@ -614,19 +614,28 @@ class LiqiProtoDecoder:
                     t_cand = [s(v).strip() for v in (hf.get(3) or []) if is_tile(v)]
                     if t_cand:
                         h_dict["hu_tile"] = t_cand[0]
-                    # Score calculation: dadian (tag 19) / point_sum (tag 18 or 7) / point_rong (tag 14) / zimo (tags 15, 16)
-                    dadian = coerce_int((hf.get(19) or hf.get(18) or hf.get(14) or [0])[0], 0)
+                    # Score calculation: dadian (tag 19) is authentic base score without honba/kyotaku
+                    dadian = coerce_int((hf.get(19) or [0])[0], 0)
                     if not dadian:
-                        z_qin = coerce_int((hf.get(15) or [0])[0], 0)
-                        z_xian = coerce_int((hf.get(16) or [0])[0], 0)
-                        if z_qin or z_xian:
-                            dadian = z_qin * 3 if z_qin and not z_xian else (z_qin + z_xian * 2)
+                        # Fallback to pure point_rong (tag 14) if non-zimo
+                        if not is_zimo and hf.get(14):
+                            dadian = coerce_int(hf[14][0], 0)
+                        else:
+                            # Tsumo points: qin (tag 15) and xian (tag 16)
+                            z_qin = coerce_int((hf.get(15) or [0])[0], 0)
+                            z_xian = coerce_int((hf.get(16) or [0])[0], 0)
+                            if z_qin or z_xian:
+                                dadian = z_qin * 3 if z_qin and not z_xian else (z_qin + z_xian * 2)
                     if not dadian:
-                        dadian = coerce_int((hf.get(7) or [0])[0], 0)
+                        # Only then fallback to point_sum (tag 18) or tag 7
+                        dadian = coerce_int((hf.get(18) or hf.get(7) or [0])[0], 0)
+
                     if 0 < dadian <= 48000:
+                        h_dict["dadian"] = dadian
                         h_dict["score"] = dadian
                         h_dict["point_sum"] = dadian
                     else:
+                        h_dict["dadian"] = 5200
                         h_dict["point_sum"] = 5200
                         h_dict["score"] = 5200
                     hules_list.append(h_dict)
