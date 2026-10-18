@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
-from io_adapter.liqi_proto_decoder import is_valid_tile_code
+from io_adapter.liqi_proto_decoder import is_valid_tile_code, calculate_pure_hora_score
 
 
 # Tile mapping tables
@@ -682,35 +682,43 @@ class MajsoulBridge:
                     loser = None
                 else:
                     target = None
-                    # 1. Explicit loser field
-                    if raw_loser is not None and safe_coerce_int(raw_loser, -1) != seat and 0 <= safe_coerce_int(raw_loser, -1) < 4:
+                    # 1. Direct negative scorer from delta_scores on Ron (financial deal-in is gold truth)
+                    if neg_scorers:
+                        deal_in_candidates = [s for s in neg_scorers if s != seat]
+                        if deal_in_candidates:
+                            target = deal_in_candidates[0]
+                    # 2. Explicit loser field
+                    if target is None and raw_loser is not None and safe_coerce_int(raw_loser, -1) != seat and 0 <= safe_coerce_int(raw_loser, -1) < 4:
                         target = safe_coerce_int(raw_loser, seat)
-                    # 2. Explicit target field
-                    elif raw_target is not None and safe_coerce_int(raw_target, -1) != seat and 0 <= safe_coerce_int(raw_target, -1) < 4:
+                    # 3. Explicit target field
+                    elif target is None and raw_target is not None and safe_coerce_int(raw_target, -1) != seat and 0 <= safe_coerce_int(raw_target, -1) < 4:
                         target = safe_coerce_int(raw_target, seat)
-                    # 3. Direct negative scorer from delta_scores on Ron
-                    elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat:
-                        target = neg_scorers[0]
                     # 4. Last discard seat
-                    elif self._last_discard_seat is not None and self._last_discard_seat != seat:
+                    elif target is None and self._last_discard_seat is not None and self._last_discard_seat != seat:
                         target = self._last_discard_seat
-                    # 5. Any negative scorer
-                    elif neg_scorers:
-                        valid_negs = [s for s in neg_scorers if s != seat]
-                        if valid_negs:
-                            target = valid_negs[0]
 
                     if target is None or target == seat:
                         target = seat if is_zimo else (self._last_discard_seat if self._last_discard_seat is not None and self._last_discard_seat != seat else seat)
                     loser = target if (target != seat and not is_zimo) else None
 
-                score_val = safe_coerce_int(h.get("dadian") or h.get("score"), 0)
-                if not (0 < score_val <= 48000):
-                    score_val = safe_coerce_int(h.get("point_sum"), 0)
-                    if not (0 < score_val <= 48000):
-                        score_val = 5200
+                # Authentic base score calculation (pure score)
+                fu_val = safe_coerce_int(h.get("fu"), 0)
+                fan_val = safe_coerce_int(h.get("fan"), 0)
+                is_dealer_val = bool(h.get("is_dealer", False))
+                dadian_val = safe_coerce_int(h.get("dadian"), 0)
 
-                events.append({
+                if 0 < dadian_val <= 48000:
+                    score_val = dadian_val
+                elif fu_val > 0 and fan_val > 0:
+                    score_val = calculate_pure_hora_score(fu_val, fan_val, is_dealer_val)
+                else:
+                    score_val = safe_coerce_int(h.get("score"), 0)
+                    if not (0 < score_val <= 48000):
+                        score_val = safe_coerce_int(h.get("point_sum"), 0)
+                        if not (0 < score_val <= 48000):
+                            score_val = 5200
+
+                hora_ev = {
                     "type": "hora",
                     "actor": seat,
                     "target": target,
@@ -719,8 +727,17 @@ class MajsoulBridge:
                     "zimo": is_zimo,
                     "pai": hu_tile,
                     "score": score_val,
+                    "dadian": score_val,
                     "deltas": deltas,
-                })
+                }
+                if fu_val > 0:
+                    hora_ev["fu"] = fu_val
+                if fan_val > 0:
+                    hora_ev["fan"] = fan_val
+                if is_dealer_val:
+                    hora_ev["is_dealer"] = is_dealer_val
+
+                events.append(hora_ev)
             self._in_round = False
             events.append({"type": "end_kyoku"})
 

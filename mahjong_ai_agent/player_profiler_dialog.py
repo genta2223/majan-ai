@@ -49,6 +49,21 @@ class PlayerProfilerDialog(tk.Toplevel):
         else:
             self._show_empty_state()
 
+    def refresh(self) -> None:
+        """Reloads player profiles and updates display without duplicating windows."""
+        self.profiles = self.profiler.profiles
+        curr = self.selected_player_var.get()
+        self.player_listbox.delete(0, tk.END)
+        for name, p in self.profiles.items():
+            self.player_listbox.insert(tk.END, f"{p.display_name} ({p.total_rounds}局)")
+        player_names = list(self.profiles.keys())
+        if curr and curr in player_names:
+            self._select_player(curr)
+        elif player_names:
+            self._select_player(player_names[0])
+        else:
+            self._show_empty_state()
+
     def _build_ui(self) -> None:
         """Builds dialog layout."""
         # Top Header Bar

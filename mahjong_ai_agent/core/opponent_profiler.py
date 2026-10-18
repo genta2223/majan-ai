@@ -10,6 +10,34 @@ import re
 from core.state_manager import normalize_tile, HONORS
 
 
+def calculate_pure_hora_score(fu: int, fan: int, is_dealer: bool) -> int:
+    """
+    Calculates pure base score from fu and fan, strictly excluding honba and riichi stick deposits.
+    Standard Japanese Riichi Mahjong score table.
+    """
+    if fan >= 13:
+        return 48000 if is_dealer else 32000  # Yakuman
+    elif fan >= 11:
+        return 36000 if is_dealer else 24000  # Sanbaiman
+    elif fan >= 8:
+        return 24000 if is_dealer else 16000  # Baiman
+    elif fan >= 6:
+        return 18000 if is_dealer else 12000  # Haneman
+    elif fan >= 5:
+        return 12000 if is_dealer else 8000   # Mangan
+
+    # Under 5 han: A = fu * 2^(2 + fan)
+    base = fu * (2 ** (2 + fan))
+    if base >= 2000:
+        return 12000 if is_dealer else 8000   # Kiriage Mangan / 2000 base cap
+
+    # Dealer: 6 * base rounded up to next 100
+    # Non-dealer: 4 * base rounded up to next 100
+    multiplier = 6 if is_dealer else 4
+    raw = base * multiplier
+    return ((raw + 99) // 100) * 100
+
+
 def clean_player_name(raw_name: str) -> str:
     """
     Normalizes player account nicknames by stripping seating annotations
@@ -865,6 +893,9 @@ class OpponentProfiler:
                 deltas = data.get("delta_scores") or ev.get("deltas") or []
                 neg_scorers = [i for i, d in enumerate(deltas) if d < 0]
 
+                # Deduplicate deal-in counts per kyoku (e.g. Daburon should only count 1 deal-in for the loser)
+                round_deal_in_recorded_seats = set()
+
                 for h in raw_hules:
                     raw_winner = h.get("winner") if "winner" in h else (h.get("actor") if "actor" in h else h.get("seat"))
                     if raw_winner is None:
@@ -887,21 +918,22 @@ class OpponentProfiler:
                         is_zimo = False
 
                     # Target / Loser determination:
-
                     loser = None
                     if not is_zimo:
-                        if raw_loser is not None and 0 <= int(raw_loser) < 4 and int(raw_loser) != actor:
+                        # 1. Delta scores: The player with negative score change is the authentic financial deal-in victim
+                        if neg_scorers:
+                            deal_in_candidates = [s for s in neg_scorers if s != actor]
+                            if deal_in_candidates:
+                                loser = deal_in_candidates[0]
+                        # 2. Explicit loser field
+                        if loser is None and raw_loser is not None and 0 <= int(raw_loser) < 4 and int(raw_loser) != actor:
                             loser = int(raw_loser)
-                        elif raw_target is not None and 0 <= int(raw_target) < 4 and int(raw_target) != actor:
+                        # 3. Explicit target field
+                        elif loser is None and raw_target is not None and 0 <= int(raw_target) < 4 and int(raw_target) != actor:
                             loser = int(raw_target)
-                        elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != actor:
-                            loser = neg_scorers[0]
-                        elif current_last_discard_seat is not None and current_last_discard_seat != actor:
+                        # 4. Last discard seat
+                        elif loser is None and current_last_discard_seat is not None and current_last_discard_seat != actor:
                             loser = current_last_discard_seat
-                        elif neg_scorers:
-                            valid_negs = [s for s in neg_scorers if s != actor]
-                            if valid_negs:
-                                loser = valid_negs[0]
 
                     if 0 <= actor < 4 and actor in self.stats:
                         self.stats[actor]["agari"] += 1
@@ -912,18 +944,31 @@ class OpponentProfiler:
                             p = self.profiles[winner_name]
                             p.hora_count += 1
                             win_score = 0
-                            # 1. Prioritize authentic base win score (dadian or score)
-                            ev_sc = h.get("dadian") or h.get("score") or ev.get("score")
-                            if ev_sc is not None and 0 < int(ev_sc) <= 48000:
-                                win_score = int(ev_sc)
-                            elif h.get("point_sum") is not None and 0 < int(h["point_sum"]) <= 48000:
-                                win_score = int(h["point_sum"])
+
+                            # Pure authentic score calculation
+                            dadian_val = int(h.get("dadian", 0) or 0)
+                            fu_val = int(h.get("fu", 0) or 0)
+                            fan_val = int(h.get("fan", 0) or h.get("fans", 0) or 0)
+                            is_dealer_val = bool(h.get("is_dealer", False)) or (actor == (self.current_round % 4 if hasattr(self, "current_round") else 0))
+
+                            if 0 < dadian_val <= 48000:
+                                win_score = dadian_val
+                            elif fu_val > 0 and fan_val > 0:
+                                win_score = calculate_pure_hora_score(fu_val, fan_val, is_dealer_val)
                             else:
-                                win_score = 5200
+                                ev_sc = h.get("score") or ev.get("score")
+                                if ev_sc is not None and 0 < int(ev_sc) <= 48000:
+                                    win_score = int(ev_sc)
+                                elif h.get("point_sum") is not None and 0 < int(h["point_sum"]) <= 48000:
+                                    win_score = int(h["point_sum"])
+                                else:
+                                    win_score = 5200
+
                             p.hora_scores_sum += win_score
 
-                    # Ron deal-in check: strictly increment deal_in_count for loser only
-                    if loser is not None and loser != actor:
+                    # Ron deal-in check: strictly increment deal_in_count for true loser only once per kyoku
+                    if loser is not None and loser != actor and loser not in round_deal_in_recorded_seats:
+                        round_deal_in_recorded_seats.add(loser)
                         if 0 <= loser < 4 and loser in self.stats:
                             self.stats[loser]["houju"] += 1
                         if 0 <= loser < len(player_names):

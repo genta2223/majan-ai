@@ -6115,3 +6115,222 @@ async def test_multi_match_tonpuu_hanchan_profiler_consistency():
     assert brokov.display_name == "ブロコフ"
     assert nishima.display_name == "nishimaニシマ"
 
+
+def test_deal_in_distribution_and_pure_hora_score_calculation():
+    """
+    Verifies that:
+    1. Ron deal-ins are distributed accurately across different players (not clustered on one player like '横丁の隠居').
+    2. Daburon (double ron) only increments deal_in_count once for the deal-in player.
+    3. Winning hand scores accurately collect pure base points (fu/fan or dadian: 1000-32000 pts),
+       strictly excluding honba (本場) and kyotaku (供託リーチ棒) deposits, preventing inflated averages (e.g. 13,842 pts).
+    """
+    from core.opponent_profiler import OpponentProfiler
+
+    profiler = OpponentProfiler(profiles_path=None)
+
+    names = ["genta2223", "横丁の隠居", "ブロコフ", "nishimaニシマ"]
+
+    # 4 distinct rounds where different players deal in, plus 1 daburon
+    events = [
+        {"type": "start_game", "names": names, "uuid": "match_deal_in_dist_01"},
+        
+        # Round 0 (東1局): genta2223 (P0) wins 3900 pts (30 fu 3 han), deal-in from 横丁の隠居 (P1)
+        # Note: kyotaku = 1000, honba = 300 included in deltas (+5200, -4200), but pure score is 3900!
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 1, "honba": 1, "kyotaku": 1, "scores": [25000, 25000, 25000, 25000]},
+        {"type": "dahai", "actor": 1, "pai": "5m"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 1,
+            "winner": 0,
+            "loser": 1,
+            "zimo": False,
+            "pai": "5m",
+            "score": 3900,
+            "dadian": 3900,
+            "fu": 30,
+            "fan": 3,
+            "deltas": [5200, -4200, 0, 0],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 1 (東2局): ブロコフ (P2) wins 8000 pts (Mangan), deal-in from genta2223 (P0)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 2, "honba": 0, "kyotaku": 0, "scores": [30200, 20800, 25000, 25000]},
+        {"type": "dahai", "actor": 0, "pai": "2s"},
+        {
+            "type": "hora",
+            "actor": 2,
+            "target": 0,
+            "winner": 2,
+            "loser": 0,
+            "zimo": False,
+            "pai": "2s",
+            "score": 8000,
+            "dadian": 8000,
+            "deltas": [-8000, 0, 8000, 0],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 2 (東3局): nishimaニシマ (P3) wins 12000 pts (Parent Mangan), deal-in from ブロコフ (P2)
+        # Note: kyotaku = 2000, honba = 600, total financial delta +14600, but authentic score is 12000!
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 3, "honba": 2, "kyotaku": 2, "scores": [22200, 20800, 33000, 25000]},
+        {"type": "dahai", "actor": 2, "pai": "7z"},
+        {
+            "type": "hora",
+            "actor": 3,
+            "target": 2,
+            "winner": 3,
+            "loser": 2,
+            "zimo": False,
+            "pai": "7z",
+            "score": 12000,
+            "dadian": 12000,
+            "fu": 40,
+            "fan": 4,
+            "is_dealer": True,
+            "deltas": [0, 0, -12600, 14600],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 3 (東4局): 横丁の隠居 (P1) wins 2000 pts (30 fu 2 han), deal-in from nishimaニシマ (P3)
+        {"type": "start_kyoku", "bakaze": "E", "kyoku": 4, "honba": 0, "kyotaku": 0, "scores": [22200, 20800, 20400, 39600]},
+        {"type": "dahai", "actor": 3, "pai": "1p"},
+        {
+            "type": "hora",
+            "actor": 1,
+            "target": 3,
+            "winner": 1,
+            "loser": 3,
+            "zimo": False,
+            "pai": "1p",
+            "score": 2000,
+            "dadian": 2000,
+            "deltas": [0, 2000, 0, -2000],
+        },
+        {"type": "end_kyoku"},
+
+        # Round 4 (南1局): Daburon! genta2223 (P0) and ブロコフ (P2) both Ron off 横丁の隠居 (P1)
+        # Daburon should strictly count as 1 deal-in for 横丁の隠居, NOT 2!
+        {"type": "start_kyoku", "bakaze": "S", "kyoku": 1, "honba": 0, "kyotaku": 0, "scores": [22200, 22800, 20400, 37600]},
+        {"type": "dahai", "actor": 1, "pai": "9s"},
+        {
+            "type": "hora",
+            "actor": 0,
+            "target": 1,
+            "winner": 0,
+            "loser": 1,
+            "zimo": False,
+            "pai": "9s",
+            "score": 8000,
+            "dadian": 8000,
+            "deltas": [8000, -16000, 8000, 0],
+            "hules": [
+                {"seat": 0, "winner": 0, "target": 1, "loser": 1, "zimo": False, "score": 8000, "dadian": 8000},
+                {"seat": 2, "winner": 2, "target": 1, "loser": 1, "zimo": False, "score": 8000, "dadian": 8000},
+            ]
+        },
+        {"type": "end_kyoku"},
+
+        {"type": "end_game"}
+    ]
+
+    profiler.analyze_game_events(events)
+
+    p0 = profiler.get_profile("genta2223")
+    p1 = profiler.get_profile("横丁の隠居")
+    p2 = profiler.get_profile("ブロコフ")
+    p3 = profiler.get_profile("nishimaニシマ")
+
+    # 1. Verification of deal-in distribution:
+    # Each player dealt in according to reality:
+    # - genta2223 (P0): dealt in once (Round 1)
+    # - 横丁の隠居 (P1): dealt in in Round 0, and once in Round 4 (Daburon deduplicated to 1!) = total 2
+    # - ブロコフ (P2): dealt in once (Round 2)
+    # - nishimaニシマ (P3): dealt in once (Round 3)
+    assert p0.deal_in_count == 1, f"Expected 1 deal-in for genta2223, got {p0.deal_in_count}"
+    assert p1.deal_in_count == 2, f"Expected 2 deal-ins for 横丁の隠居 (including 1 from Daburon), got {p1.deal_in_count}"
+    assert p2.deal_in_count == 1, f"Expected 1 deal-in for ブロコフ, got {p2.deal_in_count}"
+    assert p3.deal_in_count == 1, f"Expected 1 deal-in for nishimaニシマ, got {p3.deal_in_count}"
+
+    # 2. Verification of pure base scores (平均打点):
+    # genta2223 won 2 hands: Round 0 (3,900) + Round 4 (8,000) = 11,900 total pts
+    # Average score MUST be 11900 / 2 = 5,950 pts! (Never inflated by kyotaku/honba 13,842+)
+    assert p0.hora_count == 2, f"Expected 2 wins for genta2223, got {p0.hora_count}"
+    assert p0.hora_scores_sum == 11900, f"Expected 11900 sum for genta2223, got {p0.hora_scores_sum}"
+    assert p0.avg_hora_score == 5950.0, f"Expected 5950.0 avg score for genta2223, got {p0.avg_hora_score}"
+
+    # nishimaニシマ won 1 hand: Round 2 (12,000 pts Parent Mangan)
+    assert p3.hora_count == 1
+    assert p3.hora_scores_sum == 12000
+    assert p3.avg_hora_score == 12000.0
+
+
+def test_liqi_proto_decoder_negative_old_scores_does_not_bias_deal_in():
+    """
+    Verifies that when a player has negative points in old_scores (tag 2) (e.g. box-down '横丁の隠居'),
+    LiqiProtoDecoder strictly uses delta_scores (tag 3) and NEVER mistakes old_scores for delta_scores.
+    """
+    from io_adapter.liqi_proto_decoder import LiqiProtoDecoder
+
+    def encode_varint(val: int) -> bytes:
+        res = bytearray()
+        while True:
+            towrite = val & 0x7F
+            val >>= 7
+            if val:
+                res.append(towrite | 0x80)
+            else:
+                res.append(towrite)
+                break
+        return bytes(res)
+
+    # Construct protobuf ActionHule payload:
+    # tag 1: HuleInfo (seat=0, zimo=0, dadian=8000)
+    # tag 2: old_scores = [35000, -2000, 32000, 35000] (P1 is negative/box-down!)
+    # tag 3: delta_scores = [8000, 0, -8000, 0] (P2 actually dealt in to P0!)
+    
+    # HuleInfo inner blob
+    # tag 4: seat = 0
+    # tag 5: zimo = 0
+    # tag 19: dadian = 8000
+    hule_blob = (
+        bytes([0x20, 0x00]) +  # tag 4 (wire 0): 0
+        bytes([0x28, 0x00]) +  # tag 5 (wire 0): 0
+        bytes([0x98, 0x01]) + encode_varint(8000)  # tag 19 (wire 0): 8000
+    )
+
+    # Encode ActionHule:
+    payload = bytearray()
+    # tag 1 (wire 2, length-delimited): HuleInfo
+    payload.append((1 << 3) | 2)
+    payload.extend(encode_varint(len(hule_blob)))
+    payload.extend(hule_blob)
+
+    # tag 2: old_scores = [35000, -2000, 32000, 35000]
+    for sc in [35000, -2000, 32000, 35000]:
+        payload.append((2 << 3) | 0)
+        # Zigzag / 2s complement protobuf varint for negative
+        val = sc if sc >= 0 else (1 << 32) + sc
+        payload.extend(encode_varint(val))
+
+    # tag 3: delta_scores = [8000, 0, -8000, 0]
+    for d in [8000, 0, -8000, 0]:
+        payload.append((3 << 3) | 0)
+        val = d if d >= 0 else (1 << 32) + d
+        payload.extend(encode_varint(val))
+
+    frame = bytes(payload)
+    decoded = LiqiProtoDecoder.parse_action_payload("ActionHule", frame)
+    assert decoded is not None
+    assert "hules" in decoded
+    assert len(decoded["hules"]) == 1
+    h = decoded["hules"][0]
+
+    # Winner is P0
+    assert h["winner"] == 0
+    # True deal-in loser MUST be P2 (delta_scores = -8000), NEVER P1 (who only had negative old_scores)!
+    assert h["loser"] == 2, f"Expected loser=2 (financial deal-in from delta_scores), got {h['loser']}"
+    assert h["target"] == 2
+    assert h["dadian"] == 8000
+
+

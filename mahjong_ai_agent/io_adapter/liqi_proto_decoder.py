@@ -43,6 +43,34 @@ def is_valid_tile_code(val: Any) -> bool:
     return bool(TILE_PATTERN.match(val.strip()))
 
 
+def calculate_pure_hora_score(fu: int, fan: int, is_dealer: bool) -> int:
+    """
+    Calculates pure base score from fu and fan, strictly excluding honba and riichi stick deposits.
+    Standard Japanese Riichi Mahjong score table.
+    """
+    if fan >= 13:
+        return 48000 if is_dealer else 32000  # Yakuman
+    elif fan >= 11:
+        return 36000 if is_dealer else 24000  # Sanbaiman
+    elif fan >= 8:
+        return 24000 if is_dealer else 16000  # Baiman
+    elif fan >= 6:
+        return 18000 if is_dealer else 12000  # Haneman
+    elif fan >= 5:
+        return 12000 if is_dealer else 8000   # Mangan
+
+    # Under 5 han: A = fu * 2^(2 + fan)
+    base = fu * (2 ** (2 + fan))
+    if base >= 2000:
+        return 12000 if is_dealer else 8000   # Kiriage Mangan / 2000 base cap
+
+    # Dealer: 6 * base rounded up to next 100
+    # Non-dealer: 4 * base rounded up to next 100
+    multiplier = 6 if is_dealer else 4
+    raw = base * multiplier
+    return ((raw + 99) // 100) * 100
+
+
 def xor_decrypt_action_data(data: bytes, key: Tuple[int, ...] = LIQI_ACTION_XOR_KEY) -> bytes:
     """
     Decrypts or encrypts Majsoul ActionPrototype.data payload (Liqi XOR codec).
@@ -115,8 +143,12 @@ def decode_packed_varints(data: bytes) -> List[int]:
 
 
 def _to_signed64(v: int) -> int:
-    """proto3 int32/int64 negatives are encoded as 10-byte two's-complement varints."""
-    return v - (1 << 64) if v >= (1 << 63) else v
+    """proto3 int32/int64 negatives are encoded as two's-complement varints."""
+    if v >= (1 << 63):
+        return v - (1 << 64)
+    if (1 << 31) <= v < (1 << 32):
+        return v - (1 << 32)
+    return v
 
 
 def coerce_int(value: Any, default: int = 0) -> int:
@@ -569,9 +601,16 @@ class LiqiProtoDecoder:
             return m
 
         if name in ("ActionHule", "RecordHule"):
-            # hules = 1 or 2, delta_scores = 2 or 3, scores = 3 or 4
-            del_sc = ints_of(2) or ints_of(3)
-            # Find negative scorer if Ron deal-in
+            # delta_scores is strictly tag 3 in RecordHule/ActionHule.
+            # tag 2 is old_scores (pre-hule scores) which must NEVER be confused with delta_scores!
+            del_sc = ints_of(3)
+            if not del_sc:
+                # Fallback: if delta_scores (tag 3) is absent, check if we have both old_scores (tag 2) and scores (tag 5)
+                old_sc = ints_of(2)
+                new_sc = ints_of(5)
+                if old_sc and new_sc and len(old_sc) == len(new_sc):
+                    del_sc = [new_sc[i] - old_sc[i] for i in range(len(old_sc))]
+
             neg_scorers = [i for i, d in enumerate(del_sc) if d < 0] if del_sc else []
 
             hules_list: List[Dict[str, Any]] = []
@@ -586,6 +625,8 @@ class LiqiProtoDecoder:
                     h_dict["winner"] = seat_val
                     is_zimo = bool(coerce_int((hf.get(5) or [0])[0], 0))
                     h_dict["zimo"] = is_zimo
+                    is_dealer = bool(coerce_int((hf.get(6) or [0])[0], 0))
+                    h_dict["is_dealer"] = is_dealer
 
                     # Target / Loser determination:
                     if is_zimo:
@@ -593,19 +634,11 @@ class LiqiProtoDecoder:
                         h_dict["loser"] = None
                     else:
                         target_val = None
-                        # 1. Prioritize negative scorer from delta_scores (direct financial deal-in)
-                        if neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat_val:
-                            target_val = neg_scorers[0]
-                        # 2. Check explicit target / loser tags (tag 6 or tag 9/10 if non-seat)
-                        if target_val is None:
-                            cand_target = coerce_int((hf.get(9) or hf.get(10) or hf.get(6) or [-1])[0], -1)
-                            if 0 <= cand_target < 4 and cand_target != seat_val:
-                                target_val = cand_target
-                        # 3. Fallback to candidate target or negative scorer
-                        if target_val is None and neg_scorers:
-                            valid_negs = [s for s in neg_scorers if s != seat_val]
-                            if valid_negs:
-                                target_val = valid_negs[0]
+                        # True deal-in player is the non-winner seat with negative delta_score
+                        if neg_scorers:
+                            deal_in_candidates = [s for s in neg_scorers if s != seat_val]
+                            if deal_in_candidates:
+                                target_val = deal_in_candidates[0]
 
                         h_dict["target"] = target_val if target_val is not None else seat_val
                         h_dict["loser"] = target_val if (target_val is not None and target_val != seat_val) else None
@@ -614,30 +647,56 @@ class LiqiProtoDecoder:
                     t_cand = [s(v).strip() for v in (hf.get(3) or []) if is_tile(v)]
                     if t_cand:
                         h_dict["hu_tile"] = t_cand[0]
-                    # Score calculation: dadian (tag 19) is authentic base score without honba/kyotaku
+
+                    # Parse Fu (tag 13) and Fans (tag 12)
+                    fu = coerce_int((hf.get(13) or [0])[0], 0)
+                    h_dict["fu"] = fu
+
+                    fans_blobs = hf.get(12, [])
+                    total_fan = 0
+                    for fb in fans_blobs:
+                        if isinstance(fb, (bytes, bytearray)):
+                            fan_f = decode_raw_protobuf(bytes(fb))
+                            total_fan += coerce_int((fan_f.get(2) or [1])[0], 1)
+                        elif isinstance(fb, dict):
+                            total_fan += coerce_int(fb.get("val", 1), 1)
+                    h_dict["fan"] = total_fan
+
+                    is_yiman = bool(coerce_int((hf.get(10) or [0])[0], 0))
+                    h_dict["yiman"] = is_yiman
+
+                    # Authentic pure base score calculation (excluding honba/kyotaku)
                     dadian = coerce_int((hf.get(19) or [0])[0], 0)
-                    if not dadian:
-                        # Fallback to pure point_rong (tag 14) if non-zimo
+                    if 0 < dadian <= 48000:
+                        score_val = dadian
+                    elif fu > 0 and total_fan > 0:
+                        score_val = calculate_pure_hora_score(fu, total_fan, is_dealer)
+                    elif is_yiman:
+                        score_val = 48000 if is_dealer else 32000
+                    else:
+                        # Fallback: pure point_rong (tag 14) or tsumo points
                         if not is_zimo and hf.get(14):
-                            dadian = coerce_int(hf[14][0], 0)
+                            score_val = coerce_int(hf[14][0], 0)
                         else:
-                            # Tsumo points: qin (tag 15) and xian (tag 16)
                             z_qin = coerce_int((hf.get(15) or [0])[0], 0)
                             z_xian = coerce_int((hf.get(16) or [0])[0], 0)
-                            if z_qin or z_xian:
-                                dadian = z_qin * 3 if z_qin and not z_xian else (z_qin + z_xian * 2)
-                    if not dadian:
-                        # Only then fallback to point_sum (tag 18) or tag 7
-                        dadian = coerce_int((hf.get(18) or hf.get(7) or [0])[0], 0)
+                            if is_dealer and z_xian:
+                                score_val = z_xian * 3
+                            elif not is_dealer and (z_qin or z_xian):
+                                score_val = z_qin + z_xian * 2
+                            else:
+                                score_val = 0
 
-                    if 0 < dadian <= 48000:
-                        h_dict["dadian"] = dadian
-                        h_dict["score"] = dadian
-                        h_dict["point_sum"] = dadian
-                    else:
-                        h_dict["dadian"] = 5200
-                        h_dict["point_sum"] = 5200
-                        h_dict["score"] = 5200
+                        if not (0 < score_val <= 48000):
+                            raw_pt = coerce_int((hf.get(18) or [0])[0], 0)
+                            if 0 < raw_pt <= 48000:
+                                score_val = raw_pt
+                            else:
+                                score_val = 5200
+
+                    h_dict["dadian"] = score_val
+                    h_dict["score"] = score_val
+                    h_dict["point_sum"] = score_val
                     hules_list.append(h_dict)
                 elif isinstance(h_blob, dict):
                     hules_list.append(h_blob)
@@ -652,12 +711,12 @@ class LiqiProtoDecoder:
 
                 if seat_val is not None:
                     target_val = seat_val
-                    if 3 in f and isinstance(f[3][0], int) and 0 <= f[3][0] <= 3:
+                    if neg_scorers:
+                        deal_in_candidates = [s for s in neg_scorers if s != seat_val]
+                        if deal_in_candidates:
+                            target_val = deal_in_candidates[0]
+                    elif 3 in f and isinstance(f[3][0], int) and 0 <= f[3][0] <= 3:
                         target_val = f[3][0]
-                    elif 6 in f and isinstance(f[6][0], int) and 0 <= f[6][0] <= 3:
-                        target_val = f[6][0]
-                    elif neg_scorers and len(neg_scorers) == 1 and neg_scorers[0] != seat_val:
-                        target_val = neg_scorers[0]
 
                     is_zimo = (seat_val == target_val)
                     h_dict = {

@@ -112,6 +112,7 @@ class MahjongHUDApp:
         self.active_profiler = OpponentProfiler()
         self.active_custom_exploit: Optional[Dict[str, Any]] = None
         self.paifu_sniffer: Optional[Any] = None
+        self.profiler_dialog: Optional[PlayerProfilerDialog] = None
 
         self._init_styles()
         self._build_ui()
@@ -551,11 +552,29 @@ class MahjongHUDApp:
             self.chrome_launched = False
             self._update_button_states()
 
+    def _on_profiler_dialog_close(self) -> None:
+        """Handles profiler dialog close event cleanly."""
+        if self.profiler_dialog:
+            try:
+                self.profiler_dialog.destroy()
+            except Exception:
+                pass
+            self.profiler_dialog = None
+
     def _open_profiler_dialog(self) -> None:
-        """Opens the standalone Player Profiler analysis window."""
+        """Opens or brings to front the standalone Player Profiler analysis window."""
         try:
-            dialog = PlayerProfilerDialog(self.root, self.active_profiler)
-            dialog.focus_set()
+            if self.profiler_dialog and self.profiler_dialog.winfo_exists():
+                self.profiler_dialog.deiconify()
+                self.profiler_dialog.lift()
+                self.profiler_dialog.focus_force()
+                if hasattr(self.profiler_dialog, "refresh"):
+                    self.profiler_dialog.refresh()
+                return
+
+            self.profiler_dialog = PlayerProfilerDialog(self.root, self.active_profiler)
+            self.profiler_dialog.protocol("WM_DELETE_WINDOW", self._on_profiler_dialog_close)
+            self.profiler_dialog.focus_set()
         except Exception as e:
             self._log_err(f"[Profiler Dialog Error] {e}")
 
@@ -642,9 +661,6 @@ class MahjongHUDApp:
             self.paifu_sniffer.stop()
             self.btn_sniffer.config(text="📡 取り込み開始", bg="#7c3aed")
             self._update_button_states()
-
-        self._update_exploit_summary()
-        self._open_profiler_dialog()
 
         self._update_exploit_summary()
         self._open_profiler_dialog()
