@@ -49,6 +49,10 @@ def get_resource_path(*rel_path: str) -> str:
     return os.path.normpath(os.path.join(get_base_dir(), joined))
 
 
+# Backward-compatible alias
+resource_path = get_resource_path
+
+
 def get_writable_path(*rel_path: str, ensure_parent: bool = True) -> str:
     """
     Resolves a writable path next to the application binary or project root.

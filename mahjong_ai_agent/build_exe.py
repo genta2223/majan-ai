@@ -82,6 +82,7 @@ def get_pyinstaller_args(
         "core.state_manager",
         "core.strategy_modifier",
         "core.opponent_profiler",
+        "core.models",
         "io_adapter",
         "io_adapter.action_controller",
         "io_adapter.live_sniffer",
@@ -89,7 +90,12 @@ def get_pyinstaller_args(
         "io_adapter.vision_hand_reader",
         "io_adapter.input_simulator",
         "io_adapter.stream_client",
+        "io_adapter.liqi_proto_decoder",
+        "player_profiler_dialog",
+        "paifu_pipeline",
+        "tools",
         "tools.calibrate_ui",
+        "tools.paifu_to_mjai",
     ]
 
     for hi in hidden_imports:

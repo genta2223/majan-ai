@@ -21,6 +21,7 @@ if PROJECT_ROOT not in sys.path:
 
 from io_adapter.liqi_proto_decoder import LiqiProtoDecoder, decode_raw_protobuf
 from io_adapter.majsoul_bridge import MajsoulBridge
+from utils.path_helper import get_base_dir, get_output_path, get_writable_path
 
 
 PAIFU_UUID_REGEX = re.compile(
@@ -121,7 +122,7 @@ class PaifuDownloader:
     """Fetches raw paifu record binary or JSON from Majsoul gateway, CDP browser session, or local cache."""
 
     def __init__(self, cache_dir: Optional[str] = None, cdp_port: int = 9222):
-        self.cache_dir = cache_dir or os.path.join(PROJECT_ROOT, "output", "cache")
+        self.cache_dir = cache_dir or get_output_path("cache")
         self.cdp_port = cdp_port
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -1578,7 +1579,7 @@ class PaifuSniffer:
     def __init__(self, cdp_port: int = 9222, max_games: int = 3, cache_dir: Optional[str] = None):
         self.cdp_port = cdp_port
         self.max_games = max_games
-        self.cache_dir = cache_dir or os.path.join(PROJECT_ROOT, "data", "paifu_cache")
+        self.cache_dir = cache_dir or get_writable_path("data", "paifu_cache", ensure_parent=True)
         os.makedirs(self.cache_dir, exist_ok=True)
         self.is_running = False
         self.captured_records: List[Dict[str, Any]] = []

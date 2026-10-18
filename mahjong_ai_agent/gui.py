@@ -236,15 +236,16 @@ class MahjongHUDApp:
 
         rb_mouse = tk.Radiobutton(
             row2,
-            text="半自動マウス誘導",
+            text="半自動マウス誘導（開発中）",
             variable=self.output_mode_var,
             value="semi_auto",
+            state="disabled",
             font=("Meiryo", 9),
-            fg=self.c_yellow,
+            fg="#64748b",
             bg=self.c_card,
             selectcolor=self.c_bg,
             activebackground=self.c_card,
-            activeforeground=self.c_yellow,
+            activeforeground="#64748b",
         )
         rb_mouse.pack(side=tk.LEFT)
 
@@ -361,7 +362,7 @@ class MahjongHUDApp:
 
         self.lbl_sniffer_guide = tk.Label(
             exploit_frame,
-            text="雀魂の牌譜画面で「詳細」をクリックするとパケットを直接キャプチャします（最大3件）。",
+            text="牌譜画面で「詳細」をクリックして自動取得（3件取得でプロファイラー自動反映）",
             font=("Meiryo", 8),
             fg=self.c_text_dim,
             bg=self.c_card,
@@ -410,7 +411,7 @@ class MahjongHUDApp:
 
         self.chk_exploit = tk.Checkbutton(
             exp_btn_row,
-            text="癖エクスプロイト",
+            text="癖エクスプロイト（相手の放銃・鳴き癖に合わせて打牌補正）",
             variable=self.is_exploit_mode,
             font=("Meiryo", 8, "bold"),
             fg=self.c_purple,
@@ -423,7 +424,7 @@ class MahjongHUDApp:
 
         self.lbl_exploit_summary = tk.Label(
             exploit_frame,
-            text="待機中 (「牌譜取り込み準備」を押して監視を開始してください)",
+            text="待機中（「取り込み開始」を押した後、牌譜一覧で「詳細」をクリック）",
             font=("Meiryo", 8),
             fg=self.c_text_dim,
             bg=self.c_card,
